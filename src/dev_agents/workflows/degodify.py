@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+
+from dev_agents.runtime import GitHubError, gh_json
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,56 @@ class SkippedCandidate:
 class CandidateSelection:
     candidate: DegodifyFile | None
     skipped: list[SkippedCandidate]
+
+
+IGNORED_DIRS = {"node_modules", ".git", "dist", "build", "coverage", ".svelte-kit"}
+SOURCE_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".svelte"}
+
+
+def analyze_repository(repo: Path, *, top_count: int = 50) -> list[DegodifyFile]:
+    """Build a deterministic, read-only size analysis of source files."""
+    results: list[DegodifyFile] = []
+    for path in repo.rglob("*"):
+        if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
+            continue
+        if any(part in IGNORED_DIRS for part in path.relative_to(repo).parts):
+            continue
+        relative = path.relative_to(repo).as_posix()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        code_lines = sum(bool(line.strip()) and not line.lstrip().startswith(("//", "/*", "*")) for line in lines)
+        is_catalog = len(lines) > 500 and code_lines > 0 and code_lines / len(lines) < 0.2
+        status = "CRITICAL" if len(lines) >= 1000 else "WATCH" if len(lines) >= 500 else "STABLE"
+        results.append(DegodifyFile(relative, len(lines), code_lines, "Utility / Module", status, is_catalog))
+    results.sort(key=lambda item: (item.status == "STABLE", -item.total_lines, item.relative_path))
+    return results[:top_count]
+
+
+def active_repository_items(repo: Path) -> list[str]:
+    """Collect open PR titles/branches and remote branches for collision checks."""
+    items: list[str] = []
+    try:
+        for pr in gh_json(repo, "pr", "list", "--state", "open", "--json", "title,headRefName"):
+            if pr.get("title"):
+                items.append(str(pr["title"]).lower())
+            if pr.get("headRefName"):
+                items.append(str(pr["headRefName"]).lower())
+    except (GitHubError, TypeError):
+        pass
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "branch", "-r"], cwd=repo, text=True, capture_output=True, check=False
+        )
+        items.extend(line.strip().lower() for line in result.stdout.splitlines() if line.strip())
+    except OSError:
+        pass
+    return items
+
+
+def plan_degodify(repo: Path, *, top_count: int = 50) -> CandidateSelection:
+    """Produce a read-only decomposition plan for a repository."""
+    return select_candidate(analyze_repository(repo, top_count=top_count), active_repository_items(repo))
 
 
 def select_candidate(files: list[DegodifyFile], active_items: list[str]) -> CandidateSelection:
