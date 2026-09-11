@@ -26,7 +26,7 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.instructions import discover_instructions
-from dev_agents.runtime import JsonStateStore, isolated_worktree, run_agent
+from dev_agents.runtime import SqliteStateStore, isolated_worktree, run_agent
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -55,7 +55,7 @@ def _state_path(config: PrFixerConfig, project: str) -> Path:
 
 
 def _load_state(path: Path) -> dict[str, Any]:
-    value = JsonStateStore(path, {"version": 1, "pullRequests": {}}).load()
+    value = SqliteStateStore(path.with_suffix(".db"), "pr-fixer", {"version": 1, "pullRequests": {}}, path).load()
     if value.get("version") == 1 and isinstance(value.get("pullRequests"), dict):
         return value
     # Migrate the original {"<pr>": ["comment:..."]} shape.
@@ -63,7 +63,7 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 
 def _save_state(path: Path, state: dict[str, list[str]]) -> None:
-    JsonStateStore(path, {}).save(state)
+    SqliteStateStore(path.with_suffix(".db"), "pr-fixer", {}).save(state)
 
 
 def _cleanup_artifacts(project_name: str, config: PrFixerConfig) -> None:
