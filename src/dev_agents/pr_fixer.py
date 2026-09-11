@@ -15,7 +15,9 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from dev_agents.config import (
     ConfigError,
@@ -156,11 +158,26 @@ type check only when required by its local instructions. Commit and push HEAD to
 Do not close or merge the PR."""
 
 
+class PrFixerRunState(TypedDict, total=False):
+    """State carried through one webhook/reconciliation PR-fix run."""
+
+    number: int
+    meta: dict[str, Any]
+    keys: list[str]
+    handled: list[str]
+    unseen: list[str]
+    state_path: Path
+    skip: bool
+    fixed: bool
+    started: bool
+
+
 class PrFixerService:
     def __init__(self, project_name: str, project: ProjectConfig, config: PrFixerConfig):
         self.project_name, self.project, self.config = project_name, project, config
         self.active: set[int] = set()
         self.lock = Lock()
+        self.workflow = self._build_workflow()
 
     def handle(self, number: int) -> bool:
         with self.lock:
@@ -168,40 +185,78 @@ class PrFixerService:
                 return False
             self.active.add(number)
         try:
-            meta, keys = _feedback(self.project.repo, number)
-            labels = {label["name"].lower() for label in meta.get("labels", [])}
-            if meta.get("baseRefName") != self.config.base_branch or meta.get("isDraft") or "paused" in labels:
-                return False
-            state_path = _state_path(self.config, self.project_name)
-            state = _load_state(state_path)
-            records = state.setdefault("pullRequests", {})
-            handled = records.get(str(number), [])
-            unseen = [key for key in keys if key not in handled]
-            if not unseen:
-                if self.config.auto_merge and self._auto_merge_eligible(meta, keys):
-                    self._request_auto_merge(number)
-                return False
-            _log(f"starting pr={number} actionable_items={len(unseen)}")
-            if not self._fix(number, meta["headRefName"], unseen):
-                _log(f"fix-incomplete pr={number}; feedback remains actionable")
-                return False
-            slug = _run(self.project.repo, "gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
-            for key in unseen:
-                if key.startswith("comment:"):
-                    comment_id = key.split(":", 1)[1]
-                    _run(self.project.repo, "gh", "api", f"repos/{slug}/pulls/{number}/comments/{comment_id}/replies", "-f", "body=Processed by the PR fixer; verification completed.", check=False)
-            refreshed_meta, refreshed = _feedback(self.project.repo, number)
-            # GitHub keeps resolved inline comments in the API. Once this run has
-            # processed them, their presence alone must not block auto-merge.
-            if all(key not in refreshed or key.startswith("comment:") for key in unseen):
-                records[str(number)] = sorted(set(handled + unseen))
-                _save_state(state_path, state)
-                if self.config.auto_merge and self._auto_merge_eligible(refreshed_meta, refreshed):
-                    self._request_auto_merge(number)
-            return True
+            result = self.workflow.invoke({"number": number})
+            return bool(result.get("started", False))
         finally:
             with self.lock:
                 self.active.discard(number)
+
+    def _build_workflow(self) -> Any:
+        graph = StateGraph(PrFixerRunState)
+        graph.add_node("collect_feedback", self._collect_feedback)
+        graph.add_node("remediate", self._remediate)
+        graph.add_node("finalize", self._finalize)
+        graph.add_edge(START, "collect_feedback")
+        graph.add_edge("collect_feedback", "remediate")
+        graph.add_edge("remediate", "finalize")
+        graph.add_edge("finalize", END)
+        return graph.compile()
+
+    def _collect_feedback(self, state: PrFixerRunState) -> dict[str, Any]:
+        number = state["number"]
+        meta, keys = _feedback(self.project.repo, number)
+        labels = {label["name"].lower() for label in meta.get("labels", [])}
+        if meta.get("baseRefName") != self.config.base_branch or meta.get("isDraft") or "paused" in labels:
+            return {"meta": meta, "keys": keys, "skip": True}
+        state_path = _state_path(self.config, self.project_name)
+        records = _load_state(state_path).setdefault("pullRequests", {})
+        handled = records.get(str(number), [])
+        unseen = [key for key in keys if key not in handled]
+        return {
+            "meta": meta,
+            "keys": keys,
+            "handled": handled,
+            "unseen": unseen,
+            "state_path": state_path,
+            "skip": False,
+        }
+
+    def _remediate(self, state: PrFixerRunState) -> dict[str, Any]:
+        if state.get("skip") or not state.get("unseen"):
+            return {"started": False, "fixed": False}
+        number = state["number"]
+        unseen = state["unseen"]
+        _log(f"starting pr={number} actionable_items={len(unseen)}")
+        fixed = self._fix(number, state["meta"]["headRefName"], unseen)
+        if not fixed:
+            _log(f"fix-incomplete pr={number}; feedback remains actionable")
+        return {"started": fixed, "fixed": fixed}
+
+    def _finalize(self, state: PrFixerRunState) -> dict[str, Any]:
+        if state.get("skip"):
+            return {"started": False}
+        number = state["number"]
+        meta, keys = state["meta"], state["keys"]
+        if not state.get("unseen"):
+            if self.config.auto_merge and self._auto_merge_eligible(meta, keys):
+                self._request_auto_merge(number)
+            return {"started": False}
+        if not state.get("fixed"):
+            return {"started": False}
+        slug = _run(self.project.repo, "gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+        for key in state["unseen"]:
+            if key.startswith("comment:"):
+                comment_id = key.split(":", 1)[1]
+                _run(self.project.repo, "gh", "api", f"repos/{slug}/pulls/{number}/comments/{comment_id}/replies", "-f", "body=Processed by the PR fixer; verification completed.", check=False)
+        refreshed_meta, refreshed = _feedback(self.project.repo, number)
+        if all(key not in refreshed or key.startswith("comment:") for key in state["unseen"]):
+            saved = _load_state(state["state_path"])
+            records = saved.setdefault("pullRequests", {})
+            records[str(number)] = sorted(set(state.get("handled", []) + state["unseen"]))
+            _save_state(state["state_path"], saved)
+            if self.config.auto_merge and self._auto_merge_eligible(refreshed_meta, refreshed):
+                self._request_auto_merge(number)
+        return {"started": True}
 
     def _fix(self, number: int, branch: str, keys: list[str]) -> bool:
         base = self.config.base_branch
