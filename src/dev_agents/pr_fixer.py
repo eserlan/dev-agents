@@ -32,6 +32,7 @@ from dev_agents.runtime import (
     repository_slug,
     run_agent,
 )
+from dev_agents.workflows.degodify import DegodifyFile, run_degodify
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -327,11 +328,29 @@ def _signature_valid(body: bytes, received: str | None, secret: str) -> bool:
     return received is not None and hmac.compare_digest(received, expected)
 
 
+def _degodify_candidate(payload: dict[str, Any]) -> DegodifyFile | None:
+    candidate = payload.get("candidate")
+    if not isinstance(candidate, dict) or not isinstance(candidate.get("path"), str):
+        return None
+    try:
+        return DegodifyFile(
+            relative_path=candidate["path"],
+            total_lines=int(candidate["totalLines"]),
+            code_lines=int(candidate["codeLines"]),
+            file_type=str(candidate.get("type", "Utility / Module")),
+            status=str(candidate.get("status", "WATCH")),
+            is_data_catalog=bool(candidate.get("isDataCatalog", False)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> None:
     secret = os.environ.get(config.webhook_secret_env)
     if not secret:
         raise ConfigError(f"Set {config.webhook_secret_env} before starting the PR fixer")
     webhook_secret = secret
+    degodify_secret = os.environ.get(config.degodify_webhook_secret_env)
 
     _cleanup_artifacts(project_name, config)
     service = PrFixerService(project_name, project, config)
@@ -346,6 +365,28 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
             if content_length > MAX_BODY_BYTES:
                 self.send_response(413); self.end_headers(); return
             body = self.rfile.read(content_length)
+            if self.path == config.degodify_webhook_path:
+                if not degodify_secret or not _signature_valid(body, self.headers.get("X-Hub-Signature-256"), degodify_secret):
+                    _log(f"rejected delivery={delivery} event=degodify reason=invalid-signature")
+                    self.send_response(401); self.end_headers(); return
+                degodify_payload: Any = None
+                try:
+                    degodify_payload = json.loads(body)
+                    candidate = _degodify_candidate(degodify_payload)
+                except json.JSONDecodeError:
+                    candidate = None
+                if candidate is None or not isinstance(degodify_payload, dict) or degodify_payload.get("repository") != project.github:
+                    _log(f"ignored delivery={delivery} event=degodify reason=invalid-payload")
+                    self.send_response(400); self.end_headers(); return
+                def run_deg() -> None:
+                    try:
+                        result = run_degodify(project.repo, base_branch=config.base_branch, provider=config.providers[0], dry_run=False, supplied_candidate=candidate)
+                        _log(f"handled delivery={delivery} event=degodify path={candidate.relative_path} succeeded={result.succeeded}")
+                    except Exception as error:  # noqa: BLE001 - daemon must log worker failures
+                        _log(f"failed delivery={delivery} event=degodify error={error}")
+                Thread(target=run_deg, daemon=True).start()
+                _log(f"accepted delivery={delivery} event=degodify path={candidate.relative_path}")
+                self.send_response(202); self.end_headers(); return
             if self.path != config.webhook_path or not _signature_valid(body, self.headers.get("X-Hub-Signature-256"), webhook_secret):
                 _log(f"rejected delivery={delivery} event={event or 'unknown'} reason=invalid-path-or-signature")
                 self.send_response(401); self.end_headers(); return

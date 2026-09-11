@@ -36,6 +36,8 @@ class PrFixerConfig(BaseModel):
     worktree_retention_days: int = 2
     auto_merge_quiet_seconds: int = 60
     heartbeat_seconds: int = 30
+    degodify_webhook_path: str = "/degodify"
+    degodify_webhook_secret_env: str = "DEGODIFY_WEBHOOK_SECRET"
 
 
 class ProjectsConfig(BaseModel):

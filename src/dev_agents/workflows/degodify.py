@@ -100,10 +100,10 @@ def run_degodify(
     log_path: Path | None = None,
     timeout_seconds: float = 25 * 60,
     dry_run: bool = True,
+    supplied_candidate: DegodifyFile | None = None,
 ) -> DegodifyRunResult:
     """Run one bounded decomposition, with mutation disabled by default."""
-    selection = plan_degodify(repo)
-    candidate = selection.candidate
+    candidate = supplied_candidate or plan_degodify(repo).candidate
     if candidate is None:
         return DegodifyRunResult(None, None, None, dry_run, True)
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
