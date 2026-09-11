@@ -27,6 +27,7 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.instructions import discover_instructions
+from dev_agents.runtime import run_agent
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -280,18 +281,18 @@ class PrFixerService:
             log = log_dir / f"pr-{number}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
             prompt = _prompt(worktree, number, keys, base, conflicts)
             for provider in self.config.providers:
-                args = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", prompt] if provider == "codex" else [provider, "-p", prompt]
                 _log(f"agent-start pr={number} provider={provider} log={log}")
-                with log.open("a", encoding="utf-8") as stream:
-                    process = subprocess.Popen(args, cwd=worktree, stdout=stream, stderr=subprocess.STDOUT)
-                    deadline = time.monotonic() + self.config.timeout_minutes * 60
-                    while process.poll() is None:
-                        if time.monotonic() >= deadline:
-                            process.kill(); _log(f"agent-timeout pr={number} provider={provider}"); break
-                        time.sleep(min(self.config.heartbeat_seconds, max(0.1, deadline - time.monotonic())))
-                        if process.poll() is None:
-                            _log(f"agent-heartbeat pr={number} provider={provider}")
-                    result_code = process.wait()
+                result = run_agent(
+                    provider,
+                    prompt,
+                    cwd=worktree,
+                    log_path=log,
+                    timeout_seconds=self.config.timeout_minutes * 60,
+                    heartbeat_seconds=self.config.heartbeat_seconds,
+                )
+                result_code = result.returncode
+                if result.timed_out:
+                    _log(f"agent-timeout pr={number} provider={provider}")
                 _log(f"agent-finished pr={number} provider={provider} exit={result_code}")
                 _run(worktree, "git", "fetch", "origin", branch, check=False)
                 pushed = _run(worktree, "git", "rev-parse", "HEAD", check=False) == _run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
