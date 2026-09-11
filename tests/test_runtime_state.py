@@ -30,3 +30,9 @@ def test_sqlite_state_store_updates_transactionally(tmp_path):
     store.save({"runs": ["one"]})
     store.save({"runs": ["one", "two"]})
     assert store.load() == {"runs": ["one", "two"]}
+
+
+def test_sqlite_state_store_claims_event_once(tmp_path):
+    store = SqliteStateStore(tmp_path / "state.db", "events", {})
+    assert store.claim_once("run-1") is True
+    assert store.claim_once("run-1") is False

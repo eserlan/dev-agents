@@ -53,6 +53,12 @@ class SqliteStateStore:
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS event_claims (
+                    namespace TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(namespace, event_id)
+                );
                 """
             )
             if connection.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 0:
@@ -102,3 +108,12 @@ class SqliteStateStore:
                 """,
                 (self.namespace, payload),
             )
+
+    def claim_once(self, event_id: str) -> bool:
+        """Atomically claim an event; false means it was already processed."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO event_claims(namespace, event_id) VALUES (?, ?)",
+                (self.namespace, event_id),
+            )
+            return cursor.rowcount == 1

@@ -378,6 +378,12 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                 if candidate is None or not isinstance(degodify_payload, dict) or degodify_payload.get("repository") != project.github:
                     _log(f"ignored delivery={delivery} event=degodify reason=invalid-payload")
                     self.send_response(400); self.end_headers(); return
+                event_id = str(degodify_payload.get("analysisRunId") or delivery)
+                state_file = _state_path(config, project_name)
+                claims = SqliteStateStore(state_file.with_suffix(".db"), "degodify-events", {})
+                if not claims.claim_once(event_id):
+                    _log(f"ignored delivery={delivery} event=degodify reason=duplicate event_id={event_id}")
+                    self.send_response(200); self.end_headers(); return
                 def run_deg() -> None:
                     try:
                         result = run_degodify(project.repo, base_branch=config.base_branch, provider=config.providers[0], dry_run=False, supplied_candidate=candidate)
