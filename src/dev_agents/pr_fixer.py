@@ -9,7 +9,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +26,7 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.instructions import discover_instructions
-from dev_agents.runtime import isolated_worktree, run_agent
+from dev_agents.runtime import JsonStateStore, isolated_worktree, run_agent
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -56,25 +55,15 @@ def _state_path(config: PrFixerConfig, project: str) -> Path:
 
 
 def _load_state(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(value, dict) and value.get("version") == 1 and isinstance(value.get("pullRequests"), dict):
-            return value
-        # Migrate the original {"<pr>": ["comment:..."]} shape.
-        if isinstance(value, dict):
-            return {"version": 1, "pullRequests": value}
-        return {"version": 1, "pullRequests": {}}
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "pullRequests": {}}
+    value = JsonStateStore(path, {"version": 1, "pullRequests": {}}).load()
+    if value.get("version") == 1 and isinstance(value.get("pullRequests"), dict):
+        return value
+    # Migrate the original {"<pr>": ["comment:..."]} shape.
+    return {"version": 1, "pullRequests": value}
 
 
 def _save_state(path: Path, state: dict[str, list[str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as file:
-        json.dump(state, file, indent=2, sort_keys=True)
-        file.write("\n")
-        temporary = Path(file.name)
-    temporary.replace(path)
+    JsonStateStore(path, {}).save(state)
 
 
 def _cleanup_artifacts(project_name: str, config: PrFixerConfig) -> None:
