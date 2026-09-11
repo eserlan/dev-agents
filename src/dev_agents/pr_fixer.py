@@ -7,7 +7,6 @@ import hmac
 import json
 import os
 import re
-import shutil
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -26,7 +25,13 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.instructions import discover_instructions
-from dev_agents.runtime import SqliteStateStore, isolated_worktree, run_agent
+from dev_agents.runtime import (
+    SqliteStateStore,
+    isolated_worktree,
+    remove_older_than,
+    repository_slug,
+    run_agent,
+)
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -68,31 +73,19 @@ def _save_state(path: Path, state: dict[str, list[str]]) -> None:
 
 def _cleanup_artifacts(project_name: str, config: PrFixerConfig) -> None:
     """Bound completed logs and stale temporary worktree directories."""
-    now = datetime.now(UTC).timestamp()
     log_dir = (config.log_dir or Path.home() / ".local/state/dev-agents" / project_name / "logs").expanduser()
-    log_cutoff = now - config.log_retention_days * 86400
-    if log_dir.is_dir():
-        for path in log_dir.glob("pr-*.log"):
-            try:
-                if path.stat().st_mtime < log_cutoff:
-                    path.unlink()
-            except FileNotFoundError:
-                continue
-
     worktree_root = (config.worktree_dir or Path.home() / ".cache/dev-agents/pr-fixer").expanduser()
-    worktree_cutoff = now - config.worktree_retention_days * 86400
-    if worktree_root.is_dir():
-        for path in worktree_root.glob("pr-*"):
-            try:
-                if path.is_dir() and path.stat().st_mtime < worktree_cutoff:
-                    shutil.rmtree(path)
-            except FileNotFoundError:
-                continue
+    removed_logs = remove_older_than(log_dir, "pr-*.log", config.log_retention_days * 86400)
+    removed_worktrees = remove_older_than(
+        worktree_root, "pr-*", config.worktree_retention_days * 86400, directories=True
+    )
+    if removed_logs or removed_worktrees:
+        _log(f"cleanup logs={removed_logs} worktrees={removed_worktrees}")
 
 
 def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
     meta = json.loads(_run(repo, "gh", "pr", "view", str(number), "--json", "number,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews"))
-    slug = _run(repo, "gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+    slug = repository_slug(repo)
     owner, name = slug.split("/", 1)
     threads_query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{databaseId}}}}}}}"
     threads = json.loads(_run(repo, "gh", "api", "graphql", "-f", f"query={threads_query}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={number}"))
@@ -233,7 +226,7 @@ class PrFixerService:
             return {"started": False}
         if not state.get("fixed"):
             return {"started": False}
-        slug = _run(self.project.repo, "gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+        slug = repository_slug(self.project.repo)
         for key in state["unseen"]:
             if key.startswith("comment:"):
                 comment_id = key.split(":", 1)[1]
