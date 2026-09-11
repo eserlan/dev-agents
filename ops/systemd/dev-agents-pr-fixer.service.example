@@ -1,0 +1,15 @@
+[Unit]
+Description=dev-agents GitHub PR fixer webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/dev-agents
+EnvironmentFile=%h/.config/codex-pr-review/webhook.env
+ExecStart=%h/dev/dev-agents/.venv/bin/dev-agents pr-fixer serve codex-cryptica --config %h/.config/dev-agents/projects.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

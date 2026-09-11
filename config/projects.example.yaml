@@ -1,0 +1,14 @@
+# Copy to config/projects.yaml and replace values for this machine.
+projects:
+  codex-cryptica:
+    repo: /home/your-user/repos/Codex-Cryptica
+    github: eserlan/Codex-Cryptica
+    pr_fixer:
+      base_branch: staging
+      port: 8788
+      # Secret values stay in a private environment file, never here.
+      webhook_secret_env: GITHUB_WEBHOOK_SECRET
+      providers: [codex]
+      auto_merge: false
+      log_retention_days: 30
+      worktree_retention_days: 2
