@@ -27,7 +27,7 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.instructions import discover_instructions
-from dev_agents.runtime import run_agent
+from dev_agents.runtime import isolated_worktree, run_agent
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -262,46 +262,38 @@ class PrFixerService:
     def _fix(self, number: int, branch: str, keys: list[str]) -> bool:
         base = self.config.base_branch
         root = (self.config.worktree_dir or Path.home() / ".cache/dev-agents/pr-fixer").expanduser()
-        root.mkdir(parents=True, exist_ok=True)
-        worktree = Path(tempfile.mkdtemp(prefix=f"pr-{number}-", dir=root))
-        _log(f"worktree pr={number} path={worktree}")
         succeeded = False
         try:
-            _run(self.project.repo, "git", "fetch", "origin", branch, base)
-            _run(self.project.repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{branch}")
-            merge = subprocess.run(["git", "merge", f"origin/{base}", "--no-edit"], cwd=worktree, capture_output=True, text=True, check=False)
-            conflicts = _run(worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False).splitlines()
-            if merge.returncode != 0 and not conflicts:
-                _log(f"merge-failed pr={number} base={base}")
-                return False
-            if conflicts:
-                _log(f"merge-conflict pr={number} paths={','.join(conflicts)}")
-            log_dir = (self.config.log_dir or Path.home() / ".local/state/dev-agents" / self.project_name / "logs").expanduser()
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log = log_dir / f"pr-{number}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
-            prompt = _prompt(worktree, number, keys, base, conflicts)
-            for provider in self.config.providers:
-                _log(f"agent-start pr={number} provider={provider} log={log}")
-                result = run_agent(
-                    provider,
-                    prompt,
-                    cwd=worktree,
-                    log_path=log,
-                    timeout_seconds=self.config.timeout_minutes * 60,
-                    heartbeat_seconds=self.config.heartbeat_seconds,
-                )
-                result_code = result.returncode
-                if result.timed_out:
-                    _log(f"agent-timeout pr={number} provider={provider}")
-                _log(f"agent-finished pr={number} provider={provider} exit={result_code}")
-                _run(worktree, "git", "fetch", "origin", branch, check=False)
-                pushed = _run(worktree, "git", "rev-parse", "HEAD", check=False) == _run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
-                if result_code == 0 and pushed and not _run(worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False) and _run(worktree, "git", "status", "--porcelain") == "":
-                    _log(f"agent-accepted pr={number} provider={provider}")
-                    succeeded = True
-                    break
-        finally:
-            _run(self.project.repo, "git", "worktree", "remove", "--force", str(worktree), check=False)
+            with isolated_worktree(self.project.repo, root, branch, base) as (worktree, conflicts):
+                _log(f"worktree pr={number} path={worktree}")
+                if conflicts:
+                    _log(f"merge-conflict pr={number} paths={','.join(conflicts)}")
+                log_dir = (self.config.log_dir or Path.home() / ".local/state/dev-agents" / self.project_name / "logs").expanduser()
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log = log_dir / f"pr-{number}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
+                prompt = _prompt(worktree, number, keys, base, conflicts)
+                for provider in self.config.providers:
+                    _log(f"agent-start pr={number} provider={provider} log={log}")
+                    result = run_agent(
+                        provider,
+                        prompt,
+                        cwd=worktree,
+                        log_path=log,
+                        timeout_seconds=self.config.timeout_minutes * 60,
+                        heartbeat_seconds=self.config.heartbeat_seconds,
+                    )
+                    result_code = result.returncode
+                    if result.timed_out:
+                        _log(f"agent-timeout pr={number} provider={provider}")
+                    _log(f"agent-finished pr={number} provider={provider} exit={result_code}")
+                    _run(worktree, "git", "fetch", "origin", branch, check=False)
+                    pushed = _run(worktree, "git", "rev-parse", "HEAD", check=False) == _run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
+                    if result_code == 0 and pushed and not _run(worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False) and _run(worktree, "git", "status", "--porcelain") == "":
+                        _log(f"agent-accepted pr={number} provider={provider}")
+                        succeeded = True
+                        break
+        except RuntimeError as error:
+            _log(f"worktree-failed pr={number} error={error}")
         return succeeded
 
     def _auto_merge_eligible(self, meta: dict[str, Any], keys: list[str]) -> bool:
