@@ -6,6 +6,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 
 
@@ -34,10 +35,20 @@ def run_with_fallback(
     return None
 
 
-def provider_command(provider: str, prompt: str) -> list[str]:
+def provider_command(provider: str, prompt: str, timeout_seconds: float = 1200) -> list[str]:
     """Build the command line for a configured provider."""
     if provider == "codex":
         return ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", prompt]
+    if provider == "agy":
+        timeout_minutes = max(1, ceil(timeout_seconds / 60))
+        return [
+            "agy",
+            "--print",
+            prompt,
+            "--effort=medium",
+            "--dangerously-skip-permissions",
+            f"--print-timeout={timeout_minutes}m0s",
+        ]
     return [provider, "-p", prompt]
 
 
@@ -56,7 +67,7 @@ def run_agent(
         stream.write(f"\n=== agent started provider={provider} ===\n")
         stream.flush()
         process = subprocess.Popen(
-            provider_command(provider, prompt),
+            provider_command(provider, prompt, timeout_seconds),
             cwd=cwd,
             stdout=stream,
             stderr=subprocess.STDOUT,

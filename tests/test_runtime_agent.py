@@ -14,6 +14,17 @@ def test_generic_provider_command_uses_prompt_flag() -> None:
     assert provider_command("claude", "fix it") == ["claude", "-p", "fix it"]
 
 
+def test_agy_provider_command_uses_bounded_print_mode() -> None:
+    assert provider_command("agy", "fix it", 150) == [
+        "agy",
+        "--print",
+        "fix it",
+        "--effort=medium",
+        "--dangerously-skip-permissions",
+        "--print-timeout=3m0s",
+    ]
+
+
 def test_run_with_fallback_tries_until_accepted() -> None:
     calls: list[str] = []
 
