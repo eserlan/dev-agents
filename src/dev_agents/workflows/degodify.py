@@ -7,6 +7,9 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Any, TypedDict, cast
+
+from langgraph.graph import END, START, StateGraph
 
 from dev_agents.runtime import AgentResult, GitHubError, gh_json, run_agent, run_with_fallback
 
@@ -40,6 +43,19 @@ class DegodifyRunResult:
     pull_request_url: str | None
     dry_run: bool
     succeeded: bool
+
+
+class DegodifyState(TypedDict, total=False):
+    repo: Path
+    base_branch: str
+    provider: str
+    providers: list[str]
+    log_path: Path | None
+    timeout_seconds: float
+    dry_run: bool
+    supplied_candidate: DegodifyFile | None
+    candidate: DegodifyFile | None
+    result: DegodifyRunResult
 
 
 IGNORED_DIRS = {"node_modules", ".git", "dist", "build", "coverage", ".svelte-kit"}
@@ -92,7 +108,7 @@ def plan_degodify(repo: Path, *, top_count: int = 50) -> CandidateSelection:
     return select_candidate(analyze_repository(repo, top_count=top_count), active_repository_items(repo))
 
 
-def run_degodify(
+def _run_degodify_impl(
     repo: Path,
     *,
     base_branch: str = "staging",
@@ -139,6 +155,65 @@ def run_degodify(
         return DegodifyRunResult(candidate, branch, pr_url, False, True)
     finally:
         _git(repo, "worktree", "remove", "--force", str(worktree), check=False)
+
+
+def build_degodify_workflow() -> Any:
+    """Build the event-driven degodify graph."""
+    graph = StateGraph(DegodifyState)
+
+    def prepare(state: DegodifyState) -> dict[str, object]:
+        candidate = state.get("supplied_candidate") or plan_degodify(state["repo"]).candidate
+        return {"candidate": candidate}
+
+    def execute(state: DegodifyState) -> dict[str, object]:
+        result = _run_degodify_impl(
+            state["repo"],
+            base_branch=state.get("base_branch", "staging"),
+            provider=state.get("provider", "codex"),
+            providers=state.get("providers"),
+            log_path=state.get("log_path"),
+            timeout_seconds=state.get("timeout_seconds", 25 * 60),
+            dry_run=state.get("dry_run", True),
+            supplied_candidate=state.get("candidate"),
+        )
+        return {"result": result}
+
+    def publish(state: DegodifyState) -> dict[str, object]:
+        return {"result": state["result"]}
+
+    graph.add_node("prepare_candidate", prepare)
+    graph.add_node("execute_decomposition", execute)
+    graph.add_node("publish_result", publish)
+    graph.add_edge(START, "prepare_candidate")
+    graph.add_edge("prepare_candidate", "execute_decomposition")
+    graph.add_edge("execute_decomposition", "publish_result")
+    graph.add_edge("publish_result", END)
+    return graph.compile()
+
+
+def run_degodify(
+    repo: Path,
+    *,
+    base_branch: str = "staging",
+    provider: str = "codex",
+    providers: list[str] | None = None,
+    log_path: Path | None = None,
+    timeout_seconds: float = 25 * 60,
+    dry_run: bool = True,
+    supplied_candidate: DegodifyFile | None = None,
+) -> DegodifyRunResult:
+    """Run degodify through its LangGraph workflow."""
+    result = build_degodify_workflow().invoke({
+        "repo": repo,
+        "base_branch": base_branch,
+        "provider": provider,
+        "providers": providers,
+        "log_path": log_path,
+        "timeout_seconds": timeout_seconds,
+        "dry_run": dry_run,
+        "supplied_candidate": supplied_candidate,
+    })
+    return cast(DegodifyRunResult, result["result"])
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
