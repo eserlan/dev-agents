@@ -31,6 +31,7 @@ from dev_agents.runtime import (
     remove_older_than,
     repository_slug,
     run_agent,
+    run_with_fallback,
 )
 from dev_agents.workflows.degodify import DegodifyFile, run_degodify
 
@@ -255,7 +256,7 @@ class PrFixerService:
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log = log_dir / f"pr-{number}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
                 prompt = _prompt(worktree, number, keys, base, conflicts)
-                for provider in self.config.providers:
+                def run_provider(provider: str) -> Any:
                     _log(f"agent-start pr={number} provider={provider} log={log}")
                     result = run_agent(
                         provider,
@@ -269,12 +270,17 @@ class PrFixerService:
                     if result.timed_out:
                         _log(f"agent-timeout pr={number} provider={provider}")
                     _log(f"agent-finished pr={number} provider={provider} exit={result_code}")
+                    return result
+
+                def accept_provider(_provider: str, result: Any) -> bool:
                     _run(worktree, "git", "fetch", "origin", branch, check=False)
                     pushed = _run(worktree, "git", "rev-parse", "HEAD", check=False) == _run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
-                    if result_code == 0 and pushed and not _run(worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False) and _run(worktree, "git", "status", "--porcelain") == "":
-                        _log(f"agent-accepted pr={number} provider={provider}")
-                        succeeded = True
-                        break
+                    return bool(result.returncode == 0 and pushed and not _run(worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False) and _run(worktree, "git", "status", "--porcelain") == "")
+
+                accepted = run_with_fallback(self.config.providers, run_provider, accept_provider)
+                if accepted:
+                    _log(f"agent-accepted pr={number} provider={accepted[0]}")
+                    succeeded = True
         except RuntimeError as error:
             _log(f"worktree-failed pr={number} error={error}")
         return succeeded

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
-from dev_agents.runtime import GitHubError, gh_json, run_agent
+from dev_agents.runtime import AgentResult, GitHubError, gh_json, run_agent, run_with_fallback
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,7 @@ def run_degodify(
     *,
     base_branch: str = "staging",
     provider: str = "codex",
+    providers: list[str] | None = None,
     log_path: Path | None = None,
     timeout_seconds: float = 25 * 60,
     dry_run: bool = True,
@@ -119,16 +120,17 @@ def run_degodify(
         _git(repo, "fetch", "origin", base_branch)
         _git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base_branch}")
         prompt = build_decomposition_prompt(candidate, branch, base_branch)
-        result = run_agent(
-            provider,
-            prompt,
-            cwd=worktree,
-            log_path=log_path or repo / ".dev-agents" / "degodify.log",
-            timeout_seconds=timeout_seconds,
-        )
+        configured_providers = providers or [provider]
+        def run_provider(name: str) -> AgentResult:
+            if name != configured_providers[0]:
+                _git(worktree, "reset", "--hard", f"origin/{base_branch}")
+                _git(worktree, "clean", "-fdx")
+            return run_agent(name, prompt, cwd=worktree, log_path=log_path or repo / ".dev-agents" / "degodify.log", timeout_seconds=timeout_seconds)
+        accepted = run_with_fallback(configured_providers, run_provider)
+        result = accepted[1] if accepted else None
         clean = _git(worktree, "status", "--porcelain") == ""
         changed = _git(worktree, "rev-parse", "HEAD") != _git(worktree, "rev-parse", f"origin/{base_branch}")
-        if result.returncode != 0 or not clean or not changed:
+        if result is None or not clean or not changed:
             return DegodifyRunResult(candidate, branch, None, False, False)
         _git(worktree, "push", "-u", "origin", branch)
         title = f"♻️ Curator: [degodify] extract concern from {PurePosixPath(candidate.relative_path).name}"

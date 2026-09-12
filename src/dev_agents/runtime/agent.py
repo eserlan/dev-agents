@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,23 @@ class AgentResult:
 
     returncode: int | None
     timed_out: bool
+
+
+def run_with_fallback(
+    providers: Iterable[str],
+    run_one: Callable[[str], AgentResult],
+    accept: Callable[[str, AgentResult], bool] | None = None,
+) -> tuple[str, AgentResult] | None:
+    """Run providers in order until a result satisfies the acceptance policy."""
+    for provider in providers:
+        result = run_one(provider)
+        if accept is None:
+            accepted = result.returncode == 0 and not result.timed_out
+        else:
+            accepted = accept(provider, result)
+        if accepted:
+            return provider, result
+    return None
 
 
 def provider_command(provider: str, prompt: str) -> list[str]:
