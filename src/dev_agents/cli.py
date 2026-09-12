@@ -12,6 +12,7 @@ from dev_agents.context.repository import RepositoryError
 from dev_agents.pr_fixer import serve_project
 from dev_agents.workflows.degodify import run_degodify
 from dev_agents.workflows.inspection import inspect_project
+from dev_agents.workflows.release_comms import run_release_comms
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--base", default="staging")
     run.add_argument("--provider", default="codex")
     run.add_argument("--execute", action="store_true", help="Create branch, push, and open a PR")
+    comms = subcommands.add_parser("release-comms", help="Run release communications workflows")
+    comms_subcommands = comms.add_subparsers(dest="release_comms_command", required=True)
+    evaluate = comms_subcommands.add_parser("evaluate", help="Evaluate release changes and generate drafts")
+    evaluate.add_argument("project", help="Configured project name")
+    evaluate.add_argument("promote_run_id", help="GitHub workflow run ID of promote-to-prod")
+    evaluate.add_argument("--config", type=Path, default=Path("config/projects.yaml"))
+    evaluate.add_argument("--publish", action="store_true", help="Publish approved destinations")
+    evaluate.add_argument("--dry-run", action="store_true", default=True, help="Run without publishing (default: True)")
 
     return parser
 
@@ -82,6 +91,30 @@ def main(argv: list[str] | None = None) -> int:
             "succeeded": result.succeeded,
         }, indent=2, sort_keys=True))
         return 0 if result.succeeded else 1
+    if arguments.command == "release-comms" and arguments.release_comms_command == "evaluate":
+        try:
+            config = load_projects_config(arguments.config)
+            project = select_project(config, arguments.project)
+            dry_run = not arguments.publish
+            comms_result = run_release_comms(
+                project,
+                arguments.project,
+                arguments.promote_run_id,
+                dry_run=dry_run,
+                publish_approved=arguments.publish,
+            )
+        except (ConfigError, RepositoryError, RuntimeError) as error:
+            parser.exit(2, f"error: {error}\n")
+        print(json.dumps({
+            "promoteRunId": comms_result.promote_run_id,
+            "newSha": comms_result.new_sha,
+            "previousSha": comms_result.previous_sha,
+            "postworthy": comms_result.postworthy,
+            "drafts": comms_result.drafts,
+            "published": comms_result.published,
+            "completed": comms_result.completed,
+        }, indent=2, sort_keys=True))
+        return 0 if comms_result.completed else 1
     return 1
 
 

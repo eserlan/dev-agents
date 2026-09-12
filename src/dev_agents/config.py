@@ -16,6 +16,22 @@ class ProjectConfig(BaseModel):
     repo: Path
     github: str | None = None
     pr_fixer: PrFixerConfig | None = None
+    release_comms: ReleaseCommsConfig | None = None
+
+
+class ReleaseCommsConfig(BaseModel):
+    """Opt-in configuration for the release communications workflow."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tracking_issue: int = 2906
+    providers: list[str] = ["muse", "claude", "agy", "codex"]
+    timeout_minutes: int = 10
+    state_path: Path | None = None
+    log_dir: Path | None = None
+    auto_publish: bool = False
+    webhook_path: str = "/release-comms"
+    webhook_secret_env: str = "RELEASE_COMMS_SECRET"
 
 
 class PrFixerConfig(BaseModel):

@@ -34,6 +34,7 @@ from dev_agents.runtime import (
     run_with_fallback,
 )
 from dev_agents.workflows.degodify import DegodifyFile, run_degodify
+from dev_agents.workflows.release_comms import run_release_comms
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -357,6 +358,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
         raise ConfigError(f"Set {config.webhook_secret_env} before starting the PR fixer")
     webhook_secret = secret
     degodify_secret = os.environ.get(config.degodify_webhook_secret_env)
+    release_comms_secret = os.environ.get(project.release_comms.webhook_secret_env) if project.release_comms else None
 
     _cleanup_artifacts(project_name, config)
     service = PrFixerService(project_name, project, config)
@@ -404,6 +406,31 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                         _log(f"failed delivery={delivery} event=degodify error={error}")
                 Thread(target=run_deg, daemon=True).start()
                 _log(f"accepted delivery={delivery} event=degodify path={candidate.relative_path}")
+                self.send_response(202); self.end_headers(); return
+            if project.release_comms and self.path == project.release_comms.webhook_path:
+                secret_hdr = self.headers.get("X-Release-Comms-Secret")
+                if not release_comms_secret or not secret_hdr or not hmac.compare_digest(secret_hdr, release_comms_secret):
+                    _log(f"rejected delivery={delivery} event=release-comms reason=invalid-secret")
+                    self.send_response(401); self.end_headers(); return
+                try:
+                    comms_payload = json.loads(body)
+                except json.JSONDecodeError:
+                    _log(f"rejected delivery={delivery} event=release-comms reason=invalid-json")
+                    self.send_response(400); self.end_headers(); return
+                promote_run_id = str(comms_payload.get("promoteRunId", ""))
+                if not promote_run_id:
+                    _log(f"ignored delivery={delivery} event=release-comms reason=missing-promote-run-id")
+                    self.send_response(400); self.end_headers(); return
+                comms_cfg = project.release_comms
+                auto_publish = bool(comms_cfg and comms_cfg.auto_publish)
+                def run_comms() -> None:
+                    try:
+                        res = run_release_comms(project, project_name, promote_run_id, dry_run=not auto_publish, publish_approved=auto_publish)
+                        _log(f"handled delivery={delivery} event=release-comms run_id={promote_run_id} completed={res.completed}")
+                    except Exception as error:  # noqa: BLE001 - daemon must log worker failures
+                        _log(f"failed delivery={delivery} event=release-comms error={error}")
+                Thread(target=run_comms, daemon=True).start()
+                _log(f"accepted delivery={delivery} event=release-comms run_id={promote_run_id}")
                 self.send_response(202); self.end_headers(); return
             if self.path != config.webhook_path or not _signature_valid(body, self.headers.get("X-Hub-Signature-256"), webhook_secret):
                 _log(f"rejected delivery={delivery} event={event or 'unknown'} reason=invalid-path-or-signature")
