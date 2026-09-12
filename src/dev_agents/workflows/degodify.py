@@ -135,7 +135,7 @@ def _run_degodify_impl(
     try:
         _git(repo, "fetch", "origin", base_branch)
         _git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base_branch}")
-        prompt = build_decomposition_prompt(candidate, branch, base_branch)
+        prompt = build_decomposition_prompt(candidate, branch, base_branch, worktree)
         configured_providers = providers or [provider]
         def run_provider(name: str) -> AgentResult:
             if name != configured_providers[0]:
@@ -248,8 +248,11 @@ def select_candidate(files: list[DegodifyFile], active_items: list[str]) -> Cand
     return CandidateSelection(None, skipped)
 
 
-def build_decomposition_prompt(file: DegodifyFile, branch: str, base_branch: str) -> str:
+def build_decomposition_prompt(file: DegodifyFile, branch: str, base_branch: str, worktree: Path) -> str:
     """Build the bounded extraction prompt without performing any mutation."""
+    changed_files_output = _git(worktree, "diff", "--name-only", f"origin/{base_branch}...HEAD", check=False)
+    changed_files = [path for path in changed_files_output.splitlines() if path and (worktree / path).exists()]
+    changed_text = " ".join(changed_files) if changed_files else "<no changed files detected>"
     return f"""You are Curator, an autonomous refactoring specialist.
 
 TARGET FILE: {file.relative_path} (Current size: {file.total_lines} lines, {file.code_lines} code lines, type: {file.file_type})
@@ -257,5 +260,12 @@ CURRENT BRANCH: {branch} (branched from {base_branch})
 
 Extract ONE single cohesive responsibility into a dedicated sibling file.
 Preserve the existing public API and behavior. Add focused tests for the extraction.
-Run the focused test, type-check, and lint gates before committing or pushing.
+
+Changed files (use these paths for targeted testing and verification):
+{changed_text}
+
+Run focused tests for the changed files first. For linting and formatting, target only the changed files
+(for example, `bunx eslint <changed-files>` and `bunx prettier --check <changed-files>`); do not run
+the repository-wide `bun run lint` unless a targeted command is unavailable. Run type-check only when
+required by repository instructions. Commit and push HEAD to the PR branch.
 Do not merge the pull request."""

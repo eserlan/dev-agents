@@ -255,8 +255,8 @@ class PrFixerService:
                 log_dir = (self.config.log_dir or Path.home() / ".local/state/dev-agents" / self.project_name / "logs").expanduser()
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log = log_dir / f"pr-{number}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
-                prompt = _prompt(worktree, number, keys, base, conflicts)
                 def run_provider(provider: str) -> Any:
+                    prompt = _prompt(worktree, number, keys, base, conflicts)
                     _log(f"agent-start pr={number} provider={provider} log={log}")
                     result = run_agent(
                         provider,
