@@ -6,12 +6,29 @@ def test_codex_provider_command_uses_non_interactive_exec() -> None:
         "codex",
         "exec",
         "--dangerously-bypass-approvals-and-sandbox",
+        "-m",
+        "gpt-5.6-luna",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "fix it",
+    ]
+
+
+def test_claude_provider_command_uses_haiku_medium() -> None:
+    assert provider_command("claude", "fix it") == [
+        "claude",
+        "-p",
+        "--dangerously-skip-permissions",
+        "--model",
+        "haiku",
+        "--effort",
+        "medium",
         "fix it",
     ]
 
 
 def test_generic_provider_command_uses_prompt_flag() -> None:
-    assert provider_command("claude", "fix it") == ["claude", "-p", "fix it"]
+    assert provider_command("other-agent", "fix it") == ["other-agent", "-p", "fix it"]
 
 
 def test_agy_provider_command_uses_bounded_print_mode() -> None:
@@ -19,9 +36,21 @@ def test_agy_provider_command_uses_bounded_print_mode() -> None:
         "agy",
         "--print",
         "fix it",
-        "--effort=medium",
+        "--model=gemini-3.8-flash-low",
+        "--effort=low",
         "--dangerously-skip-permissions",
         "--print-timeout=3m0s",
+    ]
+
+
+def test_muse_provider_command_uses_spark() -> None:
+    assert provider_command("muse", "fix it") == [
+        "muse",
+        "exec",
+        "--model",
+        "muse-spark-1.2",
+        "--yolo",
+        "fix it",
     ]
 
 

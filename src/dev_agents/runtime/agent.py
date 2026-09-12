@@ -38,16 +38,46 @@ def run_with_fallback(
 def provider_command(provider: str, prompt: str, timeout_seconds: float = 1200) -> list[str]:
     """Build the command line for a configured provider."""
     if provider == "codex":
-        return ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", prompt]
+        return [
+            "codex",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            "gpt-5.6-luna",
+            "-c",
+            'model_reasoning_effort="medium"',
+            prompt,
+        ]
+    if provider == "claude":
+        return [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--model",
+            "haiku",
+            "--effort",
+            "medium",
+            prompt,
+        ]
     if provider == "agy":
         timeout_minutes = max(1, ceil(timeout_seconds / 60))
         return [
             "agy",
             "--print",
             prompt,
-            "--effort=medium",
+            "--model=gemini-3.8-flash-low",
+            "--effort=low",
             "--dangerously-skip-permissions",
             f"--print-timeout={timeout_minutes}m0s",
+        ]
+    if provider == "muse":
+        return [
+            "muse",
+            "exec",
+            "--model",
+            "muse-spark-1.2",
+            "--yolo",
+            prompt,
         ]
     return [provider, "-p", prompt]
 

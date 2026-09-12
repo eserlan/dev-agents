@@ -392,7 +392,13 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                     self.send_response(200); self.end_headers(); return
                 def run_deg() -> None:
                     try:
-                        result = run_degodify(project.repo, base_branch=config.base_branch, provider=config.providers[0], dry_run=False, supplied_candidate=candidate)
+                        result = run_degodify(
+                            project.repo,
+                            base_branch=config.base_branch,
+                            providers=config.providers,
+                            dry_run=False,
+                            supplied_candidate=candidate,
+                        )
                         _log(f"handled delivery={delivery} event=degodify path={candidate.relative_path} succeeded={result.succeeded}")
                     except Exception as error:  # noqa: BLE001 - daemon must log worker failures
                         _log(f"failed delivery={delivery} event=degodify error={error}")
