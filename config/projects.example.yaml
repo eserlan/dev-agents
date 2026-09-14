@@ -3,12 +3,41 @@ projects:
   codex-cryptica:
     repo: /home/your-user/repos/Codex-Cryptica
     github: eserlan/Codex-Cryptica
+    # Optional automatic report destination. Omit to use ~/.local/state/dev-agents/<project>/dev-agents-flow.html.
+    visualization_path: ~/.local/state/dev-agents/codex-cryptica/dev-agents-flow.html
+    # Optional Vercel upload after each report refresh. Requires the Vercel CLI and either a
+    # login for the daemon user or a token in the daemon environment. The deployment is best-effort.
+    # report_vercel_project: codex-cryptica-flow
+    # report_vercel_scope: your-team-slug
+    # report_vercel_alias: flow.example.com
+    # report_vercel_token_env: VERCEL_TOKEN
+    # report_vercel_min_interval_seconds: 300
+    # report_vercel_max_deployments_24h: 80
     pr_fixer:
       base_branch: staging
       port: 8788
+      # SQLite state database. Omit to use ~/.local/state/dev-agents/<project>/pr-fixer-state.db.
+      state_path: ~/.local/state/dev-agents/codex-cryptica/pr-fixer-state.db
       # Secret values stay in a private environment file, never here.
       webhook_secret_env: GITHUB_WEBHOOK_SECRET
       providers: [codex]
+      reasoning_effort: high
+      # Green staging PRs without a submitted Copilot review receive the two-pass
+      # general + Codex-Cryptica review before auto-merge eligibility is checked.
+      review_without_copilot: true
       auto_merge: false
       log_retention_days: 30
       worktree_retention_days: 2
+    # Required for the promote workflow's "Trigger Release Communications Agent"
+    # step: without this block, POSTs to /release-comms are rejected with 401.
+    release_comms:
+      tracking_issue: 2906
+      # Omit to use <target-repository>/.dev-agents/release-comms-state.db.
+      state_path: ~/.local/state/dev-agents/codex-cryptica/release-comms-state.db
+      auto_publish: false
+      # Pick a random 15–30 minute delay between distinct live messages.
+      publication_delay_min_seconds: 900
+      publication_delay_max_seconds: 1800
+      scheduler_poll_seconds: 30
+      webhook_path: /release-comms
+      webhook_secret_env: RELEASE_COMMS_SECRET

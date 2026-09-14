@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -54,12 +55,19 @@ class DegodifyState(TypedDict, total=False):
     timeout_seconds: float
     dry_run: bool
     supplied_candidate: DegodifyFile | None
+    on_event: Callable[[str, dict[str, Any]], None] | None
     candidate: DegodifyFile | None
     result: DegodifyRunResult
 
 
 IGNORED_DIRS = {"node_modules", ".git", "dist", "build", "coverage", ".svelte-kit"}
 SOURCE_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".svelte"}
+
+
+def _emit(state: DegodifyState, event: str, payload: dict[str, Any]) -> None:
+    callback = state.get("on_event")
+    if callback is not None:
+        callback(event, payload)
 
 
 def analyze_repository(repo: Path, *, top_count: int = 50) -> list[DegodifyFile]:
@@ -92,13 +100,16 @@ def active_repository_items(repo: Path) -> list[str]:
     except (GitHubError, TypeError):
         pass
     try:
-        import subprocess
-
         result = subprocess.run(
-            ["git", "branch", "-r"], cwd=repo, text=True, capture_output=True, check=False
+            ["git", "branch", "-r"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
         )
         items.extend(line.strip().lower() for line in result.stdout.splitlines() if line.strip())
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return items
 
@@ -163,6 +174,11 @@ def build_degodify_workflow() -> Any:
 
     def prepare(state: DegodifyState) -> dict[str, object]:
         candidate = state.get("supplied_candidate") or plan_degodify(state["repo"]).candidate
+        _emit(
+            state,
+            "prepare_candidate",
+            {"candidate": candidate.relative_path if candidate is not None else None},
+        )
         return {"candidate": candidate}
 
     def execute(state: DegodifyState) -> dict[str, object]:
@@ -176,9 +192,15 @@ def build_degodify_workflow() -> Any:
             dry_run=state.get("dry_run", True),
             supplied_candidate=state.get("candidate"),
         )
+        _emit(state, "execute_decomposition", {"succeeded": result.succeeded})
         return {"result": result}
 
     def publish(state: DegodifyState) -> dict[str, object]:
+        _emit(
+            state,
+            "publish_result",
+            {"branch": state["result"].branch, "succeeded": state["result"].succeeded},
+        )
         return {"result": state["result"]}
 
     graph.add_node("prepare_candidate", prepare)
@@ -201,6 +223,7 @@ def run_degodify(
     timeout_seconds: float = 25 * 60,
     dry_run: bool = True,
     supplied_candidate: DegodifyFile | None = None,
+    on_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> DegodifyRunResult:
     """Run degodify through its LangGraph workflow."""
     result = build_degodify_workflow().invoke({
@@ -212,19 +235,30 @@ def run_degodify(
         "timeout_seconds": timeout_seconds,
         "dry_run": dry_run,
         "supplied_candidate": supplied_candidate,
+        "on_event": on_event,
     })
     return cast(DegodifyRunResult, result["result"])
 
 
-def _git(repo: Path, *args: str, check: bool = True) -> str:
-    result = subprocess.run(("git", *args), cwd=repo, text=True, capture_output=True, check=False)
+def _git(repo: Path, *args: str, check: bool = True, timeout: float = 120) -> str:
+    try:
+        result = subprocess.run(
+            ("git", *args), cwd=repo, text=True, capture_output=True, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout:g}s") from error
     if check and result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git command failed")
     return result.stdout.strip()
 
 
-def _gh(repo: Path, *args: str) -> str:
-    result = subprocess.run(("gh", *args), cwd=repo, text=True, capture_output=True, check=False)
+def _gh(repo: Path, *args: str, timeout: float = 60) -> str:
+    try:
+        result = subprocess.run(
+            ("gh", *args), cwd=repo, text=True, capture_output=True, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"gh {' '.join(args)} timed out after {timeout:g}s") from error
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh command failed")
     return result.stdout.strip()

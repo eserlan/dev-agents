@@ -32,14 +32,18 @@ class RepositoryContext(BaseModel):
         return not self.status
 
 
-def _git(repository: Path, *args: str, check: bool = True) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repository,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def _git(repository: Path, *args: str, check: bool = True, timeout: float = 60) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RepositoryError(f"git {' '.join(args)} timed out after {timeout:g}s") from error
     if check and result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
         raise RepositoryError(f"git {' '.join(args)} failed: {message}")

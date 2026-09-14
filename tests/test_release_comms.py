@@ -1,27 +1,37 @@
+import json
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from dev_agents.config import ProjectConfig, ReleaseCommsConfig
+from dev_agents.runtime import DuplicateRunError, StateRepository
 from dev_agents.workflows.release_comms import (
     EvaluatorResult,
     WriterResult,
     extract_json_block,
+    resolve_promote_shas,
     run_release_comms,
 )
+from dev_agents.workflows.release_publish import PublicationReceipt
 
 
 def test_extract_json_block_fenced_and_unfenced() -> None:
-    fenced = "```json\n{\"postworthy\": true, \"reason\": \"good\"}\n```"
+    fenced = '```json\n{"postworthy": true, "reason": "good"}\n```'
     assert extract_json_block(fenced) == {"postworthy": True, "reason": "good"}
 
-    unfenced = "some text {\"postworthy\": false, \"reason\": \"bad\"} trailing"
+    unfenced = 'some text {"postworthy": false, "reason": "bad"} trailing'
     assert extract_json_block(unfenced) == {"postworthy": False, "reason": "bad"}
 
     assert extract_json_block("not json at all") is None
 
 
-def test_run_release_comms_dry_run_does_not_publish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_run_release_comms_dry_run_does_not_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     project = ProjectConfig(
@@ -68,7 +78,9 @@ def test_run_release_comms_dry_run_does_not_publish(monkeypatch: pytest.MonkeyPa
     assert result.published["bluesky"] == []
 
 
-def test_run_release_comms_not_postworthy_skips_drafts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_run_release_comms_not_postworthy_skips_drafts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     project = ProjectConfig(repo=repo, github="owner/repo")
@@ -95,3 +107,228 @@ def test_run_release_comms_not_postworthy_skips_drafts(monkeypatch: pytest.Monke
     assert result.postworthy is False
     assert result.drafts is None
     assert result.completed is True
+
+
+def test_run_release_comms_claims_promote_run_and_respects_configured_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "custom-state.db"
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(state_path=database),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+
+    evaluation = EvaluatorResult(postworthy=False, reason="chore")
+    run_release_comms(project, "demo", "123", evaluator_result=evaluation)
+
+    with pytest.raises(DuplicateRunError):
+        run_release_comms(project, "demo", "123", evaluator_result=evaluation)
+    record = StateRepository(database, "demo", repo).get_run("release-comms", "123")
+    assert record is not None
+    assert record.status == "completed"
+    assert record.attempt == 1
+    assert database.exists()
+    assert not (tmp_path / "custom-state.db.db").exists()
+
+
+def test_live_release_comms_schedules_and_resumes_publications(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "release.db"
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(
+            state_path=database,
+            image_generation=False,
+            publication_delay_min_seconds=900,
+            publication_delay_max_seconds=1800,
+        ),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
+    )
+    published_pages: list[str] = []
+
+    def fake_publish(**kwargs: object) -> PublicationReceipt:
+        page_url = str(kwargs["page_url"])
+        published_pages.append(page_url)
+        return PublicationReceipt("bluesky", "bluesky", page_url, f"https://bsky.test/{len(published_pages)}")
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish.publish_bluesky", fake_publish)
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_publish.publish_discord",
+        lambda **kwargs: [
+            PublicationReceipt(
+                "discord", "main-community", str(kwargs["page_url"]), "https://discord.test/1"
+            )
+        ],
+    )
+    evaluation = EvaluatorResult(
+        postworthy=True, reason="Launch", recommended_channels=["bluesky"]
+    )
+    drafts = WriterResult(
+        bluesky=[
+            {"pageUrl": "https://example.com/a", "text": "A", "image": "og/a.jpg"},
+            {"pageUrl": "https://example.com/b", "text": "B", "image": "og/b.jpg"},
+        ]
+    )
+
+    first = run_release_comms(
+        project, "demo", "release-1", dry_run=False, publish_approved=True,
+        evaluator_result=evaluation, writer_result=drafts,
+    )
+    assert first.completed is False
+    assert first.scheduled is True
+    assert published_pages == ["https://example.com/a"]
+    state = StateRepository(database, "demo", repo)
+    record = state.get_run("release-comms", "release-1")
+    assert record is not None
+    assert record.status == "scheduled"
+    assert record.metadata["_release_comms_resume"]["writer_result"]["bluesky"]
+    with pytest.raises(DuplicateRunError, match="scheduled for"):
+        run_release_comms(project, "demo", "release-1", dry_run=False, publish_approved=True)
+
+    state.update_run(
+        "release-comms",
+        "release-1",
+        status="scheduled",
+        metadata={"next_publication_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat()},
+    )
+    second = run_release_comms(
+        project, "demo", "release-1", dry_run=False, publish_approved=True
+    )
+    assert second.completed is True
+    assert second.scheduled is False
+    assert published_pages == ["https://example.com/a", "https://example.com/b"]
+
+
+def _ok(stdout: str) -> Any:
+    return SimpleNamespace(stdout=stdout, returncode=0)
+
+
+def test_resolve_promote_shas_prefers_gh_over_git(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(args: list[str], **kwargs: Any) -> Any:
+        if args[0] == "git":
+            raise AssertionError(f"gh output should suffice, unexpected: {args}")
+        if args[2] == "view":
+            return _ok("newsha123\n")
+        return _ok(json.dumps([{"databaseId": 123, "headSha": "prevsha000"}]))
+
+    monkeypatch.setattr("dev_agents.workflows.release_comms.subprocess.run", fake_run)
+    assert resolve_promote_shas(tmp_path, "999") == ("newsha123", "prevsha000")
+
+
+def test_resolve_promote_shas_timeout_falls_back_to_git(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(args: list[str], **kwargs: Any) -> Any:
+        if args[0] == "gh":
+            raise subprocess.TimeoutExpired(cmd=args, timeout=60)
+        if args == ["git", "rev-parse", "HEAD"]:
+            return _ok("headsha\n")
+        if args == ["git", "rev-parse", "HEAD~1"]:
+            return _ok("prevsha\n")
+        raise AssertionError(f"unexpected command: {args}")
+
+    monkeypatch.setattr("dev_agents.workflows.release_comms.subprocess.run", fake_run)
+    assert resolve_promote_shas(tmp_path, "123") == ("headsha", "prevsha")
+
+
+def test_resolve_promote_shas_raises_when_unresolvable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(args: list[str], **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(cmd=args, timeout=60)
+
+    monkeypatch.setattr("dev_agents.workflows.release_comms.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="could not resolve"):
+        resolve_promote_shas(tmp_path, "123")
+
+
+def test_progress_events_trace_phases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    result = run_release_comms(
+        project,
+        "demo",
+        "123",
+        dry_run=True,
+        evaluator_result=EvaluatorResult(
+            postworthy=True, reason="Launch", importance="high", features=[{"name": "F"}]
+        ),
+        writer_result=WriterResult(
+            bluesky=[{"pageUrl": "", "text": "Hi"}],
+            discord="Hi",
+        ),
+        on_event=lambda event, payload: events.append((event, payload)),
+    )
+
+    assert result.completed is True
+    assert [event for event, _ in events] == [
+        "resolved",
+        "evaluated",
+        "routed",
+        "drafted",
+        "published",
+    ]
+    by_name = dict(events)
+    assert by_name["resolved"] == {"new_sha": "newsha", "previous_sha": "prevsha"}
+    assert by_name["evaluated"]["postworthy"] is True
+    assert by_name["evaluated"]["reason"] == "Launch"
+    assert by_name["drafted"] == {
+        "bluesky": 1,
+        "github_discussions": 0,
+        "discord": True,
+    }
+    assert by_name["published"] == {"completed": True, "postworthy": True}
+
+
+def test_progress_events_skip_drafts_when_not_postworthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    run_release_comms(
+        project,
+        "demo",
+        "123",
+        dry_run=True,
+        evaluator_result=EvaluatorResult(postworthy=False, reason="Chores"),
+        on_event=lambda event, payload: events.append((event, payload)),
+    )
+
+    assert [event for event, _ in events] == [
+        "resolved",
+        "evaluated",
+        "routed",
+        "drafts_skipped",
+        "published",
+    ]

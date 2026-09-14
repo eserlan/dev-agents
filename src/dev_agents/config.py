@@ -15,6 +15,14 @@ class ProjectConfig(BaseModel):
 
     repo: Path
     github: str | None = None
+    visualization_path: Path | None = None
+    report_vercel_project: str | None = None
+    report_vercel_scope: str | None = None
+    report_vercel_alias: str | None = None
+    report_vercel_token_env: str = "VERCEL_TOKEN"
+    report_vercel_timeout_seconds: int = 120
+    report_vercel_min_interval_seconds: int = 300
+    report_vercel_max_deployments_24h: int = 80
     pr_fixer: PrFixerConfig | None = None
     release_comms: ReleaseCommsConfig | None = None
 
@@ -32,6 +40,13 @@ class ReleaseCommsConfig(BaseModel):
     auto_publish: bool = False
     webhook_path: str = "/release-comms"
     webhook_secret_env: str = "RELEASE_COMMS_SECRET"
+    local_generation: bool = False
+    forms: list[str] = ["short", "long"]
+    image_generation: bool = False
+    image_providers: list[str] = ["agy", "codex", "muse"]
+    publication_delay_min_seconds: float = 900.0
+    publication_delay_max_seconds: float = 1800.0
+    scheduler_poll_seconds: int = 30
 
 
 class PrFixerConfig(BaseModel):
@@ -45,8 +60,10 @@ class PrFixerConfig(BaseModel):
     log_dir: Path | None = None
     worktree_dir: Path | None = None
     providers: list[str] = ["codex"]
+    reasoning_effort: str = "high"
     timeout_minutes: int = 20
     reconcile_interval_seconds: int = 300
+    review_without_copilot: bool = True
     auto_merge: bool = False
     log_retention_days: int = 30
     worktree_retention_days: int = 2

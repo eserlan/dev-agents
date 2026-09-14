@@ -14,6 +14,12 @@ def test_codex_provider_command_uses_non_interactive_exec() -> None:
     ]
 
 
+def test_codex_provider_command_can_use_luna_high_reasoning() -> None:
+    assert 'model_reasoning_effort="high"' in provider_command(
+        "codex", "review it", reasoning_effort="high"
+    )
+
+
 def test_claude_provider_command_uses_haiku_medium() -> None:
     assert provider_command("claude", "fix it") == [
         "claude",

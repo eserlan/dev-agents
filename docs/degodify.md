@@ -42,3 +42,7 @@ projects:
       degodify_webhook_path: /degodify
       degodify_webhook_secret_env: DEGODIFY_WEBHOOK_SECRET
 ```
+
+Degodify delivery claims share the PR-fixer SQLite database. Set `pr_fixer.state_path` to choose
+the location; the default is `~/.local/state/dev-agents/<project>/pr-fixer-state.db`. Claims are
+durable across daemon processes, so a repeated delivery or analysis run is rejected transactionally.

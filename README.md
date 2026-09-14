@@ -30,6 +30,17 @@ The command writes a JSON inspection summary to stdout. Its Git commands are rea
 See [docs/pr-fixer-daemon.md](docs/pr-fixer-daemon.md) for the systemd and Cloudflare Tunnel
 setup. Secrets and tunnel credentials remain outside the repository.
 
+## Visualize workflow runs
+
+Generate a local HTML view of the LangGraph flows and recent job timelines:
+
+```bash
+uv run dev-agents visualize codex-cryptica --config config/projects.yaml \
+  --output /tmp/dev-agents-flow.html
+```
+
+See [docs/observability.md](docs/observability.md) for details.
+
 ## Development
 
 ```bash

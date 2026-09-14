@@ -12,18 +12,23 @@ class GitHubError(RuntimeError):
     """Raised when a GitHub CLI operation fails."""
 
 
-def gh(repo: Path, *args: str, check: bool = True) -> str:
+def gh(repo: Path, *args: str, check: bool = True, timeout: float = 60) -> str:
     """Run ``gh`` in a repository and return trimmed stdout."""
-    result = subprocess.run(("gh", *args), cwd=repo, text=True, capture_output=True, check=False)
+    try:
+        result = subprocess.run(
+            ("gh", *args), cwd=repo, text=True, capture_output=True, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise GitHubError(f"gh {' '.join(args)} timed out after {timeout:g}s") from error
     if check and result.returncode:
         raise GitHubError(result.stderr.strip() or result.stdout.strip() or "gh command failed")
     return result.stdout.strip()
 
 
-def gh_json(repo: Path, *args: str) -> Any:
+def gh_json(repo: Path, *args: str, timeout: float = 60) -> Any:
     """Run ``gh`` and decode its JSON response."""
     try:
-        return json.loads(gh(repo, *args))
+        return json.loads(gh(repo, *args, timeout=timeout))
     except json.JSONDecodeError as error:
         raise GitHubError(f"invalid JSON from gh: {error}") from error
 

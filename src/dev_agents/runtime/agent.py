@@ -35,7 +35,12 @@ def run_with_fallback(
     return None
 
 
-def provider_command(provider: str, prompt: str, timeout_seconds: float = 1200) -> list[str]:
+def provider_command(
+    provider: str,
+    prompt: str,
+    timeout_seconds: float = 1200,
+    reasoning_effort: str = "medium",
+) -> list[str]:
     """Build the command line for a configured provider."""
     if provider == "codex":
         return [
@@ -45,7 +50,7 @@ def provider_command(provider: str, prompt: str, timeout_seconds: float = 1200) 
             "-m",
             "gpt-5.6-luna",
             "-c",
-            'model_reasoning_effort="medium"',
+            f'model_reasoning_effort="{reasoning_effort}"',
             prompt,
         ]
     if provider == "claude":
@@ -90,6 +95,7 @@ def run_agent(
     log_path: Path,
     timeout_seconds: float,
     heartbeat_seconds: float = 30.0,
+    reasoning_effort: str = "medium",
 ) -> AgentResult:
     """Run a provider, forwarding output to a durable log and emitting heartbeats."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +103,7 @@ def run_agent(
         stream.write(f"\n=== agent started provider={provider} ===\n")
         stream.flush()
         process = subprocess.Popen(
-            provider_command(provider, prompt, timeout_seconds),
+            provider_command(provider, prompt, timeout_seconds, reasoning_effort),
             cwd=cwd,
             stdout=stream,
             stderr=subprocess.STDOUT,

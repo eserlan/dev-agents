@@ -9,8 +9,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-def _run(repo: Path, *args: str, check: bool = True) -> str:
-    result = subprocess.run(args, cwd=repo, text=True, capture_output=True, check=False)
+def _run(repo: Path, *args: str, check: bool = True, timeout: float = 120) -> str:
+    try:
+        result = subprocess.run(
+            args, cwd=repo, text=True, capture_output=True, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"{' '.join(args)} timed out after {timeout:g}s") from error
     if check and result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
     return result.stdout.strip()
