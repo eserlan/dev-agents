@@ -7,6 +7,7 @@ from dev_agents.config import ProjectConfig
 from dev_agents.workflows.release_publish import (
     PublicationError,
     PublicationReceipt,
+    publish_discord,
     publish_release_drafts,
     resolve_image,
     social_delivery_image_url,
@@ -48,6 +49,31 @@ def test_http_image_download_sends_user_agent(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     assert _http_bytes("https://assets.codexcryptica.com/image.png") == b"image"
     assert seen["User-agent"] == "dev-agents/release-comms"
+
+
+def test_discord_execution_uses_canonical_host_and_wait_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_http(url: str, **kwargs: object) -> dict[str, object]:
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers")
+        return {"id": "message"}
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish._http_json", fake_http)
+    receipts = publish_discord(
+        repo=tmp_path,
+        message="Hello",
+        page_url="https://example.com/a",
+        env={"DISCORD_WEBHOOK_URL": "https://discordapp.com/api/webhooks/123/token"},
+        dry_run=False,
+    )
+
+    assert len(receipts) == 1
+    assert str(seen["url"]).startswith("https://discord.com/api/webhooks/123/token?")
+    assert "wait=true" in str(seen["url"])
+    assert seen["headers"] == {"User-Agent": "dev-agents/release-comms"}
 
 
 def test_resolve_image_uses_draft_key_or_page_slug() -> None:

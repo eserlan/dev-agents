@@ -348,6 +348,17 @@ def _discord_config(repo: Path) -> list[dict[str, Any]]:
     return [item for item in destinations if isinstance(item, dict) and item.get("auto_publish", True)]
 
 
+def _discord_execute_url(webhook: str) -> str:
+    """Use Discord's canonical host and request a JSON execution receipt."""
+    parsed = urllib.parse.urlsplit(webhook)
+    if parsed.hostname in {"discordapp.com", "www.discordapp.com"}:
+        parsed = parsed._replace(netloc="discord.com")
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key == "wait" for key, _ in query):
+        query.append(("wait", "true"))
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+
+
 def publish_discord(
     *,
     repo: Path,
@@ -383,7 +394,16 @@ def publish_discord(
             delay = random.uniform(delay_min, delay_max)
             if delay > 0:
                 time.sleep(delay)
-        _http_json(webhook, method="POST", payload={"content": message})
+        try:
+            _http_json(
+                _discord_execute_url(webhook),
+                method="POST",
+                payload={"content": message},
+                headers={"User-Agent": "dev-agents/release-comms"},
+            )
+        except PublicationError as error:
+            # Do not put the webhook token into SQLite or journal logs.
+            raise PublicationError("Discord webhook execution failed") from error
         receipts.append(PublicationReceipt("discord", destination_id, page_url, None))
         if max_publications is not None and len(receipts) >= max_publications:
             break
