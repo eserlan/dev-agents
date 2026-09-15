@@ -9,6 +9,7 @@ receipt immediately, making failed runs safe to retry.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import shutil
@@ -93,8 +94,8 @@ def _upload_r2_file(
 
     if shutil.which("wrangler"):
         command = ["wrangler"]
-    elif shutil.which("bunx"):
-        command = ["bunx", "wrangler"]
+    elif bunx := shutil.which("bunx"):
+        command = [bunx, "wrangler"]
     else:
         raise PublicationError("wrangler or bunx is required to upload to R2")
     command.extend(

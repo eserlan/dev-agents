@@ -11,6 +11,7 @@ from dev_agents.workflows.reddit import (
     export_reddit_markdown,
     fetch_subreddit_posts,
     format_reddit_post,
+    prune_published_reddit_candidates,
     stage_reddit_candidate,
     sync_reddit_status,
 )
@@ -88,6 +89,7 @@ def test_stage_reddit_candidate_live_invokes_wrangler(
         return f"https://assets.codexcryptica.com/{key}"
 
     monkeypatch.setattr("dev_agents.workflows.reddit._upload_r2_file", fake_upload_r2_file)
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=15.0: (_ for _ in ()).throw(FileNotFoundError("isolated test")))
 
     receipt = stage_reddit_candidate(
         repo=tmp_path,
@@ -410,5 +412,104 @@ def test_cli_sync_reddit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
     assert data["reconciled"][0]["runId"] == "run-99"
     assert data["reconciled"][0]["publicUrl"] == "https://www.reddit.com/r/codexcryptica/comments/sorcery_thread/"
     assert data["reconciled"][0]["status"] == "published"
+
+
+def test_prune_published_reddit_candidates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    initial_manifest = {
+        "updated_at": 1000,
+        "candidates": [
+            {"id": "post-1", "source_id": "src-1", "title": "Post 1"},
+            {"id": "post-2", "source_id": "src-2", "title": "Post 2"},
+            {"id": "post-3", "source_id": "src-3", "title": "Post 3"},
+        ],
+    }
+
+    class DummyResponse:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return json.dumps(initial_manifest).encode("utf-8")
+
+    uploaded_manifest: dict[str, Any] = {}
+
+    def fake_upload(*, repo: Path, path: Path, key: str, **kwargs: Any) -> str:
+        nonlocal uploaded_manifest
+        uploaded_manifest = json.loads(path.read_text(encoding="utf-8"))
+        return f"https://assets.codexcryptica.com/{key}"
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=15.0: DummyResponse())
+    monkeypatch.setattr("dev_agents.workflows.reddit._upload_r2_file", fake_upload)
+
+    pruned = prune_published_reddit_candidates(
+        repo=repo,
+        published_source_ids={"src-2", "post-999"},
+    )
+
+    assert pruned == 1
+    assert len(uploaded_manifest["candidates"]) == 2
+    candidate_ids = [c["id"] for c in uploaded_manifest["candidates"]]
+    assert candidate_ids == ["post-1", "post-3"]
+
+
+def test_sync_reddit_status_triggers_manifest_pruning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_db = tmp_path / "state.db"
+
+    project = ProjectConfig(repo=repo, github="owner/demo")
+    repository = StateRepository(state_db, project_name="demo")
+    repository.claim_run("release-comms", "run-prune")
+
+    repository.record_publication(
+        workflow="release-comms",
+        run_id="run-prune",
+        channel="reddit",
+        destination="reddit",
+        page_url="https://codexcryptica.com/answers/prune",
+        public_url="dry-run://r2/announcements/reddit-candidates.json",
+        external_id="staged:src-prune",
+        status="staged",
+        metadata={"status": "staged_to_r2", "source_id": "src-prune"},
+    )
+
+    pruned_calls: list[set[str]] = []
+
+    def fake_prune(*, repo: Path, published_source_ids: set[str], **kwargs: Any) -> int:
+        pruned_calls.append(published_source_ids)
+        return len(published_source_ids)
+
+    monkeypatch.setattr("dev_agents.workflows.reddit.prune_published_reddit_candidates", fake_prune)
+
+    fetched_posts = [
+        {
+            "id": "t3_pruned_post",
+            "title": "Pruned Post Title",
+            "selftext": "Details at https://codexcryptica.com/answers/prune <!-- id:src-prune -->",
+            "source_id": "src-prune",
+            "permalink": "/r/codexcryptica/comments/pruned_post/",
+            "url": "https://www.reddit.com/r/codexcryptica/comments/pruned_post/",
+        }
+    ]
+
+    reconciled = sync_reddit_status(
+        project=project,
+        project_name="demo",
+        run_id="run-prune",
+        repository=repository,
+        fetched_posts=fetched_posts,
+        notify_tracking_issue=False,
+        prune_manifest=True,
+    )
+
+    assert len(reconciled) == 1
+    assert len(pruned_calls) == 1
+    assert "src-prune" in pruned_calls[0]
 
 

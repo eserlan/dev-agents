@@ -62,6 +62,9 @@ def format_reddit_post(
     }
 
 
+DEFAULT_MANIFEST_KEY = "announcements/reddit-candidates.json"
+
+
 def stage_reddit_candidate(
     *,
     repo: Path,
@@ -69,7 +72,7 @@ def stage_reddit_candidate(
     env: Mapping[str, str],
     dry_run: bool,
     destination: str = "reddit",
-    key: str = "announcements/reddit-candidates.json",
+    key: str = DEFAULT_MANIFEST_KEY,
     timeout: float = 120,
 ) -> PublicationReceipt:
     """Upload or update the Reddit candidate manifest on Cloudflare R2."""
@@ -141,6 +144,72 @@ def stage_reddit_candidate(
     )
 
 
+def prune_published_reddit_candidates(
+    *,
+    repo: Path,
+    published_source_ids: set[str],
+    key: str = DEFAULT_MANIFEST_KEY,
+    env: Mapping[str, str] | None = None,
+    timeout: float = 30.0,
+    dry_run: bool = False,
+) -> int:
+    """Remove published candidates from the R2 candidate manifest.
+
+    Returns the number of candidates removed.
+    """
+    if not published_source_ids or dry_run:
+        return 0
+
+    existing_candidates: list[dict[str, Any]] = []
+    try:
+        req = urllib.request.Request(
+            f"https://{ASSET_HOST}/{key}",
+            headers={"User-Agent": "dev-agents/release-comms"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("candidates"), list):
+                existing_candidates = [c for c in data["candidates"] if isinstance(c, dict)]
+            elif isinstance(data, list):
+                existing_candidates = [c for c in data if isinstance(c, dict)]
+    except Exception:  # noqa: BLE001
+        return 0
+
+    remaining_candidates = [
+        c
+        for c in existing_candidates
+        if str(c.get("source_id", "")) not in published_source_ids
+        and str(c.get("id", "")) not in published_source_ids
+    ]
+
+    pruned_count = len(existing_candidates) - len(remaining_candidates)
+    if pruned_count == 0:
+        return 0
+
+    manifest = {
+        "updated_at": int(time.time()),
+        "candidates": remaining_candidates,
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as temp:
+        temp_path = Path(temp.name)
+        json.dump(manifest, temp, indent=2)
+
+    try:
+        _upload_r2_file(
+            repo=repo,
+            path=temp_path,
+            key=key,
+            content_type="application/json",
+            env=env or {},
+            timeout=timeout,
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    return pruned_count
+
+
 def export_reddit_markdown(
     discussions: list[dict[str, Any]],
     source_id: str = "",
@@ -198,8 +267,11 @@ def fetch_subreddit_posts(
         url,
         headers={"User-Agent": user_agent},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
 
     posts: list[dict[str, Any]] = []
     children = (data.get("data") or {}).get("children") or []
@@ -231,6 +303,9 @@ def sync_reddit_status(
     repository: Any = None,
     fetched_posts: list[dict[str, Any]] | None = None,
     notify_tracking_issue: bool = True,
+    prune_manifest: bool = True,
+    dry_run: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> list[Any]:
     """Reconcile staged Reddit candidates with live submissions from the subreddit."""
     from dev_agents.config import ReleaseCommsConfig
@@ -343,6 +418,33 @@ def sync_reddit_status(
                     pass
 
             reconciled.append(updated_pub)
+
+    if reconciled and prune_manifest and not dry_run:
+        published_ids = {
+            str(pub.metadata.get("source_id", ""))
+            for pub in reconciled
+            if pub.metadata.get("source_id")
+        }
+        published_ids.update({
+            pub.external_id.removeprefix("staged:")
+            for pub in reconciled
+            if pub.external_id and pub.external_id.startswith("staged:")
+        })
+        published_ids.update({
+            str(pub.metadata.get("candidate_id", ""))
+            for pub in reconciled
+            if pub.metadata.get("candidate_id")
+        })
+        published_ids.discard("")
+        if published_ids:
+            try:
+                prune_published_reddit_candidates(
+                    repo=project.repo,
+                    published_source_ids=published_ids,
+                    env=env,
+                )
+            except Exception:  # noqa: BLE001, S110
+                pass
 
     return reconciled
 
