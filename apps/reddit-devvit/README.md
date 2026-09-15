@@ -30,6 +30,10 @@ Submissions made by `dev-agent-publisher` include the following standard footer 
 <!-- id:<source_id> -->
 ```
 
+## Fetch Domains
+
+* `assets.codexcryptica.com`: Used by the companion app to pull approved announcement candidate JSON manifests (`announcements/reddit-candidates.json`) staged by the release pipeline for automated community publication.
+
 ## Architecture
 
 * Built using Reddit's official **Devvit** platform (`@devvit/public-api`).

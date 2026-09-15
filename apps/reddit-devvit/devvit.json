@@ -1,0 +1,15 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "dev-agent-publisher",
+  "blocks": {
+    "entry": "src/main.ts"
+  },
+  "permissions": {
+    "http": {
+      "enable": true,
+      "domains": [
+        "assets.codexcryptica.com"
+      ]
+    }
+  }
+}
