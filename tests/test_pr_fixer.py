@@ -460,6 +460,62 @@ def test_auto_merge_does_not_run_without_checks(monkeypatch, tmp_path: Path) -> 
     assert merge_called is False
 
 
+def test_auto_merge_accepts_clean_review_chain_final_fix_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=database, auto_merge=True)
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "isDraft": False,
+        "labels": [],
+        "headRefOid": "final-sha",
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+        "autoMergeRequest": None,
+    }
+    commands: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
+        commands.append(args)
+        if args[:3] == ("gh", "pr", "view"):
+            return '{"state":"OPEN","autoMergeRequest":{"enabledAt":"now"}}'
+        return ""
+
+    monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+    state = StateRepository(database, "demo", repo)
+    state.claim_run(
+        "pr-review",
+        "pr-review-42-pre-fix-sha",
+        metadata={
+            "pull_request": 42,
+            "head_sha": "pre-fix-sha",
+            "review_round": 1,
+        },
+    )
+    state.complete_run(
+        "pr-review",
+        "pr-review-42-pre-fix-sha",
+        metadata={
+            "reviewed_head_sha": "pre-fix-sha",
+            "review_exhausted_head_sha": "final-sha",
+            "review_report_valid": True,
+            "review_report": {"verdict": "clean"},
+        },
+    )
+
+    PrFixerService("demo", project, config)._ensure_auto_merge(42)
+
+    assert ("gh", "pr", "merge", "42", "--auto", "--squash") in commands
+
+
 def test_reconcile_persists_a_run_for_the_daemon_index(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

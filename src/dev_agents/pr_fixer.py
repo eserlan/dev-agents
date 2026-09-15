@@ -1458,8 +1458,7 @@ class PrFixerService:
             return
         if self.config.review_without_copilot and not _has_copilot_review(meta):
             head_sha = str(meta.get("headRefOid", "unknown"))
-            review_run = self.state.load_run("pr-review", f"pr-review-{number}-{head_sha}")
-            if review_run is None or review_run.status != "completed":
+            if not self._has_completed_internal_review(number, head_sha):
                 _log(f"auto-merge-deferred pr={number} reason=internal-review-required")
                 return
 
@@ -1504,6 +1503,32 @@ class PrFixerService:
             metadata={"requested": True},
         )
         _log(f"auto-merge-requested pr={number} mode=squash head={head_sha[:12]}")
+
+    def _has_completed_internal_review(self, number: int, head_sha: str) -> bool:
+        """Return whether the current head is covered by a completed review chain.
+
+        A targeted post-fix review can finish by pushing the final fix commit.
+        In that case the review run is keyed to the pre-fix head, while its
+        ``review_exhausted_head_sha`` records the new head that was actually
+        validated. Treat that explicit clean chain result as covering the
+        current head too.
+        """
+        review_run = self.state.load_run("pr-review", f"pr-review-{number}-{head_sha}")
+        if review_run is not None and review_run.status == "completed":
+            return True
+
+        for candidate in self.state.list_runs("pr-review", limit=100):
+            metadata = candidate.metadata
+            if (
+                candidate.status == "completed"
+                and metadata.get("pull_request") == number
+                and metadata.get("review_exhausted_head_sha") == head_sha
+                and metadata.get("review_report_valid") is True
+                and isinstance(metadata.get("review_report"), dict)
+                and metadata["review_report"].get("verdict") == "clean"
+            ):
+                return True
+        return False
 
     def reconcile(self) -> None:
         run_id = f"reconcile-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{time.time_ns()}"
