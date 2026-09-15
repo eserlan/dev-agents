@@ -502,6 +502,7 @@ def recommend_channels(
         # removed; it does not need a separate writer draft.
         "discord": bool(drafts.bluesky) or bool(drafts.discord and drafts.discord.strip()),
         "github_discussions": bool(drafts.github_discussions),
+        "reddit": bool(drafts.github_discussions),
     }
     return [name for name in content if name in enabled and content[name]]
 

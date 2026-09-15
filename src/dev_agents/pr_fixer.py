@@ -1921,9 +1921,25 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
         active: set[str] = set()
         active_lock = Lock()
         interval = max(5, comms_config.scheduler_poll_seconds)
+        last_reddit_sync = 0.0
         while True:
             time.sleep(interval)
             now = datetime.now(UTC)
+            if time.time() - last_reddit_sync >= 300:
+                last_reddit_sync = time.time()
+                try:
+                    from dev_agents.workflows.reddit import sync_reddit_status
+
+                    reconciled = sync_reddit_status(
+                        project=project,
+                        project_name=project_name,
+                        repository=claims,
+                    )
+                    if reconciled:
+                        _log(f"reconciled {len(reconciled)} reddit posts")
+                except Exception as error:  # noqa: BLE001 - scheduler keeps serving
+                    _log(f"periodic reddit sync error: {error}")
+
             for run in claims.list_runs("release-comms", limit=100):
                 if run.status != "scheduled":
                     continue

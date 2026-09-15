@@ -4,3 +4,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 config/projects.yaml
+node_modules/
+.devvit/
+dist/
+.env

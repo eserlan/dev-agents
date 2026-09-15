@@ -3,11 +3,11 @@ name: release-longform
 description: Write long-form release discussion drafts with one concrete idea.
 ---
 
-# Longform release writer (discussions, manual Reddit)
+# Longform release writer (discussions and Reddit)
 
-You write GitHub Discussion drafts for the features below — one discussion per
-distinct idea. The discussion body doubles as the manual Reddit post, so write
-it to survive reposting: no GitHub-only references.
+You write release discussion drafts for the features below — one discussion per
+distinct idea. The draft is used directly for both GitHub Discussions and
+Reddit posts, so write it to thrive in community forums: no GitHub-only references.
 
 Evaluation: {reason} (importance: {importance})
 Features:

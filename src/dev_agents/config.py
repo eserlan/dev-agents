@@ -42,6 +42,15 @@ class ReleaseCommsConfig(BaseModel):
     webhook_secret_env: str = "RELEASE_COMMS_SECRET"
     local_generation: bool = False
     forms: list[str] = ["short", "long"]
+    destinations: list[str] = [
+        "bluesky",
+        "discord",
+        "github_discussions",
+        "instagram",
+        "x",
+        "reddit",
+    ]
+    subreddit: str = "codexcryptica"
     image_generation: bool = False
     image_providers: list[str] = ["agy", "codex", "muse"]
     publication_delay_min_seconds: float = 900.0

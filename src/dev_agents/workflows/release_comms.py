@@ -383,11 +383,12 @@ def build_release_comms_workflow() -> Any:
             github_discussions=discussions,
         )
         writer_res = align_discussion_images(writer_res)
-        recommended_channels = recommend_channels(writer_res)
+        enabled_destinations = state["config"].destinations
+        recommended_channels = recommend_channels(writer_res, enabled=enabled_destinations)
         if writer_res.bluesky:
-            recommended_channels = list(
-                dict.fromkeys([*recommended_channels, "instagram", "x"])
-            )
+            for extra in ("instagram", "x"):
+                if extra in enabled_destinations and extra not in recommended_channels:
+                    recommended_channels.append(extra)
         updated = EvaluatorResult(
             postworthy=eval_res.postworthy,
             reason=eval_res.reason,
@@ -524,7 +525,7 @@ def build_release_comms_workflow() -> Any:
         already_published = {
             publication_key(record.channel, record.destination, record.page_url)
             for record in state.get("existing_publications", [])
-            if record.status == "published"
+            if record.status in ("published", "staged")
         }
         published, errors = publish_release_drafts(
             project=state["project"],
@@ -538,6 +539,7 @@ def build_release_comms_workflow() -> Any:
             publication_delay_max_seconds=0,
             max_publications=1,
             on_receipt=state["publication_sink"],
+            source_id=str(state["promote_run_id"]),
         )
         publications.update(published)
         completed = not errors
@@ -695,6 +697,11 @@ def run_release_comms(
             on_event(event, payload)
 
     def persist_publication(receipt: PublicationReceipt) -> None:
+        status = (
+            "staged"
+            if receipt.metadata and receipt.metadata.get("status") == "staged_to_r2"
+            else "published"
+        )
         repository.record_publication(
             "release-comms",
             str(promote_run_id),
@@ -703,8 +710,21 @@ def run_release_comms(
             page_url=receipt.page_url,
             public_url=receipt.public_url,
             external_id=receipt.external_id,
+            status=status,
             metadata=receipt.metadata or {"publisher": "dev-agents"},
         )
+
+    try:
+        from dev_agents.workflows.reddit import sync_reddit_status
+
+        sync_reddit_status(
+            project=project,
+            project_name=project_name,
+            repository=repository,
+            notify_tracking_issue=False,
+        )
+    except Exception:  # noqa: BLE001, S110 - opportunistic sync should not block run
+        pass
 
     try:
         app = build_release_comms_workflow()
@@ -768,7 +788,10 @@ def run_release_comms(
         str(promote_run_id),
         status="completed" if result.completed else "failed",
         error=None if result.completed else "publishing failed",
-        metadata={"postworthy": result.postworthy},
+        metadata={
+            "postworthy": result.postworthy,
+            "drafts": result.drafts,
+        },
     )
     from dev_agents.visualize import schedule_report_refresh
 

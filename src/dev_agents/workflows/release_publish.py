@@ -76,21 +76,27 @@ def _cloudflare_env(repo: Path, env: Mapping[str, str]) -> dict[str, str]:
     return command_env
 
 
-def upload_release_image(
-    *, repo: Path, path: Path, key: str, env: Mapping[str, str], timeout: float = 120
+def _upload_r2_file(
+    *,
+    repo: Path,
+    path: Path,
+    key: str,
+    content_type: str,
+    env: Mapping[str, str],
+    timeout: float = 120,
 ) -> str:
-    """Upload generated announcement art to the public R2 asset bucket."""
+    """Upload a file to the public R2 asset bucket using wrangler."""
     if not path.is_file():
-        raise PublicationError(f"generated image does not exist: {path}")
+        raise PublicationError(f"file to upload does not exist: {path}")
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", key) or key.startswith("/"):
-        raise PublicationError(f"invalid R2 image key: {key}")
+        raise PublicationError(f"invalid R2 key: {key}")
 
     if shutil.which("wrangler"):
         command = ["wrangler"]
     elif shutil.which("bunx"):
         command = ["bunx", "wrangler"]
     else:
-        raise PublicationError("wrangler or bunx is required to upload generated images")
+        raise PublicationError("wrangler or bunx is required to upload to R2")
     command.extend(
         [
             "r2",
@@ -100,7 +106,7 @@ def upload_release_image(
             "--file",
             str(path),
             "--content-type",
-            "image/png",
+            content_type,
             "--remote",
         ]
     )
@@ -115,11 +121,26 @@ def upload_release_image(
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise PublicationError(f"R2 image upload failed for {key}: {error}") from error
+        raise PublicationError(f"R2 upload failed for {key}: {error}") from error
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "wrangler failed"
-        raise PublicationError(f"R2 image upload failed for {key}: {detail}")
+        raise PublicationError(f"R2 upload failed for {key}: {detail}")
     return f"https://{ASSET_HOST}/{key}"
+
+
+def upload_release_image(
+    *, repo: Path, path: Path, key: str, env: Mapping[str, str], timeout: float = 120
+) -> str:
+    """Upload generated announcement art to the public R2 asset bucket."""
+    return _upload_r2_file(
+        repo=repo,
+        path=path,
+        key=key,
+        content_type="image/png",
+        env=env,
+        timeout=timeout,
+    )
+
 
 
 def social_delivery_image_url(image_url: str) -> str:
@@ -502,6 +523,7 @@ def publish_release_drafts(
     publication_delay_max_seconds: float = 1800.0,
     max_publications: int | None = None,
     on_receipt: Callable[[PublicationReceipt], None],
+    source_id: str = "",
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     """Publish channel variants in message batches, checkpointing each receipt.
 
@@ -510,7 +532,8 @@ def publish_release_drafts(
     when enabled, is only applied before a subsequent distinct message.
     """
     result: dict[str, list[dict[str, Any]]] = {
-        name: [] for name in ("bluesky", "github_discussions", "instagram", "x", "discord")
+        name: []
+        for name in ("bluesky", "github_discussions", "instagram", "x", "discord", "reddit")
     }
     errors: list[str] = []
     message_batches_published = 0
@@ -585,6 +608,10 @@ def publish_release_drafts(
             pending = pending or publication_key(
                 "github_discussions", "github_discussions", page_url
             ) not in already_published
+        if discussion is not None and "reddit" in recommended_channels:
+            pending = pending or publication_key(
+                "reddit", "reddit", page_url
+            ) not in already_published
         if "discord" in recommended_channels and draft is not None:
             pending = pending or any(
                 publication_key("discord", str(destination.get("id", "main-community")), page_url)
@@ -654,6 +681,32 @@ def publish_release_drafts(
             except Exception as error:  # noqa: BLE001
                 errors.append(f"github_discussions {page_url}: {error}")
 
+        if discussion is not None and "reddit" in recommended_channels and publication_key("reddit", "reddit", page_url) not in already_published:
+            try:
+                from dev_agents.workflows.reddit import (
+                    format_reddit_post,
+                    stage_reddit_candidate,
+                )
+
+                discussion_image, _ = resolve_image(discussion, image_overrides)
+                candidate = format_reddit_post(
+                    title=str(discussion.get("title", "Release update")),
+                    body=str(discussion.get("body", "")),
+                    page_url=page_url,
+                    source_id=source_id,
+                    image_url=discussion_image,
+                )
+                receipt = stage_reddit_candidate(
+                    repo=project.repo,
+                    candidate=candidate,
+                    env=env,
+                    dry_run=dry_run,
+                )
+                record_receipt(receipt)
+                result["reddit"].append(receipt.__dict__)
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"reddit {page_url}: {error}")
+
         if len(errors) > errors_before_batch:
             return result, errors
         message_batches_published += 1
@@ -693,6 +746,12 @@ def pending_publication_count(
                 page_url = str(draft.get("pageUrl", ""))
                 if publication_key("github_discussions", "github_discussions", page_url) not in already_published:
                     count += 1
+    if "reddit" in recommended_channels:
+        for draft in drafts.get("github_discussions") or []:
+            if isinstance(draft, dict):
+                page_url = str(draft.get("pageUrl", ""))
+                if publication_key("reddit", "reddit", page_url) not in already_published:
+                    count += 1
     if "discord" in recommended_channels and not drafts.get("bluesky") and drafts.get("discord"):
         count += sum(
             1
@@ -727,12 +786,38 @@ def comment_tracking_issue(
     ]
     for channel, items in publications.items():
         if items:
-            links = [f"[{item.get('page_url', '')}]({item.get('public_url')})" for item in items if item.get("public_url")]
-            lines.append(f"- **{channel}:** " + (", ".join(links) if links else "published"))
+            if channel == "reddit":
+                links = []
+                for item in items:
+                    status = item.get("status") or (item.get("metadata") or {}).get("status")
+                    public_url = str(item.get("public_url", ""))
+                    if (
+                        status in ("staged", "staged_to_r2")
+                        or public_url.startswith("dry-run://r2")
+                        or "reddit-candidates.json" in public_url
+                    ):
+                        dest = item.get("destination", "reddit")
+                        links.append(f"staged in queue ({dest})")
+                    elif public_url:
+                        links.append(f"[{item.get('page_url', '')}]({public_url})")
+                    else:
+                        links.append(f"staged ({item.get('page_url', '')})")
+                lines.append(f"- **{channel}:** " + ", ".join(links))
+            else:
+                links = [f"[{item.get('page_url', '')}]({item.get('public_url')})" for item in items if item.get("public_url")]
+                lines.append(f"- **{channel}:** " + (", ".join(links) if links else "published"))
     if not publications or not any(publications.values()):
         lines.append("- No external publications recorded.")
     if errors:
         lines.extend(["", "### Delivery errors", *[f"- {error}" for error in errors]])
     if drafts:
-        lines.extend(["", "### Draft counts", f"- Bluesky: {len(drafts.get('bluesky') or [])}", f"- GitHub Discussions: {len(drafts.get('github_discussions') or [])}", f"- Discord: {'yes' if drafts.get('discord') else 'no'}"])
+        lines.extend(
+            [
+                "",
+                "### Draft counts",
+                f"- Bluesky: {len(drafts.get('bluesky') or [])}",
+                f"- GitHub Discussions: {len(drafts.get('github_discussions') or [])}",
+                f"- Discord: {'yes' if drafts.get('discord') else 'no'}",
+            ]
+        )
     gh(project.repo, "issue", "comment", str(issue_number), "--body", "\n".join(lines), check=False)

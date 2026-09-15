@@ -1,0 +1,20 @@
+{
+  "name": "dev-agent-publisher",
+  "version": "0.0.0",
+  "description": "First-party Devvit publisher companion app for dev-agents",
+  "main": "src/main.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "playtest": "devvit playtest",
+    "upload": "devvit upload"
+  },
+  "dependencies": {
+    "@devvit/public-api": "0.14.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "private": true,
+  "license": "BSD-3-Clause"
+}

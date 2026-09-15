@@ -496,6 +496,29 @@ class StateRepository:
             ).fetchall()
         return [self._publication_record(row) for row in rows]
 
+    def list_publications(
+        self,
+        workflow: str = "release-comms",
+        *,
+        channel: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[PublicationRecord]:
+        """Query publications across runs filtered by workflow, channel, or status."""
+        query = "SELECT * FROM publications WHERE project_name = ? AND workflow = ?"
+        params: list[Any] = [self.project_name, workflow]
+        if channel is not None:
+            query += " AND channel = ?"
+            params.append(channel)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY published_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._publication_record(row) for row in rows]
+
     def record_publication(
         self,
         workflow: str,

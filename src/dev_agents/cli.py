@@ -15,6 +15,7 @@ from dev_agents.config import (
 )
 from dev_agents.context.repository import RepositoryError
 from dev_agents.pr_fixer import serve_project
+from dev_agents.runtime import StateRepository, state_database_path
 from dev_agents.visualize import (
     WORKFLOW_NAMES,
     deploy_report_to_vercel,
@@ -75,6 +76,26 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Run without publishing (default: True unless --publish is given)",
+    )
+    export_reddit = comms_subcommands.add_parser(
+        "export-reddit", help="Export formatted Reddit markdown for a release run"
+    )
+    export_reddit.add_argument("project", help="Configured project name")
+    export_reddit.add_argument("promote_run_id", help="GitHub workflow run ID of promote-to-prod")
+    export_reddit.add_argument("--config", type=Path, default=Path("config/projects.yaml"))
+    export_reddit.add_argument(
+        "--output", type=Path, help="Optional file path to save exported markdown"
+    )
+    sync_reddit = comms_subcommands.add_parser(
+        "sync-reddit", help="Reconcile staged Reddit candidates with live Reddit posts"
+    )
+    sync_reddit.add_argument("project", help="Configured project name")
+    sync_reddit.add_argument(
+        "--run-id", dest="run_id", help="Optional specific promote run ID to reconcile"
+    )
+    sync_reddit.add_argument("--config", type=Path, default=Path("config/projects.yaml"))
+    sync_reddit.add_argument(
+        "--subreddit", help="Optional subreddit override (e.g. codexcryptica)"
     )
     visualize = subcommands.add_parser(
         "visualize", help="Render LangGraph flows and persisted run timelines as HTML"
@@ -186,6 +207,73 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0 if comms_result.completed else 1
+    if arguments.command == "release-comms" and arguments.release_comms_command == "export-reddit":
+        try:
+            config = load_projects_config(arguments.config)
+            project = select_project(config, arguments.project)
+            comms_config = project.release_comms or ReleaseCommsConfig()
+            database_path = state_database_path(
+                comms_config.state_path, project.repo / ".dev-agents/release-comms-state.db"
+            )
+            state_repo = StateRepository(
+                database_path,
+                project_name=arguments.project,
+            )
+            run = state_repo.get_run("release-comms", str(arguments.promote_run_id))
+            if run is None:
+                parser.exit(2, f"error: no release-comms run found for {arguments.promote_run_id}\n")
+            drafts = run.metadata.get("drafts") if isinstance(run.metadata, dict) else {}
+            discussions = (drafts or {}).get("github_discussions") or []
+            if not discussions:
+                parser.exit(2, f"error: no discussion/reddit drafts found for run {arguments.promote_run_id}\n")
+
+            from dev_agents.workflows.reddit import export_reddit_markdown
+
+            output_content = export_reddit_markdown(discussions, str(arguments.promote_run_id))
+            if arguments.output:
+                arguments.output.parent.mkdir(parents=True, exist_ok=True)
+                arguments.output.write_text(output_content, encoding="utf-8")
+                print(f"Exported Reddit drafts to {arguments.output}")
+            else:
+                print(output_content)
+            return 0
+        except (ConfigError, RepositoryError, RuntimeError) as error:
+            parser.exit(2, f"error: {error}\n")
+    if arguments.command == "release-comms" and arguments.release_comms_command == "sync-reddit":
+        try:
+            config = load_projects_config(arguments.config)
+            project = select_project(config, arguments.project)
+            from dev_agents.workflows.reddit import sync_reddit_status
+
+            reconciled = sync_reddit_status(
+                project=project,
+                project_name=arguments.project,
+                run_id=arguments.run_id,
+                subreddit=arguments.subreddit,
+            )
+            print(
+                json.dumps(
+                    {
+                        "reconciledCount": len(reconciled),
+                        "reconciled": [
+                            {
+                                "runId": r.run_id,
+                                "destination": r.destination,
+                                "pageUrl": r.page_url,
+                                "publicUrl": r.public_url,
+                                "externalId": r.external_id,
+                                "status": r.status,
+                            }
+                            for r in reconciled
+                        ],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        except (ConfigError, RepositoryError, RuntimeError) as error:
+            parser.exit(2, f"error: {error}\n")
     if arguments.command == "visualize":
         try:
             config = load_projects_config(arguments.config)
