@@ -12,12 +12,15 @@ export const MIN_SPACING_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export async function enqueueCandidate(
   redis: RedisClient,
-  post: CandidatePost
+  post: CandidatePost,
+  force: boolean = false
 ): Promise<boolean> {
   const seenKey = `${REDIS_SEEN_PREFIX}${post.source_id}`;
-  const alreadySeen = await redis.get(seenKey);
-  if (alreadySeen) {
-    return false;
+  if (!force) {
+    const alreadySeen = await redis.get(seenKey);
+    if (alreadySeen) {
+      return false;
+    }
   }
 
   const postKey = `${REDIS_POST_PREFIX}${post.id}`;

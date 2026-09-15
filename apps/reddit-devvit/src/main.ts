@@ -6,6 +6,7 @@ import {
   syncCandidatesFromCdn,
   togglePause,
   MIN_SPACING_MS,
+  enqueueCandidate,
 } from './queue.js';
 import { publishCandidatePost } from './publisher.js';
 
@@ -191,6 +192,32 @@ Devvit.addMenuItem({
     context.ui.showToast(
       `Auto-publishing is now ${isPaused ? 'PAUSED' : 'ACTIVE'}`
     );
+  },
+});
+
+// Moderator Menu: Enqueue Discussion #3066 Candidate
+Devvit.addMenuItem({
+  location: 'subreddit',
+  label: 'Release Queue: Enqueue Discussion #3066',
+  forUserType: 'moderator',
+  onPress: async (_, context) => {
+    const candidate = {
+      id: 'reddit-34789183506-share-any-generator-result-as-a-public-l',
+      title: 'Share any generator result as a public link with one-click Remix',
+      body: 'You roll an NPC or a location you actually want to use, then you copy the text into Discord and the formatting falls apart. If someone wants to tweak one detail they have to paste it back into the generator and guess your inputs.\n\nI built shareable generator results: any output can become a public link with a human-readable slug that anyone can view and Remix straight back into the generator to make it their own.\n\nTry it from any generator: https://codexcryptica.com/generators\n\n- Works for NPCs, locations, encounters, factions, items, quests and the rest, not just one generator\n- Viewer gets a clean rendered page, no account needed to open it\n- Remix drops the content back into the generator with the prompt and options prefilled so you can reroll a variant\n- Link uses a readable slug like `/share/whispering-cold-tavern-...` instead of a random ID wall\n\nTradeoff I am still sitting with: once you share, the link is public to anyone with the URL. You can revoke it from My Stuff, but there is no private share or password yet. I kept it simple to ship, and I am not sure if private links are worth the extra friction.\n\nWhat is the last generator result you copy-pasted somewhere and wished you could just link instead?\n\n![A tabletop roleplaying illustration for https://codexcryptica.com/generators](https://assets.codexcryptica.com/announcements/release-34789183506-3.png)\n\n---\n*Posted automatically via release pipeline. Feedback and discussion welcome!*\n<!-- id:34789183506 -->',
+      url: 'https://codexcryptica.com/generators',
+      image_url: 'https://assets.codexcryptica.com/announcements/release-34789183506-3.png',
+      source_id: '34789183506',
+      status: 'approved' as const,
+      created_at: Math.floor(Date.now() / 1000),
+    };
+
+    const added = await enqueueCandidate(context.redis, candidate, true);
+    if (added) {
+      context.ui.showToast('Discussion #3066 enqueued to release queue!');
+    } else {
+      context.ui.showToast('Discussion #3066 was already enqueued or seen.');
+    }
   },
 });
 
