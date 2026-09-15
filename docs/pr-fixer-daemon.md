@@ -79,6 +79,12 @@ when that review pushes a fix, one targeted post-fix verification of the resulti
 findings. The chain is persisted per PR head SHA, capped after that verification, and a later
 user push starts a new chain; duplicate webhook and reconciliation deliveries are deduplicated.
 
+To avoid concurrent-agent rewrite loops, `pause_on_external_agent_commits` is enabled by default.
+When the latest commit author matches `external_agent_logins` (Jules is included in the example
+configuration), all review, fix, and auto-merge activity pauses for that PR. The daemon publishes
+one idempotent pause comment per head. Apply the configured `external_agent_resume_label`
+(`dev-agents-resume` by default) when the external agent is finished and automation should resume.
+
 After a successful remediation run, the daemon also creates or updates top-level PR comments for
 that run. A review publishes a start comment, then Luna publishes a concise findings comment before
 editing and a fixes-started comment when concrete defects need remediation. Luna must also emit a

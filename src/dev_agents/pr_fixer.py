@@ -126,7 +126,7 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
             "view",
             str(number),
             "--json",
-            "number,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews,autoMergeRequest,url",
+            "number,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews,commits,autoMergeRequest,url",
         )
     )
     slug = repository_slug(repo)
@@ -359,6 +359,43 @@ def _publish_pr_run_comment(
         _log(f"run-comment-failed pr={number} phase={phase} error={error}")
         return False
     return True
+
+
+def _external_agent_commit(meta: dict[str, Any], config: PrFixerConfig) -> str | None:
+    """Return the latest commit author when an external agent owns the PR head."""
+    if not config.pause_on_external_agent_commits:
+        return None
+    configured = {
+        login.strip().lower() for login in config.external_agent_logins if login.strip()
+    }
+    commits = meta.get("commits")
+    if not configured or not isinstance(commits, list) or not commits:
+        return None
+    latest = commits[-1]
+    if not isinstance(latest, dict):
+        return None
+    authors = latest.get("authors")
+    if not isinstance(authors, list):
+        return None
+    for author in authors:
+        if not isinstance(author, dict):
+            continue
+        login = str(author.get("login") or "").strip()
+        if login.lower() in configured:
+            return login
+    return None
+
+
+def _external_agent_pause_body(
+    number: int, head_sha: str, author: str, resume_label: str
+) -> str:
+    return f"""<!-- dev-agents:pr-external-agent-paused run=pr-review-pause-{number}-{head_sha} -->
+### 🤖 Dev-agents paused
+
+Automation is paused for PR #{number} because its latest commit was pushed by `{author}`.
+
+Apply the `{resume_label}` label when the external agent is finished and you want dev-agents to resume review/fix automation.
+"""
 
 
 def _report_line(report_url: str | None) -> str:
@@ -915,6 +952,33 @@ class PrFixerService:
             or "paused" in labels
         ):
             return {"meta": meta, "keys": keys, "skip": True}
+        head_sha = str(meta.get("headRefOid", "unknown"))
+        external_author = _external_agent_commit(meta, self.config)
+        resume_label = self.config.external_agent_resume_label.strip().lower()
+        if (
+            meta.get("state") == "OPEN"
+            and external_author is not None
+            and resume_label not in labels
+        ):
+            _publish_pr_run_comment(
+                self.project.repo,
+                number,
+                f"pr-review-pause-{number}-{head_sha}",
+                "external-agent-paused",
+                _external_agent_pause_body(
+                    number, head_sha, external_author, self.config.external_agent_resume_label
+                ),
+            )
+            _log(
+                f"paused pr={number} reason=external-agent-commit author={external_author}"
+            )
+            return {
+                "meta": meta,
+                "keys": keys,
+                "skip": True,
+                "skip_reason": "external-agent-commit",
+                "external_agent": external_author,
+            }
         state_path = _state_path(self.config, self.project_name)
         # Import old JSON feedback identities into relational rows once. The legacy document
         # remains readable for rollback, while all new transitions use SQLite rows.
@@ -927,7 +991,6 @@ class PrFixerService:
                 legacy_handled = candidate_handled
                 self.state.mark_feedback_processed("pr-fixer", str(number), legacy_handled)
         unseen = self.state.unprocessed_feedback("pr-fixer", str(number), keys)
-        head_sha = str(meta.get("headRefOid", "unknown"))
         review_plan = self._review_plan(number, head_sha)
         review_only = (
             self.config.review_without_copilot
@@ -1426,6 +1489,9 @@ class PrFixerService:
     def _auto_merge_eligible(self, meta: dict[str, Any], keys: list[str]) -> bool:
         labels = {label["name"].lower() for label in meta.get("labels", [])}
         checks = meta.get("checks", [])
+        resume_label = self.config.external_agent_resume_label.strip().lower()
+        if _external_agent_commit(meta, self.config) and resume_label not in labels:
+            return False
         if not checks:
             return False
         return (

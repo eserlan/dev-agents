@@ -25,6 +25,11 @@ projects:
       # Green staging PRs without a submitted Copilot review receive the two-pass
       # general + Codex-Cryptica review before auto-merge eligibility is checked.
       review_without_copilot: true
+      # Pause when the latest commit is from an external coding agent. Apply this label
+      # to explicitly resume automation after that agent is finished.
+      pause_on_external_agent_commits: true
+      external_agent_logins: ["google-labs-jules[bot]"]
+      external_agent_resume_label: dev-agents-resume
       auto_merge: false
       log_retention_days: 30
       worktree_retention_days: 2

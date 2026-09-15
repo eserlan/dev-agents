@@ -219,6 +219,62 @@ def test_pr_fixer_starts_internal_review_for_green_pr_without_copilot(
     assert record.status == "running"
 
 
+def test_external_agent_commit_pauses_pr_automation(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "headRefOid": "jules-sha",
+        "state": "OPEN",
+        "isDraft": False,
+        "labels": [],
+        "commits": [{"authors": [{"login": "google-labs-jules[bot]"}]}],
+    }
+    published: list[tuple[Any, ...]] = []
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer._publish_pr_run_comment",
+        lambda *args: published.append(args) or True,
+    )
+
+    state = PrFixerService("demo", project, config)._collect_feedback({"number": 42})
+
+    assert state["skip"] is True
+    assert state["skip_reason"] == "external-agent-commit"
+    assert state["external_agent"] == "google-labs-jules[bot]"
+    assert published[0][2:4] == ("pr-review-pause-42-jules-sha", "external-agent-paused")
+
+
+def test_external_agent_pause_can_be_explicitly_resumed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "headRefName": "feature/review-me",
+        "headRefOid": "jules-sha",
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "labels": [{"name": "dev-agents-resume"}],
+        "commits": [{"authors": [{"login": "google-labs-jules[bot]"}]}],
+        "reviews": [],
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+    }
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+
+    state = PrFixerService("demo", project, config)._collect_feedback({"number": 42})
+
+    assert state["skip"] is False
+    assert state["review_only"] is True
+
+
 def test_internal_review_uses_one_targeted_follow_up_after_luna_fix(
     monkeypatch, tmp_path: Path
 ) -> None:
