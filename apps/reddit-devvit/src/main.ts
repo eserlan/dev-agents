@@ -16,7 +16,9 @@ const SCHEDULER_JOB_NAME = 'reddit_dispatcher';
 Devvit.configure({
   redditAPI: true,
   redis: true,
-  http: true,
+  http: {
+    domains: ['assets.codexcryptica.com'],
+  },
   media: true,
 });
 
