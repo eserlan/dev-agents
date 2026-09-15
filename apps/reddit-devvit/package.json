@@ -1,6 +1,6 @@
 {
   "name": "dev-agent-publisher",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "First-party Devvit publisher companion app for dev-agents",
   "main": "src/main.ts",
   "type": "module",

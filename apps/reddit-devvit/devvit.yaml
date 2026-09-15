@@ -7,5 +7,6 @@ capabilities:
   scheduler: true
   media: true
   http:
-    endpoints:
-      - https://assets.codexcryptica.com
+    enable: true
+    domains:
+      - assets.codexcryptica.com

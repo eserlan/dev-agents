@@ -119,8 +119,9 @@ capabilities:
   redis: true
   scheduler: true
   http:
-    endpoints:
-      - "https://assets.codexcryptica.com"  # Configured R2 CDN domain
+    enable: true
+    domains:
+      - "assets.codexcryptica.com"  # Configured R2 CDN domain
 ```
 
 #### Self-Healing Scheduler Registration
