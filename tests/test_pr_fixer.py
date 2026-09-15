@@ -348,6 +348,39 @@ def test_internal_review_stops_after_targeted_follow_up_fix(monkeypatch, tmp_pat
     assert next_review["review_round"] == 0
 
 
+def test_internal_review_stops_after_clean_targeted_follow_up(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=database)
+    run_id = "pr-review-42-follow-up-sha"
+    state = StateRepository(database, "demo", repo)
+    state.claim_run(
+        "pr-review",
+        run_id,
+        metadata={
+            "pull_request": 42,
+            "head_sha": "follow-up-sha",
+            "review_round": 1,
+            "review_scope": "targeted-post-fix",
+            "review_chain_id": "pr-review-42-old-sha",
+        },
+    )
+    state.complete_run(
+        "pr-review",
+        run_id,
+        metadata={
+            "reviewed_head_sha": "follow-up-sha",
+            "review_fix_pushed": False,
+            "review_report_valid": True,
+            "review_report": {"verdict": "clean"},
+        },
+    )
+
+    assert PrFixerService("demo", project, config)._review_plan(42, "follow-up-sha") is None
+
+
 def test_internal_review_is_due_before_any_checks_exist(tmp_path: Path) -> None:
     config = PrFixerConfig(base_branch="staging")
     metadata: dict[str, Any] = {

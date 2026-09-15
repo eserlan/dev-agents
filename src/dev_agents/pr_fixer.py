@@ -857,6 +857,16 @@ class PrFixerService:
         if metadata.get("review_exhausted_head_sha") == head_sha:
             return None
 
+        # Older completed targeted reviews did not persist an exhausted head when
+        # they found no new defect. Treat that completed round as exhausted too,
+        # so reconciliation cannot restart the same review indefinitely.
+        if (
+            latest.status == "completed"
+            and review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1
+            and latest_head == head_sha
+        ):
+            return None
+
         if review_round == 0 and metadata.get("review_fix_pushed"):
             return {
                 "round": 1,
@@ -1175,6 +1185,7 @@ class PrFixerService:
                 if review_round == 0
                 else ["targeted-post-fix"]
             )
+            exhausted_head_sha = (new_sha or old_sha) if review_round >= 1 else None
             comment_posted = False
             if fix_pushed:
                 from dev_agents.visualize import refresh_report_run_url
@@ -1224,7 +1235,7 @@ class PrFixerService:
                     "review_fix_pushed": fix_pushed,
                     "review_follow_up_pending": review_round == 0 and fix_pushed,
                     "review_follow_up_head_sha": new_sha if review_round == 0 and fix_pushed else None,
-                    "review_exhausted_head_sha": new_sha if review_round >= 1 and fix_pushed else None,
+                    "review_exhausted_head_sha": exhausted_head_sha,
                     "summary_comment_posted": comment_posted,
                     "review_report": state.get("report", {}).get("review_report"),
                     "review_report_valid": state.get("report", {}).get("report_valid", False),
@@ -1244,7 +1255,7 @@ class PrFixerService:
                     "review_fix_pushed": fix_pushed,
                     "review_follow_up_pending": review_round == 0 and fix_pushed,
                     "review_follow_up_head_sha": new_sha if review_round == 0 and fix_pushed else None,
-                    "review_exhausted_head_sha": new_sha if review_round >= 1 and fix_pushed else None,
+                    "review_exhausted_head_sha": exhausted_head_sha,
                     "review_report": state.get("report", {}).get("review_report"),
                     "review_report_valid": state.get("report", {}).get("report_valid", False),
                 },
