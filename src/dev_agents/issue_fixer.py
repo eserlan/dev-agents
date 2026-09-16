@@ -337,7 +337,7 @@ class IssueFixerService:
         if _existing_issue_pr(self.project.repo, number) is not None:
             return {"issue": issue, "skip": True}
         fingerprint = hashlib.sha256(
-            f"{issue.get('updatedAt', '')}\0{issue.get('title', '')}\0{issue.get('body', '')}".encode()
+            f"{issue.get('title', '')}\0{issue.get('body', '')}".encode()
         ).hexdigest()[:16]
         run_id = f"issue-fix-{number}-{fingerprint}"
         claim = self.state.claim_run(
