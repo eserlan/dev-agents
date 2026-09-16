@@ -314,7 +314,7 @@ def _findings_summary(report: dict[str, Any], default: str) -> str:
 def _publish_pr_run_comment(
     repo: Path, number: int, run_id: str, phase: str, body: str
 ) -> bool:
-    """Create or update one idempotent lifecycle comment for a PR run phase."""
+    """Create or update the single lifecycle comment for a PR run."""
     try:
         slug = repository_slug(repo)
         raw = _run(
@@ -332,9 +332,28 @@ def _publish_pr_run_comment(
                 comments.extend(item for item in page if isinstance(item, dict))
             elif isinstance(page, dict):
                 comments.append(page)
-        marker = f"<!-- dev-agents:pr-{phase} run={run_id} -->"
+        if phase.startswith("review"):
+            markers = [
+                f"<!-- dev-agents:pr-review run={run_id} -->",
+                # Migrate a lifecycle comment created by an older daemon version.
+                *(
+                    f"<!-- dev-agents:pr-{legacy_phase} run={run_id} -->"
+                    for legacy_phase in (
+                        "review-started",
+                        "review-findings",
+                        "review-fixes-started",
+                    )
+                ),
+            ]
+        else:
+            markers = [f"<!-- dev-agents:pr-{phase} run={run_id} -->"]
         existing = next(
-            (comment for comment in comments if marker in str(comment.get("body", ""))),
+            (
+                comment
+                for marker in markers
+                for comment in comments
+                if marker in str(comment.get("body", ""))
+            ),
             None,
         )
         if existing and existing.get("id") is not None:
@@ -416,13 +435,67 @@ def _review_started_body(
         if review_round == 0
         else "the one allowed targeted post-fix verification of the changed diff and prior findings"
     )
-    return f"""<!-- dev-agents:pr-review-started run={run_id} -->
+    return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna review started
 
 Luna has started {scope} for PR #{number}.
 
 - PR head: `{meta.get('headRefOid', 'unknown')}`
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
+- Run: `{run_id}`
+{_report_line(report_url)}
+"""
+
+
+def _review_completed_body(
+    number: int,
+    run_id: str,
+    report: dict[str, Any],
+    report_url: str | None = None,
+    review_round: int = 0,
+    old_sha: str = "",
+    new_sha: str = "",
+    changed_files: list[str] | None = None,
+    validation: str | None = None,
+    failure: str | None = None,
+) -> str:
+    """Render the final state into the same comment used for review progress."""
+    review_report = report.get("review_report")
+    verdict = review_report.get("verdict") if isinstance(review_report, dict) else None
+    if failure:
+        heading = "### 🤖 Luna review failed"
+        outcome = failure
+    elif new_sha and new_sha != old_sha:
+        heading = "### 🤖 Luna review completed — fixes pushed"
+        outcome = "Concrete findings were identified and fixed."
+    elif verdict == "clean":
+        heading = "### 🤖 Luna review completed — clean"
+        outcome = "No actionable defects were found."
+    else:
+        heading = "### 🤖 Luna review completed"
+        outcome = "The review completed without pushing a code change."
+    findings = _findings_summary(report, "No actionable defects found.")
+    fixes = str(report.get("fixes") or "None reported.").strip()
+    shown_files = changed_files or []
+    files_line = ", ".join(f"`{path}`" for path in shown_files[:12]) or "None"
+    if len(shown_files) > 12:
+        files_line += f" (+{len(shown_files) - 12} more)"
+    commit_line = "The PR head was unchanged."
+    if new_sha and new_sha != old_sha:
+        commit_line = f"Pushed fix commit `{new_sha[:12]}`."
+    validation_line = validation or "See the run report for validation details."
+    return f"""<!-- dev-agents:pr-review run={run_id} -->
+{heading}
+
+{outcome}
+
+- PR: #{number}
+- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
+- Findings: {findings}
+- What changed: {fixes}
+- {commit_line}
+- Changed files: {files_line}
+- Validation: {validation_line}
 - Run: `{run_id}`
 {_report_line(report_url)}
 """
@@ -437,7 +510,7 @@ def _review_findings_body(
 ) -> str:
     findings = _findings_summary(report, "No actionable defects found.")
     scope = "review passes" if review_round == 0 else "targeted post-fix verification"
-    return f"""<!-- dev-agents:pr-review-findings run={run_id} -->
+    return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna review findings
 
 Luna completed the {scope} for PR #{number}.
@@ -459,7 +532,7 @@ def _review_fixes_started_body(
     findings = _findings_summary(
         report, "Concrete findings were identified during the review."
     )
-    return f"""<!-- dev-agents:pr-review-fixes-started run={run_id} -->
+    return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna fixes started
 
 Luna is applying the smallest correct fixes for PR #{number}.
@@ -773,13 +846,14 @@ Validation protocol:
 {validation_instructions}
 
 Review communication protocol:
-- The daemon posts the review-started comment. Do not duplicate that comment.
-- Before making any edits, publish a concise findings comment with
-  `gh pr comment {number}`. Include this exact marker so retries update it rather than creating
-  duplicates: `<!-- dev-agents:pr-review-findings run={report_id} -->`. State either “No actionable
-  defects found” or the concrete defects, with file/symbol references and impact.
-- If concrete defects require changes, publish a second concise comment immediately before editing
-  with this exact marker: `<!-- dev-agents:pr-review-fixes-started run={report_id} -->`.
+- The daemon owns one evolving lifecycle comment for this run, marked
+  `<!-- dev-agents:pr-review run={report_id} -->`.
+- Do not create additional PR comments for findings or fixes. Before editing, use `gh api` to PATCH
+  the existing comment containing that marker with a concise findings update, then PATCH it again
+  immediately before edits begin when concrete fixes are needed. Never use `gh pr comment` for
+  review progress. The daemon will make the final update with the structured findings, what changed,
+  commit, files, and validation. Keep the full detail in the required report block and persisted
+  run timeline.
 - At the end, print this exact plain-text block to stdout (no markdown fence), with one concise line
   for each field. Use `none` when appropriate:
   {REVIEW_REPORT_BEGIN}
@@ -1165,38 +1239,6 @@ class PrFixerService:
                     "report_error": report.get("report_error"),
                 },
             )
-            from dev_agents.visualize import refresh_report_run_url
-
-            report_url = refresh_report_run_url(
-                self.project_name, self.project, workflow, state["run_id"]
-            )
-            _publish_pr_run_comment(
-                self.project.repo,
-                number,
-                state["run_id"],
-                "review-findings",
-                _review_findings_body(
-                    number,
-                    state["run_id"],
-                    report,
-                    report_url,
-                    int(state.get("review_round", 0)),
-                ),
-            )
-            if report.get("fixes") and report["fixes"].lower() not in {"none", "no changes"}:
-                _publish_pr_run_comment(
-                    self.project.repo,
-                    number,
-                    state["run_id"],
-                    "review-fixes-started",
-                    _review_fixes_started_body(
-                        number,
-                        state["run_id"],
-                        report,
-                        report_url,
-                        int(state.get("review_round", 0)),
-                    ),
-                )
         self.state.record_event(
             workflow,
             state["run_id"],
@@ -1262,6 +1304,20 @@ class PrFixerService:
                     error="review agent did not complete successfully",
                     metadata=recovery_metadata,
                 )
+                _publish_pr_run_comment(
+                    self.project.repo,
+                    number,
+                    state["run_id"],
+                    "review-final",
+                    _review_completed_body(
+                        number,
+                        state["run_id"],
+                        state.get("report", {}),
+                        state.get("report_url"),
+                        int(state.get("review_round", 0)),
+                        failure="The review agent did not complete successfully; see the daemon log.",
+                    ),
+                )
                 return {"started": False}
             refreshed_meta, _ = _feedback(self.project.repo, number)
             old_sha = str(state["meta"].get("headRefOid", ""))
@@ -1274,44 +1330,40 @@ class PrFixerService:
                 else ["targeted-post-fix"]
             )
             exhausted_head_sha = (new_sha or old_sha) if review_round >= 1 else None
-            comment_posted = False
-            if fix_pushed:
-                from dev_agents.visualize import refresh_report_run_url
-
-                report_url = refresh_report_run_url(
-                    self.project_name, self.project, workflow, state["run_id"]
-                )
-                changed_files = [
-                    path
-                    for path in _run(
-                        self.project.repo,
-                        "gh",
-                        "pr",
-                        "diff",
-                        str(number),
-                        "--name-only",
-                        check=False,
-                    ).splitlines()
-                    if path
-                ]
-                summary = _fix_summary_body(
+            changed_files = [
+                path
+                for path in _run(
+                    self.project.repo,
+                    "gh",
+                    "pr",
+                    "diff",
+                    str(number),
+                    "--name-only",
+                    check=False,
+                ).splitlines()
+                if path
+            ]
+            review_report = state.get("report", {}).get("review_report")
+            validation = None
+            if isinstance(review_report, dict) and isinstance(review_report.get("validation"), list):
+                validation = "; ".join(str(item) for item in review_report["validation"])
+            comment_posted = _publish_pr_run_comment(
+                self.project.repo,
+                number,
+                state["run_id"],
+                "review-final",
+                _review_completed_body(
                     number,
                     state["run_id"],
-                    state["meta"],
-                    refreshed_meta,
-                    [],
+                    state.get("report", {}),
+                    state.get("report_url"),
+                    review_round,
+                    old_sha,
+                    new_sha,
                     changed_files,
-                    reason=(
-                        "findings from the general and Codex review passes"
-                        if review_round == 0
-                        else "findings from targeted post-fix verification"
-                    ),
-                    details=state.get("report", {}).get("fixes"),
-                    report_url=report_url,
-                )
-                comment_posted = _publish_fix_summary(
-                    self.project.repo, number, state["run_id"], summary
-                )
+                    validation,
+                ),
+            )
             self.state.record_event(
                 workflow,
                 state["run_id"],

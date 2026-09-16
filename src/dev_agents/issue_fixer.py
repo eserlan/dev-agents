@@ -121,11 +121,21 @@ def _publish_issue_comment(repo: Path, number: int, marker: str, body: str) -> b
         comments = json.loads(raw)
     except (RuntimeError, json.JSONDecodeError):
         return False
+    markers = [marker]
+    if marker.startswith("dev-agents:issue-fix issue="):
+        # Migrate comments created before issue lifecycle updates were collapsed.
+        markers.extend(
+            (
+                marker.replace("issue-fix ", "issue-fix-started "),
+                marker.replace("issue-fix ", "issue-fix-result "),
+            )
+        )
     existing = next(
         (
             item
             for item in comments
-            if isinstance(item, dict) and marker in str(item.get("body", ""))
+            if isinstance(item, dict)
+            and any(candidate in str(item.get("body", "")) for candidate in markers)
         ),
         None,
     )
@@ -159,7 +169,7 @@ def _publish_issue_comment(repo: Path, number: int, marker: str, body: str) -> b
 
 
 def _issue_start_body(number: int, run_id: str, issue: dict[str, Any]) -> str:
-    marker = f"<!-- dev-agents:issue-fix-started issue={number} run={run_id} -->"
+    marker = f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->"
     return f"""{marker}
 ### 🤖 Dev-agents issue fixer started
 
@@ -169,7 +179,7 @@ It will work in an isolated branch, validate the change, and open a PR for the n
 
 
 def _issue_result_body(number: int, run_id: str, pr_url: str | None, summary: str) -> str:
-    marker = f"<!-- dev-agents:issue-fix-result issue={number} run={run_id} -->"
+    marker = f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->"
     destination = f"[Open the PR]({pr_url})" if pr_url else "No PR was created."
     return f"""{marker}
 ### 🤖 Dev-agents issue fixer result
@@ -380,7 +390,7 @@ class IssueFixerService:
         _publish_issue_comment(
             self.project.repo,
             number,
-            f"dev-agents:issue-fix-started issue={number} run={run_id}",
+            f"dev-agents:issue-fix issue={number} run={run_id}",
             _issue_start_body(number, run_id, issue),
         )
         log_dir = (
@@ -499,7 +509,7 @@ class IssueFixerService:
         _publish_issue_comment(
             self.project.repo,
             number,
-            f"dev-agents:issue-fix-result issue={number} run={run_id}",
+            f"dev-agents:issue-fix issue={number} run={run_id}",
             _issue_result_body(number, run_id, pr_url, f"{summary}\n\n{validation}"),
         )
         return {"fixed": bool(state.get("fixed"))}

@@ -11,6 +11,7 @@ from dev_agents.pr_fixer import (
     _fix_summary_body,
     _normalise_review_report,
     _publish_fix_summary,
+    _publish_pr_run_comment,
     _pull_request_checks,
     _review_is_due,
     _review_prompt,
@@ -126,8 +127,8 @@ def test_review_prompt_requires_lifecycle_comments(tmp_path: Path) -> None:
         run_id="pr-review-42-abc123",
     )
 
-    assert "pr-review-findings run=pr-review-42-abc123" in prompt
-    assert "pr-review-fixes-started run=pr-review-42-abc123" in prompt
+    assert "pr-review run=pr-review-42-abc123" in prompt
+    assert "Do not create additional PR comments" in prompt
     assert "DEV_AGENTS_REVIEW_REPORT_BEGIN" in prompt
 
 
@@ -709,6 +710,38 @@ def test_review_started_comment_links_to_report_run() -> None:
     )
 
     assert "[Open this run in dev-agents report](https://dev-agents-reports.vercel.app?workflow=pr-review&run=pr-review-3056-head)" in body
+
+
+def test_review_lifecycle_updates_one_comment(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
+        calls.append(args)
+        if args[:3] == ("gh", "api", "repos/owner/repo/issues/42/comments"):
+            return '[[{"id": 77, "body": "<!-- dev-agents:pr-review run=run-1 -->\\nstarted"}]]'
+        return ""
+
+    monkeypatch.setattr("dev_agents.pr_fixer.repository_slug", lambda _repo: "owner/repo")
+    monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+
+    assert _publish_pr_run_comment(
+        tmp_path, 42, "run-1", "review-final", "<!-- dev-agents:pr-review run=run-1 -->\\nfinal"
+    )
+    assert any(
+        call[:5]
+        == (
+            "gh",
+            "api",
+            "repos/owner/repo/issues/comments/77",
+            "--method",
+            "PATCH",
+        )
+        for call in calls
+    )
+    assert not any(
+        call[:4] == ("gh", "api", "repos/owner/repo/issues/42/comments", "-f")
+        for call in calls
+    )
 
 
 def test_publish_fix_summary_updates_existing_run_comment(monkeypatch, tmp_path: Path) -> None:

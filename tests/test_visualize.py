@@ -328,12 +328,33 @@ def test_refresh_report_run_url_deploys_a_fresh_snapshot_before_linking(
         lambda *_args, **_kwargs: report,
     )
     monkeypatch.setattr(
-        "dev_agents.visualize.deploy_report_to_vercel",
-        lambda _project, _report: "https://dev-agents-reports-new.vercel.app",
+        "dev_agents.visualize.deploy_report_to_vercel", lambda *_args: "https://preview.example"
     )
 
     assert refresh_report_run_url("demo", project, "pr-review", "run/1") == (
-        "https://dev-agents-reports-new.vercel.app?workflow=pr-review&run=run%2F1"
+        "https://dev-agents-reports.vercel.app?workflow=pr-review&run=run%2F1"
+    )
+
+
+def test_refresh_report_run_url_uses_stable_url_when_public_upload_is_batched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(
+        repo=repo,
+        visualization_path=tmp_path / "flow.html",
+        report_vercel_project="dev-agents-reports",
+        report_vercel_alias="dev-agents-reports.vercel.app",
+    )
+    monkeypatch.setattr(
+        "dev_agents.visualize.refresh_project_report",
+        lambda *_args, **_kwargs: tmp_path / "flow.html",
+    )
+    monkeypatch.setattr("dev_agents.visualize.deploy_report_to_vercel", lambda *_args: None)
+
+    assert refresh_report_run_url("demo", project, "pr-review", "run/1") == (
+        "https://dev-agents-reports.vercel.app?workflow=pr-review&run=run%2F1"
     )
 
 

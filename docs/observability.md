@@ -55,8 +55,9 @@ optionally `report_vercel_scope` and `report_vercel_alias`). Install the Vercel 
 log in as the daemon user or provide a token under `report_vercel_token_env` (default:
 `VERCEL_TOKEN`). A token is preferred for unattended services, while the local CLI login works
 for a daemon running as the same user. Unchanged report content reuses its previous deployment;
-changed reports are throttled to once every five minutes by default and capped at 80 deployments
-per rolling 24 hours. Configure `report_vercel_min_interval_seconds` and
+changed reports are throttled to once every hour by default and capped at 24 deployments per
+rolling 24 hours. The local HTML snapshot still refreshes immediately; only public Vercel uploads
+are batched. Configure `report_vercel_min_interval_seconds` and
 `report_vercel_max_deployments_24h` if needed. For example:
 
 ```yaml

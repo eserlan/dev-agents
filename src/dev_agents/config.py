@@ -33,8 +33,8 @@ class ProjectConfig(BaseModel):
     report_vercel_alias: str | None = None
     report_vercel_token_env: str = "VERCEL_TOKEN"
     report_vercel_timeout_seconds: int = 120
-    report_vercel_min_interval_seconds: int = 300
-    report_vercel_max_deployments_24h: int = 80
+    report_vercel_min_interval_seconds: int = 3600
+    report_vercel_max_deployments_24h: int = 24
     pr_fixer: PrFixerConfig | None = None
     issue_fixer: IssueFixerConfig | None = None
     release_comms: ReleaseCommsConfig | None = None

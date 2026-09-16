@@ -11,8 +11,9 @@ projects:
     # report_vercel_scope: your-team-slug
     # report_vercel_alias: flow.example.com
     # report_vercel_token_env: VERCEL_TOKEN
-    # report_vercel_min_interval_seconds: 300
-    # report_vercel_max_deployments_24h: 80
+    # Public report snapshots are batched; local HTML still refreshes immediately.
+    # report_vercel_min_interval_seconds: 3600
+    # report_vercel_max_deployments_24h: 24
     pr_fixer:
       base_branch: staging
       port: 8788

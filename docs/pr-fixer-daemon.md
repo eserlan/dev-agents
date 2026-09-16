@@ -113,10 +113,13 @@ validated structured `REPORT_JSON` containing the verdict, findings with severit
 the categories checked, validation commands, and fixes. The normalized result is persisted in the
 run metadata and event timeline; the completion comment uses its human-readable summary to explain
 what actually changed, alongside the resulting commit, PR files, and validation result.
-Each comment carries a hidden run/phase marker so retries update the same comment instead of adding
-duplicates. Comment delivery is best-effort and is recorded in workflow event metadata.
+Each review or issue run carries one hidden lifecycle marker so retries update the same comment
+instead of adding phase-by-phase duplicates. Pause alerts and completed feedback-fix summaries stay
+separate because they represent distinct actionable events. Comment delivery is best-effort and is
+recorded in workflow event metadata.
 
 Report deployments are also best-effort and rate-limited. Unchanged report content reuses its last
-deployment; changed content is limited to one upload every five minutes and 80 uploads per rolling
-24 hours by default. A Vercel daily-quota response pauses further attempts for 24 hours. Configure
+deployment; changed content is limited to one public upload per hour and 24 uploads per rolling
+24 hours by default. Local report files still refresh immediately. A Vercel daily-quota response
+pauses further attempts for 24 hours. Configure
 the limits with `report_vercel_min_interval_seconds` and `report_vercel_max_deployments_24h`.

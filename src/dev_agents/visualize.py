@@ -68,11 +68,10 @@ def report_run_url(project: ProjectConfig, workflow: str, run_id: str) -> str | 
 def refresh_report_run_url(
     project_name: str, project: ProjectConfig, workflow: str, run_id: str
 ) -> str | None:
-    """Create a fresh report deployment and return its run-focused URL.
+    """Refresh the local report and return a stable run-focused URL.
 
-    PR comments must never point at a report version that predates the lifecycle event they
-    describe. A deployment-specific URL is returned when Vercel is configured, so the comment
-    remains tied to the exact snapshot created for that phase.
+    The local snapshot is refreshed immediately. Public deployments are deliberately throttled;
+    when a deployment is deferred, callers still receive the stable configured dashboard URL.
     """
     output = getattr(project, "visualization_path", None) or default_report_path(project_name)
     try:
@@ -80,21 +79,8 @@ def refresh_report_run_url(
     except (OSError, ValueError, RuntimeError) as error:
         print(f"Report refresh before comment failed: {error}", file=sys.stderr)
         return None
-    deployment_url = deploy_report_to_vercel(project, report)
-    if project.report_vercel_project and not deployment_url:
-        return None
-    base = deployment_url
-    if not base:
-        host = project.report_vercel_alias or project.report_vercel_project
-        if not host:
-            return None
-        base = host.rstrip("/")
-        if not base.startswith(("http://", "https://")):
-            domain = base if "." in base else f"{base}.vercel.app"
-            base = f"https://{domain}"
-    if not base:
-        return None
-    return f"{base.rstrip('/')}?{urlencode({'workflow': workflow, 'run': run_id})}"
+    deploy_report_to_vercel(project, report)
+    return report_run_url(project, workflow, run_id)
 
 
 def write_report(output: Path, report: str) -> Path:
