@@ -454,11 +454,12 @@ class IssueFixerService:
             error=None if state.get("fixed") else summary,
             metadata={"issue": number, "pr_url": pr_url, "summary": summary},
         )
+        validation = state.get("validation", "Validation was not reported.")
         _publish_issue_comment(
             self.project.repo,
             number,
             f"dev-agents:issue-fix-result issue={number} run={run_id}",
-            _issue_result_body(number, run_id, pr_url, summary),
+            _issue_result_body(number, run_id, pr_url, f"{summary}\n\n{validation}"),
         )
         return {"fixed": bool(state.get("fixed"))}
 
