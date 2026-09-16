@@ -332,6 +332,7 @@ class IssueFixerService:
         if (
             str(issue.get("state", "")).upper() != "OPEN"
             or self.config.label.strip().lower() not in labels
+            or "paused" in labels
         ):
             return {"issue": issue, "skip": True}
         if _existing_issue_pr(self.project.repo, number) is not None:

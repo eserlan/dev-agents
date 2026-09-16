@@ -76,3 +76,26 @@ def test_collect_issue_claims_labeled_open_issue(
     assert result["claimed"] is True
     assert result["branch"] == "dev-agents/issue-92"
     assert state.list_runs("issue-fixer")[0].metadata["issue"] == 92
+
+
+def test_collect_issue_skips_paused_bug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    state = StateRepository(tmp_path / "state.db", "lear-bear", tmp_path)
+    service = IssueFixerService(
+        "lear-bear", project, IssueFixerConfig(), PrFixerConfig(), state
+    )
+    issue = {
+        "number": 92,
+        "state": "OPEN",
+        "title": "Paused bug",
+        "body": "Wait",
+        "labels": [{"name": "bug"}, {"name": "paused"}],
+    }
+    monkeypatch.setattr("dev_agents.issue_fixer._issue", lambda *_args: issue)
+
+    result = service._collect_issue({"number": 92})
+
+    assert result["skip"] is True
+    assert state.list_runs("issue-fixer") == []
