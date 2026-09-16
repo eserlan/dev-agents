@@ -21,6 +21,7 @@ def test_open_bug_issues_keeps_only_open_exact_label(
         {"number": 2, "state": "OPEN", "labels": [{"name": "Bug"}]},
         {"number": 3, "state": "CLOSED", "labels": [{"name": "bug"}]},
         {"number": 4, "state": "OPEN", "labels": [{"name": "bugfix"}]},
+        {"number": 5, "state": "OPEN", "labels": [{"name": "bug"}, {"name": "paused"}]},
     ]
     monkeypatch.setattr(
         "dev_agents.issue_fixer._run", lambda *_args, **_kwargs: json.dumps(payload)

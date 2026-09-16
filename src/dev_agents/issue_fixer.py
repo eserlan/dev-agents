@@ -77,6 +77,10 @@ def _open_bug_issues(repo: Path, config: IssueFixerConfig) -> list[dict[str, Any
         for item in value
         if str(item.get("state", "")).upper() == "OPEN"
         and any(str(tag.get("name", "")).lower() == label for tag in item.get("labels", []))
+        and not any(
+            str(tag.get("name", "")).lower() == "paused"
+            for tag in item.get("labels", [])
+        )
     ]
 
 
