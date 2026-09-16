@@ -416,7 +416,14 @@ class IssueFixerService:
                         heartbeat_seconds=self.pr_config.heartbeat_seconds,
                         reasoning_effort=self.pr_config.reasoning_effort,
                     )
-                    _run(worktree, "git", "fetch", "origin", state["branch"], check=False)
+                    _run(
+                        worktree,
+                        "git",
+                        "fetch",
+                        "origin",
+                        f"refs/heads/{state['branch']}:refs/remotes/origin/{state['branch']}",
+                        check=False,
+                    )
                     head = _run(worktree, "git", "rev-parse", "HEAD", check=False)
                     remote = _run(
                         worktree, "git", "rev-parse", f"origin/{state['branch']}", check=False
