@@ -85,6 +85,27 @@ configuration), all review, fix, and auto-merge activity pauses for that PR. The
 one idempotent pause comment per head. Apply the configured `external_agent_resume_label`
 (`dev-agents-resume` by default) when the external agent is finished and automation should resume.
 
+## Issue fixer
+
+Projects may also opt in to the label-driven issue fixer:
+
+```yaml
+issue_fixer:
+  label: bug
+  base_branch: main
+  branch_prefix: dev-agents/issue-
+```
+
+On startup and during reconciliation, open issues carrying the configured label are claimed in
+SQLite. Luna works in an isolated branch, runs the target repository's validation, pushes the
+branch, and opens a PR containing an issue marker. The normal PR review/fix workflow then owns
+that PR; the issue fixer never merges or closes it. Existing marked PRs prevent duplicate issue
+branches, and failed claims may be retried safely.
+
+The PR workflow's `pause_on_external_agent_commits`, `external_agent_logins`, and
+`external_agent_resume_label` settings also protect issue-fixer PRs. If an external agent such as
+Jules pushes the latest commit, all automation pauses for that PR until the resume label is added.
+
 After a successful remediation run, the daemon also creates or updates top-level PR comments for
 that run. A review publishes a start comment, then Luna publishes a concise findings comment before
 editing and a fixes-started comment when concrete defects need remediation. Luna must also emit a

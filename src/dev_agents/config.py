@@ -8,6 +8,18 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class IssueFixerConfig(BaseModel):
+    """Opt-in configuration for the label-driven issue fixer."""
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str = "bug"
+    base_branch: str = "main"
+    branch_prefix: str = "dev-agents/issue-"
+    timeout_minutes: int = 30
+    max_open_issues: int = 5
+
+
 class ProjectConfig(BaseModel):
     """A target repository available to workflows."""
 
@@ -24,6 +36,7 @@ class ProjectConfig(BaseModel):
     report_vercel_min_interval_seconds: int = 300
     report_vercel_max_deployments_24h: int = 80
     pr_fixer: PrFixerConfig | None = None
+    issue_fixer: IssueFixerConfig | None = None
     release_comms: ReleaseCommsConfig | None = None
 
 

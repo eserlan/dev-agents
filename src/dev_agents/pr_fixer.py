@@ -25,6 +25,7 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.instructions import discover_instructions
+from dev_agents.issue_fixer import IssueFixerService
 from dev_agents.runtime import (
     SqliteStateStore,
     StateRepository,
@@ -47,6 +48,7 @@ _ACTIONS = {
     "pull_request_review": {"submitted", "edited"},
     "pull_request_review_comment": {"created", "edited"},
     "check_run": {"completed"},
+    "issues": {"opened", "reopened", "labeled", "unlabeled", "edited"},
 }
 MAX_BODY_BYTES = 1_000_000
 REVIEW_REPORT_BEGIN = "DEV_AGENTS_REVIEW_REPORT_BEGIN"
@@ -1743,6 +1745,17 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
     _cleanup_artifacts(project_name, config)
     service = PrFixerService(project_name, project, config)
+    issue_service = (
+        IssueFixerService(
+            project_name,
+            project,
+            project.issue_fixer,
+            config,
+            service.state,
+        )
+        if project.issue_fixer is not None
+        else None
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1750,7 +1763,11 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
             self.end_headers()
             self.wfile.write(
                 json.dumps(
-                    {"ok": self.path == "/health", "active_jobs": len(service.active)}
+                    {
+                        "ok": self.path == "/health",
+                        "active_jobs": len(service.active)
+                        + (len(issue_service.active) if issue_service is not None else 0),
+                    }
                 ).encode()
             )
 
@@ -1945,6 +1962,65 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                 self.send_response(202)
                 self.end_headers()
                 return
+            if event == "issues":
+                issue_number = payload.get("issue", {}).get("number")
+                if (
+                    issue_service is None
+                    or payload.get("repository", {}).get("full_name") != project.github
+                    or action not in _ACTIONS["issues"]
+                    or not isinstance(issue_number, int)
+                ):
+                    _log(
+                        f"ignored delivery={delivery} event=issues action={action or 'unknown'} "
+                        f"issue={issue_number or 'unknown'}"
+                    )
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+                assert issue_service is not None
+                claim = service.state.claim_run(
+                    "github-webhook",
+                    f"delivery:{delivery}",
+                    delivery_id=delivery,
+                    metadata={"event": event, "action": action, "issue": issue_number},
+                )
+                if not claim.claimed:
+                    _log(f"ignored delivery={delivery} event=issues reason=duplicate")
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+
+                def run_issue() -> None:
+                    try:
+                        started = issue_service.handle(issue_number)
+                        service.state.complete_run(
+                            "github-webhook",
+                            f"delivery:{delivery}",
+                            metadata={"started": started, "issue": issue_number},
+                        )
+                        _log(
+                            f"handled delivery={delivery} event=issues action={action} "
+                            f"issue={issue_number} started={started}"
+                        )
+                    except Exception as error:  # noqa: BLE001 - daemon must keep serving
+                        service.state.complete_run(
+                            "github-webhook",
+                            f"delivery:{delivery}",
+                            status="failed",
+                            error=str(error),
+                        )
+                        _log(
+                            f"failed delivery={delivery} event=issues action={action} "
+                            f"issue={issue_number} error={error}"
+                        )
+
+                Thread(target=run_issue, daemon=True).start()
+                _log(
+                    f"accepted delivery={delivery} event=issues action={action} issue={issue_number}"
+                )
+                self.send_response(202)
+                self.end_headers()
+                return
             check_pull_requests = payload.get("check_run", {}).get("pull_requests") or []
             check_pr_number = check_pull_requests[0].get("number") if check_pull_requests else None
             number = (
@@ -2087,6 +2163,9 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
     _log(f"listening on 127.0.0.1:{config.port}{config.webhook_path} for {project.github}")
     Thread(target=service.reconcile_loop, daemon=True).start()
+    if issue_service is not None:
+        Thread(target=issue_service.reconcile, daemon=True).start()
+        Thread(target=issue_service.reconcile_loop, daemon=True).start()
     Thread(target=release_comms_scheduler, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", config.port), Handler).serve_forever()
 

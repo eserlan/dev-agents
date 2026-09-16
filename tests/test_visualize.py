@@ -395,5 +395,6 @@ def test_report_collapses_hour_old_runs_and_omits_day_old_runs(tmp_path: Path) -
 
 def test_workflow_mermaid_rejects_unknown_workflow() -> None:
     assert "collect_feedback" in workflow_mermaid("pr-fixer")
+    assert "collect_issue" in workflow_mermaid("issue-fixer")
     with pytest.raises(ValueError, match="unknown workflow"):
         workflow_mermaid("missing")

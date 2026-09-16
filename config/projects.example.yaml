@@ -33,6 +33,14 @@ projects:
       auto_merge: false
       log_retention_days: 30
       worktree_retention_days: 2
+    # Optional issue-driven fixer. Open issues carrying this label are handled in an isolated
+    # branch and submitted as PRs; the normal PR review/fix workflow then takes over.
+    issue_fixer:
+      label: bug
+      base_branch: staging
+      branch_prefix: dev-agents/issue-
+      timeout_minutes: 30
+      max_open_issues: 5
     # Required for the promote workflow's "Trigger Release Communications Agent"
     # step: without this block, POSTs to /release-comms are rejected with 401.
     release_comms:

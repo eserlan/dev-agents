@@ -27,8 +27,22 @@ from dev_agents.workflows.degodify import build_degodify_workflow
 from dev_agents.workflows.inspection import build_inspection_workflow
 from dev_agents.workflows.release_comms import build_release_comms_workflow
 
-WORKFLOW_NAMES = ("inspection", "degodify", "pr-fixer", "pr-review", "release-comms")
-PR_DATABASE_WORKFLOWS = ("pr-fixer", "pr-review", "degodify", "github-webhook")
+WORKFLOW_NAMES = (
+    "inspection",
+    "degodify",
+    "issue-fixer",
+    "pr-fixer",
+    "pr-review",
+    "release-comms",
+)
+PR_DATABASE_WORKFLOWS = (
+    "pr-fixer",
+    "pr-review",
+    "issue-fixer",
+    "issue-reconcile",
+    "degodify",
+    "github-webhook",
+)
 REPORT_HIDE_AFTER = timedelta(hours=1)
 REPORT_DELETE_AFTER = timedelta(days=1)
 REPORT_DEPLOY_BACKOFF = timedelta(hours=24)
@@ -375,12 +389,22 @@ def _pr_review_mermaid() -> str:
     finalize --> __end__([END])"""
 
 
+def _issue_fixer_mermaid() -> str:
+    return """graph TD
+    __start__([START]) --> collect_issue[collect_issue]
+    collect_issue --> remediate[remediate]
+    remediate --> finalize[finalize]
+    finalize --> __end__([END])"""
+
+
 def workflow_mermaid(workflow: str) -> str:
     """Return the current static graph definition for compatibility callers."""
     if workflow == "pr-fixer":
         return _pr_fixer_mermaid()
     if workflow == "pr-review":
         return _pr_review_mermaid()
+    if workflow == "issue-fixer":
+        return _issue_fixer_mermaid()
     builders = {
         "inspection": build_inspection_workflow,
         "degodify": build_degodify_workflow,
@@ -416,6 +440,22 @@ def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
             {"id": "collect_feedback", "label": "collect_feedback", "kind": "node"},
             {"id": "general_review", "label": "general_review", "kind": "node"},
             {"id": "codex_review", "label": "codex_review", "kind": "node"},
+            {"id": "remediate", "label": "remediate", "kind": "node"},
+            {"id": "finalize", "label": "finalize", "kind": "node"},
+            {"id": "__end__", "label": "END", "kind": "end"},
+        ]
+        node_ids = [node["id"] for node in nodes]
+        return {
+            "nodes": nodes,
+            "edges": [
+                {"source": source, "target": target, "conditional": False}
+                for source, target in pairwise(node_ids)
+            ],
+        }
+    if workflow == "issue-fixer":
+        nodes = [
+            {"id": "__start__", "label": "START", "kind": "start"},
+            {"id": "collect_issue", "label": "collect_issue", "kind": "node"},
             {"id": "remediate", "label": "remediate", "kind": "node"},
             {"id": "finalize", "label": "finalize", "kind": "node"},
             {"id": "__end__", "label": "END", "kind": "end"},
