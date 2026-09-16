@@ -1224,18 +1224,41 @@ class PrFixerService:
         workflow = state.get("workflow", "pr-fixer")
         if state.get("review_only"):
             if not state.get("fixed"):
+                recovery_metadata: dict[str, Any] = {}
+                try:
+                    refreshed_meta, _ = _feedback(self.project.repo, number)
+                except (RuntimeError, json.JSONDecodeError):
+                    refreshed_meta = {}
+                old_sha = str(state.get("meta", {}).get("headRefOid", ""))
+                new_sha = str(refreshed_meta.get("headRefOid", ""))
+                if new_sha and new_sha != old_sha:
+                    review_round = int(state.get("review_round", 0))
+                    recovery_metadata = {
+                        "reviewed_head_sha": old_sha,
+                        "review_fix_pushed": True,
+                        "review_follow_up_pending": review_round == 0,
+                        "review_follow_up_head_sha": new_sha if review_round == 0 else None,
+                        "review_exhausted_head_sha": new_sha if review_round >= 1 else None,
+                        "review_failure_recovered": True,
+                        "review_report": state.get("report", {}).get("review_report"),
+                        "review_report_valid": state.get("report", {}).get(
+                            "report_valid", False
+                        ),
+                    }
                 self.state.record_event(
                     workflow,
                     state["run_id"],
                     "finalize",
                     "review_failed",
                     status="failed",
+                    metadata=recovery_metadata,
                 )
                 self.state.complete_run(
                     workflow,
                     state["run_id"],
                     status="failed",
                     error="review agent did not complete successfully",
+                    metadata=recovery_metadata,
                 )
                 return {"started": False}
             refreshed_meta, _ = _feedback(self.project.repo, number)

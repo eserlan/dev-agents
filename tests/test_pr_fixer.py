@@ -350,6 +350,45 @@ def test_internal_review_uses_one_targeted_follow_up_after_luna_fix(
     assert "old-sha" in prompt
 
 
+def test_failed_review_with_pushed_fix_uses_targeted_follow_up(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=database)
+    run_id = "pr-review-42-old-sha"
+    state = StateRepository(database, "demo", repo)
+    state.claim_run(
+        "pr-review",
+        run_id,
+        metadata={
+            "pull_request": 42,
+            "head_sha": "old-sha",
+            "review_round": 0,
+            "review_chain_id": run_id,
+        },
+    )
+    state.complete_run(
+        "pr-review",
+        run_id,
+        status="failed",
+        error="review agent did not complete successfully",
+        metadata={
+            "reviewed_head_sha": "old-sha",
+            "review_fix_pushed": True,
+            "review_follow_up_pending": True,
+            "review_follow_up_head_sha": "new-sha",
+        },
+    )
+
+    plan = PrFixerService("demo", project, config)._review_plan(42, "new-sha")
+
+    assert plan is not None
+    assert plan["round"] == 1
+    assert plan["scope"] == "targeted-post-fix"
+    assert plan["parent_run_id"] == run_id
+
+
 def test_internal_review_stops_after_targeted_follow_up_fix(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
