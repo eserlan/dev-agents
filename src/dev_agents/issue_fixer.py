@@ -244,7 +244,13 @@ def _isolated_issue_worktree(
             check=False,
         )
         if remote_branch:
-            _run(repo, "git", "fetch", "origin", branch)
+            _run(
+                repo,
+                "git",
+                "fetch",
+                "origin",
+                f"refs/heads/{branch}:refs/remotes/origin/{branch}",
+            )
             _run(repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{branch}")
         else:
             _run(repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{base_branch}")
