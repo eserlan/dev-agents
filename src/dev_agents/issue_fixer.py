@@ -377,6 +377,9 @@ class IssueFixerService:
             or Path.home() / ".local/state/dev-agents" / self.project_name / "logs"
         ).expanduser()
         log_path = log_dir / f"issue-{number}-{run_id.rsplit('-', 1)[-1]}.log"
+        fixed = False
+        summary = "Agent did not produce a clean pushed fix."
+        validation = f"Agent log: {log_path}"
         try:
             with _isolated_issue_worktree(
                 self.project.repo,
@@ -385,28 +388,48 @@ class IssueFixerService:
                 self.config.base_branch,
             ) as (worktree, conflicts):
                 base_sha = _run(worktree, "git", "rev-parse", f"origin/{self.config.base_branch}")
-                result: AgentResult = run_agent(
-                    ISSUE_FIX_PROVIDER,
-                    _prompt(worktree, issue, self.config.base_branch, state["branch"], conflicts),
-                    cwd=worktree,
-                    log_path=log_path,
-                    timeout_seconds=self.config.timeout_minutes * 60,
-                    heartbeat_seconds=self.pr_config.heartbeat_seconds,
-                    reasoning_effort=self.pr_config.reasoning_effort,
+                remote_before = _run(
+                    worktree,
+                    "git",
+                    "rev-parse",
+                    f"origin/{state['branch']}",
+                    check=False,
                 )
-                _run(worktree, "git", "fetch", "origin", state["branch"], check=False)
-                head = _run(worktree, "git", "rev-parse", "HEAD", check=False)
-                remote = _run(worktree, "git", "rev-parse", f"origin/{state['branch']}", check=False)
-                clean = _run(worktree, "git", "status", "--porcelain", check=False) == ""
-                pushed_change = bool(head and head != base_sha and head == remote)
-                fixed = result.returncode == 0 and not result.timed_out and clean and pushed_change
-                if not fixed:
-                    summary = "Agent did not produce a clean pushed fix."
-                    if result.timed_out:
+                current = _run(worktree, "git", "rev-parse", "HEAD", check=False)
+                if remote_before and current == remote_before and remote_before != base_sha and not conflicts:
+                    fixed = True
+                    summary = "Reused the previously pushed issue fix and verified its branch."
+                    validation = "Existing remote branch is clean and ahead of the configured base."
+                else:
+                    result: AgentResult = run_agent(
+                        ISSUE_FIX_PROVIDER,
+                        _prompt(worktree, issue, self.config.base_branch, state["branch"], conflicts),
+                        cwd=worktree,
+                        log_path=log_path,
+                        timeout_seconds=self.config.timeout_minutes * 60,
+                        heartbeat_seconds=self.pr_config.heartbeat_seconds,
+                        reasoning_effort=self.pr_config.reasoning_effort,
+                    )
+                    _run(worktree, "git", "fetch", "origin", state["branch"], check=False)
+                    head = _run(worktree, "git", "rev-parse", "HEAD", check=False)
+                    remote = _run(
+                        worktree, "git", "rev-parse", f"origin/{state['branch']}", check=False
+                    )
+                    clean = _run(worktree, "git", "status", "--porcelain", check=False) == ""
+                    pushed_change = bool(head and head != base_sha and head == remote)
+                    fixed = result.returncode == 0 and not result.timed_out and clean and pushed_change
+                    validation = (
+                        f"exit={result.returncode} timed_out={result.timed_out} "
+                        f"clean={clean} head_matches_remote={head == remote} head_ahead_of_base={head != base_sha}; "
+                        f"log: {log_path}"
+                    )
+                    if not fixed and result.timed_out:
                         summary = "Agent timed out before producing a verified pushed fix."
-                    return {"fixed": False, "summary": summary, "validation": f"log: {log_path}"}
         except RuntimeError as error:
             return {"fixed": False, "summary": f"Issue fixer blocked: {error}", "validation": "none"}
+
+        if not fixed:
+            return {"fixed": False, "summary": summary, "validation": validation}
 
         try:
             pr_url = _run(
