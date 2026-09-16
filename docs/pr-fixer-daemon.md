@@ -107,12 +107,12 @@ The PR workflow's `pause_on_external_agent_commits`, `external_agent_logins`, an
 Jules pushes the latest commit, all automation pauses for that PR until the resume label is added.
 
 After a successful remediation run, the daemon also creates or updates top-level PR comments for
-that run. A review publishes a start comment, then Luna publishes a concise findings comment before
-editing and a fixes-started comment when concrete defects need remediation. Luna must also emit a
+that run. A review creates one lifecycle comment; Luna updates it with concise findings before
+editing and a fixes-started status when concrete defects need remediation. Luna must also emit a
 validated structured `REPORT_JSON` containing the verdict, findings with severity/category/location,
 the categories checked, validation commands, and fixes. The normalized result is persisted in the
-run metadata and event timeline; the completion comment uses its human-readable summary to explain
-what actually changed, alongside the resulting commit, PR files, and validation result.
+run metadata and event timeline; the final lifecycle update uses its human-readable summary to
+explain what actually changed, alongside the resulting commit, PR files, and validation result.
 Each review or issue run carries one hidden lifecycle marker so retries update the same comment
 instead of adding phase-by-phase duplicates. Pause alerts and completed feedback-fix summaries stay
 separate because they represent distinct actionable events. Comment delivery is best-effort and is
