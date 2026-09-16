@@ -741,6 +741,13 @@ const indexSummary = document.querySelector('#index-summary');
 const indexColumns = document.querySelector('#index-columns');
 const indexRows = document.querySelector('#index-rows');
 const indexDetails = document.querySelector('#index-details');
+const pubSearch = document.querySelector('#pub-search');
+const pubStatus = document.querySelector('#pub-status');
+const pubChannelOptions = document.querySelector('#pub-channel-options');
+const pubChannelSummary = document.querySelector('#pub-channel-summary');
+const pubSummary = document.querySelector('#pub-summary');
+const pubColumns = document.querySelector('#pub-columns');
+const pubRows = document.querySelector('#pub-rows');
 const reportParams = new URLSearchParams(window.location.search);
 const requestedWorkflow = reportParams.get('workflow') || '';
 const requestedRun = reportParams.get('run') || reportParams.get('run_id') || '';
@@ -753,6 +760,15 @@ let pan = {x: 18, y: 0};
 let dragging = false;
 let dragStart = null;
 let indexSort = {key: 'started_at', direction: 'desc'};
+let pubSort = {key: 'published_at', direction: 'desc'};
+const pubColumnDefinitions = [
+  {key: 'status', label: 'Status'},
+  {key: 'channel', label: 'Channel'},
+  {key: 'destination', label: 'Destination'},
+  {key: 'content', label: 'Content'},
+  {key: 'published_at', label: 'Sent'},
+  {key: 'run_id', label: 'Run'},
+];
 const indexColumnDefinitions = [
   {key: 'status', label: 'Status'},
   {key: 'workflow', label: 'Workflow'},
@@ -882,6 +898,64 @@ function renderIndex() {
   bindIndexRows();
 }
 
+function selectedPubChannels() { return new Set([...pubChannelOptions.querySelectorAll('input:checked')].map(input => input.value)); }
+function updatePubChannelSummary() {
+  const selected = selectedPubChannels(), total = pubChannelOptions.querySelectorAll('input').length;
+  pubChannelSummary.textContent = selected.size === total ? 'All channels' : `${selected.size} selected`;
+}
+function renderPubChannelOptions() {
+  const channels = [...new Set((report.allPublications || []).map(publication => publication.channel))].sort();
+  pubChannelOptions.innerHTML = channels.map(channel => `<label class="workflow-option"><input type="checkbox" value="${escapeHtml(channel)}" checked> <span>${escapeHtml(channel)}</span></label>`).join('');
+  pubChannelOptions.querySelectorAll('input').forEach(input => input.addEventListener('change', () => { updatePubChannelSummary(); renderPublications(); }));
+  updatePubChannelSummary();
+}
+function pubContent(publication) { return publication.public_url || publication.page_url || ''; }
+function pubSortValue(publication, key) {
+  if (key === 'content') return pubContent(publication);
+  if (key === 'published_at') { const timestamp = Date.parse(publication.published_at); return Number.isFinite(timestamp) ? timestamp : 0; }
+  return publication[key] || '';
+}
+function sortPubs(publications) {
+  return publications.map((publication, index) => ({publication, index})).sort((left, right) => {
+    const a = pubSortValue(left.publication, pubSort.key), b = pubSortValue(right.publication, pubSort.key);
+    let comparison;
+    if (typeof a === 'number' && typeof b === 'number') comparison = a - b;
+    else comparison = String(a).localeCompare(String(b), undefined, {numeric: true, sensitivity: 'base'});
+    return (pubSort.direction === 'asc' ? comparison : -comparison) || left.index - right.index;
+  }).map(item => item.publication);
+}
+function renderPubColumns() {
+  pubColumns.innerHTML = pubColumnDefinitions.map(column => {
+    const active = pubSort.key === column.key, arrow = active ? (pubSort.direction === 'asc' ? ' ↑' : ' ↓') : '';
+    return `<button class="index-column" type="button" data-sort-key="${column.key}" aria-label="Sort by ${column.label}" aria-sort="${active ? pubSort.direction : 'none'}">${column.label}${arrow}</button>`;
+  }).join('');
+  pubColumns.querySelectorAll('.index-column').forEach(button => button.addEventListener('click', () => {
+    const key = button.dataset.sortKey;
+    if (pubSort.key === key) pubSort.direction = pubSort.direction === 'asc' ? 'desc' : 'asc';
+    else { pubSort.key = key; pubSort.direction = key === 'published_at' ? 'desc' : 'asc'; }
+    renderPublications();
+  }));
+}
+function pubRowMarkup(publication) {
+  const content = pubContent(publication);
+  return `<button class="index-row pub-row" data-workflow="${escapeHtml(publication.workflow)}" data-run="${escapeHtml(publication.run_id)}"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b><span>${escapeHtml(publication.destination || '—')}</span>${content ? `<a href="${escapeHtml(content)}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">${escapeHtml(content)}</a>` : '<span>—</span>'}<time>${escapeHtml(publication.published_at)}</time><code>${escapeHtml(publication.workflow)}/${escapeHtml(publication.run_id)}</code></button>`;
+}
+function bindPubRows() {
+  pubRows.querySelectorAll('.pub-row').forEach(row => row.addEventListener('click', () => openIndexedRun((report.allRuns || []).find(run => run.workflow === row.dataset.workflow && run.run_id === row.dataset.run) || null)));
+}
+function renderPublications() {
+  const query = pubSearch.value.trim().toLowerCase(), status = pubStatus.value, channels = selectedPubChannels();
+  const filtered = (report.allPublications || []).filter(publication => {
+    const searchable = `${publication.destination} ${publication.page_url} ${publication.public_url || ''} ${publication.run_id} ${publication.error || ''}`.toLowerCase();
+    return (!query || searchable.includes(query)) && (!status || publication.status === status) && channels.has(publication.channel);
+  });
+  const failed = filtered.filter(publication => ['failed', 'error'].includes(publication.status)).length;
+  pubSummary.textContent = `${filtered.length} deliveries · ${failed} failed`;
+  if (!filtered.length) { pubRows.innerHTML = '<p class="empty-index">No publication receipts match these filters.</p>'; return; }
+  pubRows.innerHTML = sortPubs(filtered).map(pubRowMarkup).join('');
+  bindPubRows();
+}
+
 function rebuildLayout() {
   const nodes = currentWorkflow.graph.nodes, edges = currentWorkflow.graph.edges;
   const layers = new Map();
@@ -952,9 +1026,13 @@ canvas.addEventListener('pointerup', event => { dragging = false; canvas.release
 canvas.addEventListener('wheel', event => { event.preventDefault(); const factor = event.deltaY < 0 ? 1.1 : 0.9, bounds = canvas.getBoundingClientRect(), before = worldPoint(event.clientX - bounds.left, event.clientY - bounds.top); zoom = Math.max(.45, Math.min(2.5, zoom * factor)); pan.x = event.clientX - bounds.left - before.x * zoom; pan.y = event.clientY - bounds.top - before.y * zoom; draw(); }, {passive: false});
 workflowSelect.addEventListener('change', updateWorkflow); runSelect.addEventListener('change', updateRun); document.querySelector('#reset-view').addEventListener('click', resetView); window.addEventListener('resize', resizeCanvas);
 indexSearch.addEventListener('input', renderIndex); indexStatus.addEventListener('change', renderIndex);
+pubSearch.addEventListener('input', renderPublications); pubStatus.addEventListener('change', renderPublications);
 report.workflows.forEach(workflow => workflowSelect.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(workflow.name)}">${escapeHtml(workflow.name)}</option>`));
 renderWorkflowOptions();
 renderIndexColumns();
+renderPubChannelOptions();
+renderPubColumns();
+renderPublications();
 if (requestedWorkflow && findWorkflow(requestedWorkflow)) {
   indexWorkflowOptions.querySelectorAll('input').forEach(input => { input.checked = input.value === requestedWorkflow; });
   updateWorkflowFilterSummary();
@@ -985,6 +1063,12 @@ def _interactive_app(data: dict[str, Any]) -> str:
       <div id="index-columns" class="index-columns" role="row" aria-label="Sort runs by column"></div>
       <div id="index-rows" class="index-rows"></div>
       <div id="index-details" class="index-details" hidden></div>
+    </section>
+    <section class="run-index pub-index">
+      <div class="index-header"><div><h2>Release comms deliveries</h2><p class="subtitle">Every channel receipt written by the release-comms daemon: what was sent, to which channel, when, and with what result.</p></div><strong id="pub-summary"></strong></div>
+      <div class="index-filters"><input id="pub-search" type="search" placeholder="Search destination, URL, run, error…" aria-label="Search publications"><details id="pub-channel-filter" class="workflow-filter"><summary>Channels: <span id="pub-channel-summary">All channels</span></summary><div id="pub-channel-options" class="workflow-options" role="group" aria-label="Filter by channel"></div></details><select id="pub-status" aria-label="Filter by status"><option value="">All statuses</option><option value="published">published</option><option value="failed">failed</option><option value="error">error</option><option value="pending">pending</option></select></div>
+      <div id="pub-columns" class="pub-columns index-columns" role="row" aria-label="Sort publications by column"></div>
+      <div id="pub-rows" class="pub-rows index-rows"></div>
     </section>
     <section class="explorer">
       <div class="toolbar">
@@ -1036,6 +1120,17 @@ def render_report(
     recent_runs = [run for run in recent_runs if run["workflow"] in selected]
     recent_runs.sort(key=lambda run: run["started_at"], reverse=True)
     recent_runs = recent_runs[:limit]
+    all_publications = [
+        {
+            "workflow": run["workflow"],
+            "run_id": run["run_id"],
+            "run_started_at": run["started_at"],
+            **publication,
+        }
+        for run in all_runs
+        for publication in run["publications"]
+    ]
+    all_publications.sort(key=lambda publication: publication["published_at"], reverse=True)
     data = {
         "project": project_name,
         "repository": str(project.repo),
@@ -1045,6 +1140,7 @@ def render_report(
             "deleteAfterSeconds": int(REPORT_DELETE_AFTER.total_seconds()),
         },
         "allRuns": all_runs,
+        "allPublications": all_publications,
         "workflows": [
             {"name": name, "graph": workflow_graph(name), "runs": [run for run in recent_runs if run["workflow"] == name]}
             for name in selected
@@ -1059,6 +1155,8 @@ def render_report(
 .subtitle,.hint,.legend{{color:var(--muted)}}.run-index,.explorer{{margin-top:24px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.run-index{{padding:18px}}.index-header{{display:flex;justify-content:space-between;gap:16px;align-items:start}}.index-header h2{{margin-bottom:4px}}.index-header .subtitle{{margin:0}}.index-header strong{{color:var(--cyan);white-space:nowrap}}.index-filters{{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 10px}}input,select,button{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px}}input{{min-width:260px;flex:1}}button{{cursor:pointer}}button:hover{{border-color:var(--gold)}}.index-columns,.index-row{{display:grid;grid-template-columns:86px 125px minmax(150px,1.4fr) minmax(165px,1fr) 70px 100px 145px;align-items:center;gap:10px;text-align:left;font-size:12px}}.index-columns{{margin-bottom:5px}}.index-column{{border:0;background:transparent;color:var(--muted);padding:6px 10px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;text-align:left;white-space:nowrap}}.index-column:hover,.index-column[aria-sort="asc"],.index-column[aria-sort="desc"]{{color:var(--gold)}}.index-rows{{display:grid;gap:5px}}.index-row{{font-family:system-ui}}.index-row code,.index-row time,.index-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row time,.index-row small{{color:var(--muted)}}.index-row b{{overflow:hidden;text-overflow:ellipsis}}.older-runs{{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}}.older-runs summary{{padding:6px 10px}}.older-index-rows{{display:grid;gap:5px;margin-top:6px}}.index-details{{border-top:1px solid var(--border);margin-top:14px;padding-top:14px;max-width:900px}}.publication-detail{{border-left:2px solid var(--green);padding:7px 0 7px 10px;margin:7px 0}}.publication-detail small{{display:block;color:var(--muted);overflow-wrap:anywhere;margin-top:4px}}.publication-detail a{{color:var(--cyan);overflow-wrap:anywhere}}.empty-index{{color:var(--muted)}}.toolbar{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--border);background:#111923}}label{{display:flex;align-items:center;gap:8px;color:var(--muted)}}.hint{{margin-left:auto;font-size:12px}}
 .explorer-grid{{display:grid;grid-template-columns:minmax(0,1fr) 350px;min-height:520px}}#graph-host{{position:relative;min-height:520px;background:radial-gradient(#263342 1px,transparent 1px);background-size:22px 22px;overflow:hidden}}canvas{{display:block;width:100%;height:520px;cursor:grab}}canvas:active{{cursor:grabbing}}.empty-state{{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}}.inspector{{padding:18px;overflow:auto;max-height:620px;background:#111923;border-left:1px solid var(--border)}}.inspector hr{{border:0;border-top:1px solid var(--border);margin:18px 0}}.inspector p{{color:var(--muted);line-height:1.45}}.run-title{{display:flex;gap:9px;align-items:center;flex-wrap:wrap}}.run-title b{{overflow-wrap:anywhere}}.status{{display:inline-block;border-radius:999px;padding:2px 7px;font-size:11px;background:#334155;color:var(--muted)}}.status.completed{{background:#123e3c;color:#8af0cf}}.status.failed,.status.error{{background:#542a34;color:#ffb6bd}}.status.running,.status.pending{{background:#4a3a1b;color:#ffe5a1}}.error{{color:#ffb6bd!important}}pre{{white-space:pre-wrap;overflow:auto;background:#0b1016;border-radius:7px;padding:9px;font-size:11px;color:#cbd5e1}}details summary{{cursor:pointer;color:var(--cyan)}}.event-detail{{border-left:2px solid var(--border);padding:6px 0 8px 10px;margin:9px 0}}.event-detail time{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}.event-detail pre{{margin:7px 0 0}}.event-row{{width:100%;display:grid;grid-template-columns:24px 1fr auto auto;gap:7px;align-items:center;text-align:left;margin:5px 0;padding:7px;font-family:system-ui;font-size:12px}}.event-row span:first-child{{color:var(--muted)}}.event-row b{{overflow:hidden;text-overflow:ellipsis}}.event-row span:nth-child(3){{color:var(--muted);overflow:hidden;text-overflow:ellipsis}}.event-row .status{{font-size:10px}}.legend{{display:flex;gap:18px;flex-wrap:wrap;padding:10px 16px 14px;font-size:12px}}.legend span{{display:flex;gap:6px;align-items:center}}.dot{{width:9px;height:9px;border-radius:50%;display:inline-block;background:#64748b}}.dot.completed{{background:var(--green)}}.dot.failed{{background:var(--red)}}
 .workflow-filter{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px;min-width:190px}}.workflow-filter summary{{cursor:pointer;color:var(--muted)}}.workflow-options{{display:grid;gap:6px;margin-top:8px;max-height:240px;overflow:auto}}.workflow-option{{display:flex;align-items:center;gap:7px;color:var(--text);font-size:12px}}
+.pub-columns,.pub-row{{grid-template-columns:86px 110px minmax(130px,1fr) minmax(180px,1.6fr) 145px 145px}}.pub-row{{font-family:system-ui}}.pub-row code,.pub-row time,.pub-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.pub-row time,.pub-row small{{color:var(--muted)}}.pub-row a{{color:var(--cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+@media(max-width:900px){{.pub-columns,.pub-row{{grid-template-columns:80px 1fr auto}}.pub-columns .index-column:nth-child(4),.pub-columns .index-column:nth-child(5),.pub-columns .index-column:nth-child(6),.pub-row time,.pub-row small,.pub-row a{{display:none}}}}
 @media(max-width:900px){{.explorer-grid{{grid-template-columns:1fr}}.inspector{{border-left:0;border-top:1px solid var(--border);max-height:none}}.hint{{width:100%;margin-left:0}}}}
 @media(max-width:900px){{.index-columns,.index-row{{grid-template-columns:80px 1fr auto}}.index-columns .index-column:nth-child(4),.index-columns .index-column:nth-child(6),.index-columns .index-column:nth-child(7),.index-row time,.index-row span:last-of-type,.index-row small{{display:none}}.index-row code{{grid-column:2}}}}
 </style></head><body><h1>Workflow run explorer</h1>
