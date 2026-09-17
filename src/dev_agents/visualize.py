@@ -751,6 +751,7 @@ const pubRows = document.querySelector('#pub-rows');
 const reportParams = new URLSearchParams(window.location.search);
 const requestedWorkflow = reportParams.get('workflow') || '';
 const requestedRun = reportParams.get('run') || reportParams.get('run_id') || '';
+let reportView = reportParams.get('view') === 'release-comms' || requestedWorkflow === 'release-comms' ? 'release-comms' : 'daemon';
 let currentWorkflow = report.workflows[0] || {name: '', graph: {nodes: [], edges: []}, runs: []};
 let currentRun = null;
 let selectedNode = null;
@@ -784,6 +785,13 @@ function escapeHtml(value) {
 }
 function pretty(value) { return escapeHtml(JSON.stringify(value ?? {}, null, 2)); }
 function findWorkflow(name) { return report.workflows.find(item => item.name === name) || null; }
+function reportWorkflowNames() {
+  const names = [...new Set([
+    ...(report.workflows || []).map(workflow => workflow.name),
+    ...(report.allRuns || []).map(run => run.workflow),
+  ])].sort();
+  return reportView === 'release-comms' ? names.filter(name => name === 'release-comms') : names.filter(name => name !== 'release-comms');
+}
 function workflowIsDefault(workflow) { return !/(webhook|reconcile)/i.test(workflow); }
 function selectedIndexWorkflows() { return new Set([...indexWorkflowOptions.querySelectorAll('input:checked')].map(input => input.value)); }
 function updateWorkflowFilterSummary() {
@@ -791,13 +799,33 @@ function updateWorkflowFilterSummary() {
   indexWorkflowSummary.textContent = selected.size === total ? 'All workflows' : `${selected.size} selected`;
 }
 function renderWorkflowOptions() {
-  const names = [...new Set([
-    ...(report.workflows || []).map(workflow => workflow.name),
-    ...(report.allRuns || []).map(run => run.workflow),
-  ])].sort();
+  const names = reportWorkflowNames();
   indexWorkflowOptions.innerHTML = names.map(workflow => `<label class="workflow-option"><input type="checkbox" value="${escapeHtml(workflow)}" ${workflowIsDefault(workflow) ? 'checked' : ''}> <span>${escapeHtml(workflow)}</span></label>`).join('');
   indexWorkflowOptions.querySelectorAll('input').forEach(input => input.addEventListener('change', () => { updateWorkflowFilterSummary(); renderIndex(); }));
   updateWorkflowFilterSummary();
+}
+function renderWorkflowSelect() {
+  const names = reportWorkflowNames();
+  workflowSelect.innerHTML = names.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('');
+  const selected = names.includes(currentWorkflow.name) ? currentWorkflow.name : names[0];
+  if (selected) { workflowSelect.value = selected; updateWorkflow(); }
+}
+function setReportView(view) {
+  reportView = view === 'release-comms' ? 'release-comms' : 'daemon';
+  document.querySelector('#daemon-tab').setAttribute('aria-selected', reportView === 'daemon' ? 'true' : 'false');
+  document.querySelector('#release-comms-tab').setAttribute('aria-selected', reportView === 'release-comms' ? 'true' : 'false');
+  document.querySelector('#index-panel').hidden = reportView !== 'daemon';
+  document.querySelector('#pub-panel').hidden = reportView !== 'release-comms';
+  renderWorkflowOptions();
+  renderWorkflowSelect();
+  if (history.replaceState) {
+    const params = new URLSearchParams(window.location.search);
+    if (reportView === 'release-comms') params.set('view', 'release-comms'); else params.delete('view');
+    if (reportView === 'daemon' && params.get('workflow') === 'release-comms') {
+      params.delete('workflow'); params.delete('run'); params.delete('run_id');
+    }
+    history.replaceState(null, '', `${window.location.pathname}${params.toString() ? `?${params}` : ''}`);
+  }
 }
 function runActivityTimestamp(run) { return Date.parse(run.updated_at || run.completed_at || run.started_at); }
 function isRecentRun(run) {
@@ -1027,28 +1055,26 @@ canvas.addEventListener('wheel', event => { event.preventDefault(); const factor
 workflowSelect.addEventListener('change', updateWorkflow); runSelect.addEventListener('change', updateRun); document.querySelector('#reset-view').addEventListener('click', resetView); window.addEventListener('resize', resizeCanvas);
 indexSearch.addEventListener('input', renderIndex); indexStatus.addEventListener('change', renderIndex);
 pubSearch.addEventListener('input', renderPublications); pubStatus.addEventListener('change', renderPublications);
-report.workflows.forEach(workflow => workflowSelect.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(workflow.name)}">${escapeHtml(workflow.name)}</option>`));
-renderWorkflowOptions();
+document.querySelector('#daemon-tab').addEventListener('click', () => setReportView('daemon'));
+document.querySelector('#release-comms-tab').addEventListener('click', () => setReportView('release-comms'));
 renderIndexColumns();
 renderPubChannelOptions();
 renderPubColumns();
 renderPublications();
+setReportView(reportView);
 if (requestedWorkflow && findWorkflow(requestedWorkflow)) {
   indexWorkflowOptions.querySelectorAll('input').forEach(input => { input.checked = input.value === requestedWorkflow; });
   updateWorkflowFilterSummary();
   if (requestedRun) indexSearch.value = requestedRun;
 }
 renderIndex();
-if (requestedWorkflow && findWorkflow(requestedWorkflow)) {
+if (requestedWorkflow && findWorkflow(requestedWorkflow) && reportWorkflowNames().includes(requestedWorkflow)) {
   workflowSelect.value = requestedWorkflow;
   updateWorkflow();
   if (requestedRun && currentWorkflow.runs.some(run => run.run_id === requestedRun)) {
     runSelect.value = requestedRun;
     updateRun();
   }
-} else {
-  workflowSelect.value = currentWorkflow.name;
-  updateWorkflow();
 }
 resizeCanvas(); resetView();
 """
@@ -1057,14 +1083,18 @@ resizeCanvas(); resetView();
 def _interactive_app(data: dict[str, Any]) -> str:
     script = INTERACTIVE_SCRIPT.replace("__REPORT_DATA__", _json_for_script(data))
     return f"""
-    <section class="run-index">
+    <nav class="report-tabs" role="tablist" aria-label="Report views">
+      <button id="daemon-tab" type="button" role="tab" aria-selected="true" aria-controls="index-panel">Daemon runs</button>
+      <button id="release-comms-tab" type="button" role="tab" aria-selected="false" aria-controls="pub-panel">Release comms</button>
+    </nav>
+    <section id="index-panel" class="run-index" role="tabpanel" aria-labelledby="daemon-tab">
       <div class="index-header"><div><h2>Daemon run index</h2><p class="subtitle">Recent jobs are visible; jobs older than 1 hour are collapsed. Report messages older than 1 day are omitted.</p></div><strong id="index-summary"></strong></div>
       <div class="index-filters"><input id="index-search" type="search" placeholder="Search run, event, PR, error…" aria-label="Search daemon runs"><details id="index-workflow-filter" class="workflow-filter"><summary>Workflows: <span id="index-workflow-summary">All workflows</span></summary><div id="index-workflow-options" class="workflow-options" role="group" aria-label="Filter by workflow"></div></details><select id="index-status" aria-label="Filter by status"><option value="">All statuses</option><option value="completed">completed</option><option value="failed">failed</option><option value="running">running</option><option value="pending">pending</option><option value="scheduled">scheduled</option></select></div>
       <div id="index-columns" class="index-columns" role="row" aria-label="Sort runs by column"></div>
       <div id="index-rows" class="index-rows"></div>
       <div id="index-details" class="index-details" hidden></div>
     </section>
-    <section class="run-index pub-index">
+    <section id="pub-panel" class="run-index pub-index" role="tabpanel" aria-labelledby="release-comms-tab" hidden>
       <div class="index-header"><div><h2>Release comms deliveries</h2><p class="subtitle">Every channel receipt written by the release-comms daemon: what was sent, to which channel, when, and with what result.</p></div><strong id="pub-summary"></strong></div>
       <div class="index-filters"><input id="pub-search" type="search" placeholder="Search destination, URL, run, error…" aria-label="Search publications"><details id="pub-channel-filter" class="workflow-filter"><summary>Channels: <span id="pub-channel-summary">All channels</span></summary><div id="pub-channel-options" class="workflow-options" role="group" aria-label="Filter by channel"></div></details><select id="pub-status" aria-label="Filter by status"><option value="">All statuses</option><option value="published">published</option><option value="failed">failed</option><option value="error">error</option><option value="pending">pending</option></select></div>
       <div id="pub-columns" class="pub-columns index-columns" role="row" aria-label="Sort publications by column"></div>
@@ -1152,6 +1182,7 @@ def render_report(
 <style>
 :root{{color-scheme:dark;--bg:#0d1117;--panel:#151c26;--panel2:#1b2532;--border:#334155;--text:#e5edf5;--muted:#94a3b8;--gold:#f8d477;--cyan:#7dd3fc;--green:#46d7aa;--red:#ff7280}}
 *{{box-sizing:border-box}}body{{font:14px system-ui,sans-serif;max-width:1500px;margin:0 auto;padding:24px;background:var(--bg);color:var(--text)}}h1,h2,h3{{color:var(--gold);margin-top:0}}h1{{margin-bottom:4px}}code,pre,select,button{{font-family:ui-monospace,SFMono-Regular,monospace}}code{{color:var(--cyan)}}
+.report-tabs{{display:flex;gap:8px;margin-top:24px}}.report-tabs button{{border-radius:8px 8px 0 0;border-bottom:2px solid transparent;color:var(--muted)}}.report-tabs button[aria-selected="true"]{{background:var(--panel);border-color:var(--gold);color:var(--gold)}}
 .subtitle,.hint,.legend{{color:var(--muted)}}.run-index,.explorer{{margin-top:24px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.run-index{{padding:18px}}.index-header{{display:flex;justify-content:space-between;gap:16px;align-items:start}}.index-header h2{{margin-bottom:4px}}.index-header .subtitle{{margin:0}}.index-header strong{{color:var(--cyan);white-space:nowrap}}.index-filters{{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 10px}}input,select,button{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px}}input{{min-width:260px;flex:1}}button{{cursor:pointer}}button:hover{{border-color:var(--gold)}}.index-columns,.index-row{{display:grid;grid-template-columns:86px 125px minmax(150px,1.4fr) minmax(165px,1fr) 70px 100px 145px;align-items:center;gap:10px;text-align:left;font-size:12px}}.index-columns{{margin-bottom:5px}}.index-column{{border:0;background:transparent;color:var(--muted);padding:6px 10px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;text-align:left;white-space:nowrap}}.index-column:hover,.index-column[aria-sort="asc"],.index-column[aria-sort="desc"]{{color:var(--gold)}}.index-rows{{display:grid;gap:5px}}.index-row{{font-family:system-ui}}.index-row code,.index-row time,.index-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row time,.index-row small{{color:var(--muted)}}.index-row b{{overflow:hidden;text-overflow:ellipsis}}.older-runs{{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}}.older-runs summary{{padding:6px 10px}}.older-index-rows{{display:grid;gap:5px;margin-top:6px}}.index-details{{border-top:1px solid var(--border);margin-top:14px;padding-top:14px;max-width:900px}}.publication-detail{{border-left:2px solid var(--green);padding:7px 0 7px 10px;margin:7px 0}}.publication-detail small{{display:block;color:var(--muted);overflow-wrap:anywhere;margin-top:4px}}.publication-detail a{{color:var(--cyan);overflow-wrap:anywhere}}.empty-index{{color:var(--muted)}}.toolbar{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--border);background:#111923}}label{{display:flex;align-items:center;gap:8px;color:var(--muted)}}.hint{{margin-left:auto;font-size:12px}}
 .explorer-grid{{display:grid;grid-template-columns:minmax(0,1fr) 350px;min-height:520px}}#graph-host{{position:relative;min-height:520px;background:radial-gradient(#263342 1px,transparent 1px);background-size:22px 22px;overflow:hidden}}canvas{{display:block;width:100%;height:520px;cursor:grab}}canvas:active{{cursor:grabbing}}.empty-state{{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}}.inspector{{padding:18px;overflow:auto;max-height:620px;background:#111923;border-left:1px solid var(--border)}}.inspector hr{{border:0;border-top:1px solid var(--border);margin:18px 0}}.inspector p{{color:var(--muted);line-height:1.45}}.run-title{{display:flex;gap:9px;align-items:center;flex-wrap:wrap}}.run-title b{{overflow-wrap:anywhere}}.status{{display:inline-block;border-radius:999px;padding:2px 7px;font-size:11px;background:#334155;color:var(--muted)}}.status.completed{{background:#123e3c;color:#8af0cf}}.status.failed,.status.error{{background:#542a34;color:#ffb6bd}}.status.running,.status.pending{{background:#4a3a1b;color:#ffe5a1}}.error{{color:#ffb6bd!important}}pre{{white-space:pre-wrap;overflow:auto;background:#0b1016;border-radius:7px;padding:9px;font-size:11px;color:#cbd5e1}}details summary{{cursor:pointer;color:var(--cyan)}}.event-detail{{border-left:2px solid var(--border);padding:6px 0 8px 10px;margin:9px 0}}.event-detail time{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}.event-detail pre{{margin:7px 0 0}}.event-row{{width:100%;display:grid;grid-template-columns:24px 1fr auto auto;gap:7px;align-items:center;text-align:left;margin:5px 0;padding:7px;font-family:system-ui;font-size:12px}}.event-row span:first-child{{color:var(--muted)}}.event-row b{{overflow:hidden;text-overflow:ellipsis}}.event-row span:nth-child(3){{color:var(--muted);overflow:hidden;text-overflow:ellipsis}}.event-row .status{{font-size:10px}}.legend{{display:flex;gap:18px;flex-wrap:wrap;padding:10px 16px 14px;font-size:12px}}.legend span{{display:flex;gap:6px;align-items:center}}.dot{{width:9px;height:9px;border-radius:50%;display:inline-block;background:#64748b}}.dot.completed{{background:var(--green)}}.dot.failed{{background:var(--red)}}
 .workflow-filter{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px;min-width:190px}}.workflow-filter summary{{cursor:pointer;color:var(--muted)}}.workflow-options{{display:grid;gap:6px;margin-top:8px;max-height:240px;overflow:auto}}.workflow-option{{display:flex;align-items:center;gap:7px;color:var(--text);font-size:12px}}

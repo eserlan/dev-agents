@@ -240,6 +240,11 @@ def test_report_contains_graph_and_run_timeline(tmp_path: Path) -> None:
     assert "candidate_selected" in report
     assert "src/large.ts" in report
     assert "release-comms" in report
+    assert 'id="daemon-tab"' in report
+    assert 'id="release-comms-tab"' in report
+    assert 'id="index-panel"' in report
+    assert 'id="pub-panel"' in report
+    assert 'reportView === \'release-comms\'' in report
     assert "canvas" in report
     assert "Click nodes or events" in report
     assert "discord.example/message/1" in report
