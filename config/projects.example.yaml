@@ -32,6 +32,8 @@ projects:
       external_agent_logins: ["google-labs-jules[bot]"]
       external_agent_resume_label: dev-agents-resume
       auto_merge: false
+      # Set both auto_merge and this flag to true to merge only PRs created by issue_fixer.
+      auto_merge_issue_fixes_only: false
       log_retention_days: 30
       worktree_retention_days: 2
     # Optional issue-driven fixer. Open issues carrying this label are handled in an isolated

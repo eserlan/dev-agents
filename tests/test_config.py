@@ -37,11 +37,16 @@ def test_loads_issue_fixer_configuration(tmp_path: Path) -> None:
         "      label: bug\n"
         "      base_branch: main\n"
         "      max_open_issues: 2\n"
+        "    pr_fixer:\n"
+        "      auto_merge: true\n"
+        "      auto_merge_issue_fixes_only: true\n"
     )
 
     project = select_project(load_projects_config(config_path), "lear-bear")
 
     assert project.issue_fixer == IssueFixerConfig(max_open_issues=2)
+    assert project.pr_fixer is not None
+    assert project.pr_fixer.auto_merge_issue_fixes_only is True
 
 
 def test_reports_unknown_project(tmp_path: Path) -> None:

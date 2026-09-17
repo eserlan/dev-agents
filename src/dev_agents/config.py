@@ -87,6 +87,7 @@ class PrFixerConfig(BaseModel):
     reconcile_interval_seconds: int = 300
     review_without_copilot: bool = True
     auto_merge: bool = False
+    auto_merge_issue_fixes_only: bool = False
     log_retention_days: int = 30
     worktree_retention_days: int = 2
     auto_merge_quiet_seconds: int = 60

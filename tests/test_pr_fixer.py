@@ -645,6 +645,85 @@ def test_auto_merge_accepts_clean_review_chain_final_fix_head(
     assert ("gh", "pr", "merge", "42", "--auto", "--squash") in commands
 
 
+def test_auto_merge_can_be_scoped_to_issue_fixer_prs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(
+        state_path=tmp_path / "state.db",
+        auto_merge=True,
+        auto_merge_issue_fixes_only=True,
+        review_without_copilot=False,
+    )
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "isDraft": False,
+        "labels": [],
+        "headRefOid": "issue-fix-sha",
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+        "autoMergeRequest": None,
+        "body": "<!-- dev-agents:issue-fix issue=92 run=issue-fix-92-demo -->",
+    }
+    commands: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
+        commands.append(args)
+        if args[:3] == ("gh", "pr", "view"):
+            return '{"state":"OPEN","autoMergeRequest":{"enabledAt":"now"}}'
+        return ""
+
+    monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+    PrFixerService("demo", project, config)._ensure_auto_merge(42)
+
+    assert ("gh", "pr", "merge", "42", "--auto", "--squash") in commands
+
+
+def test_scoped_auto_merge_leaves_regular_prs_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(
+        state_path=tmp_path / "state.db",
+        auto_merge=True,
+        auto_merge_issue_fixes_only=True,
+        review_without_copilot=False,
+    )
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "isDraft": False,
+        "labels": [],
+        "headRefOid": "regular-sha",
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+        "autoMergeRequest": None,
+        "body": "A regular pull request.",
+    }
+    merge_called = False
+
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
+        nonlocal merge_called
+        merge_called = args[:3] == ("gh", "pr", "merge")
+        return ""
+
+    monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+    PrFixerService("demo", project, config)._ensure_auto_merge(42)
+
+    assert merge_called is False
+
+
 def test_reconcile_persists_a_run_for_the_daemon_index(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

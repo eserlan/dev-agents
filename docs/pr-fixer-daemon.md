@@ -63,6 +63,11 @@ With `auto_merge: true`, each handled pull-request event and reconciliation pass
 refreshes merge readiness after feedback processing. Auto-merge is deferred until GitHub reports at
 least one check, no pending or failing checks, a clean mergeable PR, and no actionable feedback.
 
+For a project that should auto-merge only daemon-created issue fixes, set both
+`auto_merge: true` and `auto_merge_issue_fixes_only: true`. The daemon then requires the hidden
+`dev-agents:issue-fix` PR marker in addition to every normal review, validation, mergeability, and
+pause gate. Regular pull requests remain manual.
+
 The auto-merge request has its own SQLite claim keyed by pull request and head SHA, separate from
 the feedback-fix claim. This means a no-op run created while checks are pending cannot suppress a
 later `check_run.completed` attempt. After `gh pr merge --auto --squash`, the daemon verifies that

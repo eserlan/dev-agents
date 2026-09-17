@@ -128,7 +128,7 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
             "view",
             str(number),
             "--json",
-            "number,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews,commits,autoMergeRequest,url",
+            "number,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews,commits,autoMergeRequest,url,body",
         )
     )
     slug = repository_slug(repo)
@@ -184,6 +184,11 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
     if meta.get("mergeable") == "CONFLICTING" or meta.get("mergeStateStatus") == "DIRTY":
         keys.append(f"conflict:{meta['headRefOid']}")
     return meta, keys
+
+
+def _is_issue_fix_pr(meta: dict[str, Any]) -> bool:
+    """Identify PRs created by the label-driven issue fixer."""
+    return bool(re.search(r"<!--\s*dev-agents:issue-fix\s+issue=\d+\b", str(meta.get("body", ""))))
 
 
 def _pull_request_checks(repo: Path, number: int) -> list[dict[str, Any]]:
@@ -1568,6 +1573,8 @@ class PrFixerService:
         checks = meta.get("checks", [])
         resume_label = self.config.external_agent_resume_label.strip().lower()
         if _external_agent_commit(meta, self.config) and resume_label not in labels:
+            return False
+        if self.config.auto_merge_issue_fixes_only and not _is_issue_fix_pr(meta):
             return False
         if not checks:
             return False
