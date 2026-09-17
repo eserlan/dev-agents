@@ -1,4 +1,5 @@
 import json
+import urllib.error
 from pathlib import Path
 from typing import Any, Self
 
@@ -91,6 +92,11 @@ def test_stage_reddit_candidate_live_invokes_wrangler(
     monkeypatch.setattr("dev_agents.workflows.reddit._upload_r2_file", fake_upload_r2_file)
     monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=15.0: (_ for _ in ()).throw(FileNotFoundError("isolated test")))
 
+    def no_existing_manifest(*args: Any, **kwargs: Any) -> Any:
+        raise urllib.error.URLError("no existing manifest in test")
+
+    monkeypatch.setattr(urllib.request, "urlopen", no_existing_manifest)
+
     receipt = stage_reddit_candidate(
         repo=tmp_path,
         candidate=candidate,
@@ -105,6 +111,73 @@ def test_stage_reddit_candidate_live_invokes_wrangler(
     manifest = uploaded_files[0]["data"]
     assert len(manifest["candidates"]) == 1
     assert manifest["candidates"][0]["id"] == "reddit-pr-100-live"
+
+
+def test_stage_reddit_candidate_merges_with_existing_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    existing = {
+        "id": "reddit-pr-99-old",
+        "title": "Old Post",
+        "body": "Old body",
+        "url": "https://codexcryptica.com/answers/old",
+        "source_id": "pr-99",
+    }
+    candidate = {
+        "id": "reddit-pr-100-live",
+        "title": "Live Post",
+        "body": "Body text",
+        "url": "https://codexcryptica.com/answers/live",
+        "source_id": "pr-100",
+    }
+
+    uploaded_files: list[dict[str, Any]] = []
+
+    def fake_upload_r2_file(*, repo: Path, path: Path, key: str, content_type: str, env: Any, timeout: float) -> str:
+        uploaded_files.append({
+            "key": key,
+            "content_type": content_type,
+            "data": json.loads(path.read_text(encoding="utf-8")),
+        })
+        return f"https://assets.codexcryptica.com/{key}"
+
+    class _FakeManifestResponse:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return json.dumps({"candidates": [existing]}).encode("utf-8")
+
+    monkeypatch.setattr("dev_agents.workflows.reddit._upload_r2_file", fake_upload_r2_file)
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda req, timeout=15.0: _FakeManifestResponse()
+    )
+
+    receipt = stage_reddit_candidate(
+        repo=tmp_path,
+        candidate=candidate,
+        env={},
+        dry_run=False,
+    )
+
+    assert receipt.external_id == "staged:pr-100"
+    manifest = uploaded_files[0]["data"]
+    assert [item["source_id"] for item in manifest["candidates"]] == ["pr-99", "pr-100"]
+
+    # Re-staging the same source replaces instead of duplicating.
+    receipt = stage_reddit_candidate(
+        repo=tmp_path,
+        candidate={**candidate, "title": "Live Post (updated)"},
+        env={},
+        dry_run=False,
+    )
+    assert receipt.external_id == "staged:pr-100"
+    manifest = uploaded_files[1]["data"]
+    assert [item["source_id"] for item in manifest["candidates"]] == ["pr-99", "pr-100"]
+    assert manifest["candidates"][1]["title"] == "Live Post (updated)"
 
 
 def test_recommend_channels_includes_reddit_when_enabled() -> None:
