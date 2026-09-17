@@ -14,7 +14,7 @@ from dev_agents.config import (
     select_project,
 )
 from dev_agents.context.repository import RepositoryError
-from dev_agents.pr_fixer import serve_project
+from dev_agents.daemon import serve_project
 from dev_agents.runtime import StateRepository, state_database_path
 from dev_agents.visualize import (
     WORKFLOW_NAMES,
