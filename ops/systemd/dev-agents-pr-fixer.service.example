@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/dev/dev-agents
+# Hard-coded so gh (and other user-managed tools, e.g. mise shims) resolve
+# regardless of the systemd user manager's ambient environment at start time.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl
 EnvironmentFile=%h/.config/codex-pr-review/webhook.env
 ExecStart=%h/dev/dev-agents/.venv/bin/dev-agents pr-fixer serve codex-cryptica --config %h/.config/dev-agents/projects.yaml
 Restart=on-failure
@@ -13,3 +16,5 @@ RestartSec=5
 
 [Install]
 WantedBy=default.target
+
+# Installation: cp this file to ~/.config/systemd/user/dev-agents.service

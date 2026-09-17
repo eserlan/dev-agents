@@ -1,7 +1,7 @@
 [Unit]
 Description=Cloudflare Tunnel for dev-agents GitHub PR fixer
-Requires=dev-agents-pr-fixer.service
-After=dev-agents-pr-fixer.service network-online.target
+Requires=dev-agents.service
+After=dev-agents.service network-online.target
 Wants=network-online.target
 
 [Service]

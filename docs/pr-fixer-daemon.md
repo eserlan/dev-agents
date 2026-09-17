@@ -11,19 +11,19 @@ to another agent; `reasoning_effort` controls the Codex reasoning level and defa
 ```bash
 mkdir -p ~/.config/dev-agents ~/.config/systemd/user
 cp config/projects.example.yaml ~/.config/dev-agents/projects.yaml
-cp ops/systemd/dev-agents-pr-fixer.service.example ~/.config/systemd/user/dev-agents-pr-fixer.service
-cp ops/systemd/dev-agents-pr-fixer-tunnel.service.example ~/.config/systemd/user/dev-agents-pr-fixer-tunnel.service
+cp ops/systemd/dev-agents-pr-fixer.service.example ~/.config/systemd/user/dev-agents.service
+cp ops/systemd/dev-agents-pr-fixer-tunnel.service.example ~/.config/systemd/user/dev-agents-tunnel.service
 # Reuse the existing remotecc secrets and tunnel config:
 #   ~/.config/codex-pr-review/webhook.env
 #   ~/.cloudflared/codex-pr-review.yml
 systemctl --user daemon-reload
 systemctl --user disable --now codex-pr-review-webhook.service codex-pr-review-tunnel.service || true
-systemctl --user enable --now dev-agents-pr-fixer.service dev-agents-pr-fixer-tunnel.service
+systemctl --user enable --now dev-agents.service dev-agents-tunnel.service
 ```
 
 The GitHub webhook remains `https://pr-webhook.codexcryptica.com/github`; configure its secret to
 match `GITHUB_WEBHOOK_SECRET`. Check both services with `systemctl --user status`, inspect logs with
-`journalctl --user -u dev-agents-pr-fixer.service -f`, and verify the local listener with
+`journalctl --user -u dev-agents.service -f`, and verify the local listener with
 `curl http://127.0.0.1:8788/health`.
 
 The new services reuse `~/.config/codex-pr-review/webhook.env` and
