@@ -11,17 +11,26 @@ import {
 import { publishCandidatePost } from './publisher.js';
 
 const DEFAULT_MANIFEST_URL =
-  'https://assets.codexcryptica.com/announcements/reddit-candidates.json';
+  'https://raw.githubusercontent.com/eserlan/Codex-Cryptica/release-manifests/announcements/reddit-candidates.json';
 const SCHEDULER_JOB_NAME = 'reddit_dispatcher';
 
 Devvit.configure({
   redditAPI: true,
   redis: true,
   http: {
-    domains: ['assets.codexcryptica.com'],
+    domains: ['raw.githubusercontent.com'],
   },
   media: true,
 });
+
+Devvit.addSettings([
+  {
+    type: 'string',
+    name: 'manifestUrl',
+    label: 'Candidate Manifest URL (raw.githubusercontent.com)',
+    defaultValue: DEFAULT_MANIFEST_URL,
+  },
+]);
 
 // Self-healing scheduler registration on install and upgrade
 Devvit.addTrigger({
@@ -63,14 +72,17 @@ Devvit.addSchedulerJob({
     const subreddit = await reddit.getCurrentSubreddit();
     const subredditName = subreddit.name;
 
-    // 1. Sync candidates from CDN
+    // 1. Sync candidates from manifest
     try {
-      const syncResult = await syncCandidatesFromCdn(redis, DEFAULT_MANIFEST_URL);
+      const manifestUrl =
+        (await context.settings.get<string>('manifestUrl')) ||
+        DEFAULT_MANIFEST_URL;
+      const syncResult = await syncCandidatesFromCdn(redis, manifestUrl);
       if (syncResult.added > 0) {
-        console.log(`Synced ${syncResult.added} new candidates from CDN`);
+        console.log(`Synced ${syncResult.added} new candidates from manifest`);
       }
     } catch (err) {
-      console.error('Error syncing candidates from CDN:', err);
+      console.error('Error syncing candidates from manifest:', err);
     }
 
     // 2. Check queue status and cadence gates
@@ -139,9 +151,12 @@ Devvit.addMenuItem({
   forUserType: 'moderator',
   onPress: async (_, context) => {
     try {
+      const manifestUrl =
+        (await context.settings.get<string>('manifestUrl')) ||
+        DEFAULT_MANIFEST_URL;
       const syncResult = await syncCandidatesFromCdn(
         context.redis,
-        DEFAULT_MANIFEST_URL
+        manifestUrl
       );
       context.ui.showToast(
         `Sync complete: ${syncResult.added} added, ${syncResult.skipped} already in queue`
@@ -195,28 +210,39 @@ Devvit.addMenuItem({
   },
 });
 
-// Moderator Menu: Enqueue Discussion #3066 Candidate
+// Moderator Menu: Enqueue Chase Answer Candidate
 Devvit.addMenuItem({
   location: 'subreddit',
-  label: 'Release Queue: Enqueue Discussion #3066',
+  label: 'Release Queue: Enqueue Chase Answer',
   forUserType: 'moderator',
   onPress: async (_, context) => {
     const candidate = {
-      id: 'reddit-34789183506-share-any-generator-result-as-a-public-l',
-      title: 'Share any generator result as a public link with one-click Remix',
-      body: 'You roll an NPC or a location you actually want to use, then you copy the text into Discord and the formatting falls apart. If someone wants to tweak one detail they have to paste it back into the generator and guess your inputs.\n\nI built shareable generator results: any output can become a public link with a human-readable slug that anyone can view and Remix straight back into the generator to make it their own.\n\nTry it from any generator: https://codexcryptica.com/generators\n\n- Works for NPCs, locations, encounters, factions, items, quests and the rest, not just one generator\n- Viewer gets a clean rendered page, no account needed to open it\n- Remix drops the content back into the generator with the prompt and options prefilled so you can reroll a variant\n- Link uses a readable slug like `/share/whispering-cold-tavern-...` instead of a random ID wall\n\nTradeoff I am still sitting with: once you share, the link is public to anyone with the URL. You can revoke it from My Stuff, but there is no private share or password yet. I kept it simple to ship, and I am not sure if private links are worth the extra friction.\n\nWhat is the last generator result you copy-pasted somewhere and wished you could just link instead?\n\n![A tabletop roleplaying illustration for https://codexcryptica.com/generators](https://assets.codexcryptica.com/announcements/release-34789183506-3.png)\n\n---\n*Posted automatically via release pipeline. Feedback and discussion welcome!*\n<!-- id:34789183506 -->',
-      url: 'https://codexcryptica.com/generators',
-      image_url: 'https://assets.codexcryptica.com/announcements/release-34789183506-3.png',
-      source_id: '34789183506',
+      id: 'reddit-pr-3155-how-do-you-run-a-chase-in-a-tabletop-rpg',
+      title: 'How do you run a chase in a tabletop RPG?',
+      body:
+        'Most RPG chases fail when treated like combat movement on a grid: counting exact feet per round turns exciting pursuits into a slog of repetitive movement checks.\n\n' +
+        'I wrote up a complete framework for running chases as a race to a conclusion rather than a positioning contest: https://codexcryptica.com/answers/how-do-you-run-a-chase-in-a-tabletop-rpg\n\n' +
+        'Five pieces every chase needs:\n' +
+        '- A visible gap: track progress in relative zones rather than square grids.\n' +
+        '- A finish line for each side: escape conditions and capture conditions set in advance.\n' +
+        '- Complications that force real choices: obstacles with multiple ways through that cost time, noise, or resources.\n' +
+        '- A job for every character: perception, route-finding, sabotage, or obstacles so slower characters aren’t bystanders.\n' +
+        '- Escalation: shifting environments rather than one unchanging street.\n\n' +
+        '[🖼️ View Chase Flowchart & Reference Guide](https://assets.codexcryptica.com/og/how-do-you-run-a-chase-in-a-tabletop-rpg.jpg)\n\n' +
+        '---\n*Posted automatically via release pipeline. Feedback and discussion welcome!*\n<!-- id:pr-3155 -->',
+      url: 'https://codexcryptica.com/answers/how-do-you-run-a-chase-in-a-tabletop-rpg',
+      image_url:
+        'https://assets.codexcryptica.com/og/how-do-you-run-a-chase-in-a-tabletop-rpg.jpg',
+      source_id: 'pr-3155',
       status: 'approved' as const,
       created_at: Math.floor(Date.now() / 1000),
     };
 
     const added = await enqueueCandidate(context.redis, candidate, true);
     if (added) {
-      context.ui.showToast('Discussion #3066 enqueued to release queue!');
+      context.ui.showToast('Chase Answer enqueued to release queue!');
     } else {
-      context.ui.showToast('Discussion #3066 was already enqueued or seen.');
+      context.ui.showToast('Chase Answer was already enqueued or seen.');
     }
   },
 });

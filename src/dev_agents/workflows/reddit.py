@@ -1,12 +1,13 @@
-"""Reddit publishing adapter: payload formatting, R2 candidate staging, and export.
+"""Reddit publishing adapter: payload formatting, candidate staging, and export.
 
 Separates asynchronous Reddit staging from direct synchronous platform delivery.
 Target repositories supply only release copy; dev-agents stages candidate
-manifests to Cloudflare R2 for ingestion by the Devvit companion app.
+manifests to GitHub (or Cloudflare R2) for ingestion by the Devvit companion app.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import tempfile
@@ -36,13 +37,29 @@ def format_reddit_post(
 ) -> dict[str, Any]:
     """Format a Reddit candidate payload for Devvit ingestion."""
     clean_body = body.strip()
-    id_tag = f"<!-- id:{source_id} -->" if source_id else ""
-    footer = (
-        "\n\n---\n"
-        "*Posted automatically via release pipeline. Feedback and discussion welcome!*"
+
+    # Convert any markdown image embeds ![alt](url) to clean clickable links
+    # because Reddit selftext does not render external image embeds inline.
+    clean_body = re.sub(
+        r"!\[([^\]]*)\]\((https?://[^)]+)\)",
+        lambda m: f"[🖼️ {m.group(1).strip() or 'View Illustration'}]({m.group(2)})",
+        clean_body,
     )
-    if id_tag:
-        footer += f"\n{id_tag}"
+
+    if image_url and image_url not in clean_body:
+        clean_body = f"{clean_body}\n\n[🖼️ View Illustration / Reference Guide]({image_url})"
+
+    id_tag = f"<!-- id:{source_id} -->" if source_id else ""
+    standard_footer = "*Posted automatically via release pipeline. Feedback and discussion welcome!*"
+    if standard_footer not in clean_body:
+        footer = f"\n\n---\n{standard_footer}"
+        if id_tag and id_tag not in clean_body:
+            footer += f"\n{id_tag}"
+        formatted_body = f"{clean_body}{footer}"
+    else:
+        formatted_body = clean_body
+        if id_tag and id_tag not in clean_body:
+            formatted_body += f"\n{id_tag}"
 
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", title.lower()).strip("-")[:40]
     candidate_id = (
@@ -53,7 +70,7 @@ def format_reddit_post(
     return {
         "id": candidate_id or "reddit-candidate",
         "title": title,
-        "body": f"{clean_body}{footer}",
+        "body": formatted_body,
         "url": page_url,
         "image_url": image_url or "",
         "source_id": source_id,
@@ -65,6 +82,90 @@ def format_reddit_post(
 DEFAULT_MANIFEST_KEY = "announcements/reddit-candidates.json"
 
 
+def _fetch_manifest_from_url(url: str, timeout: float = 15.0) -> list[dict[str, Any]]:
+    """Fetch existing candidates from a manifest URL."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "dev-agents/release-comms"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("candidates"), list):
+                return [c for c in data["candidates"] if isinstance(c, dict)]
+            elif isinstance(data, list):
+                return [c for c in data if isinstance(c, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+    return []
+
+
+def _upload_github_manifest(
+    *,
+    repo: Path,
+    github: str,
+    branch: str,
+    path: str,
+    manifest: Mapping[str, Any],
+    timeout: float = 60.0,
+) -> str:
+    """Commit an updated JSON manifest to GitHub using gh CLI."""
+    from dev_agents.runtime import gh, gh_json
+
+    content_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+    b64_content = base64.b64encode(content_bytes).decode("ascii")
+
+    # Check if branch exists; if not, create it from repository default branch
+    try:
+        gh(repo, "api", f"/repos/{github}/git/ref/heads/{branch}", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        repo_info = gh_json(repo, "api", f"/repos/{github}", timeout=timeout)
+        default_branch = repo_info.get("default_branch", "main")
+        ref_info = gh_json(repo, "api", f"/repos/{github}/git/ref/heads/{default_branch}", timeout=timeout)
+        commit_sha = ref_info["object"]["sha"]
+        gh(
+            repo,
+            "api",
+            "--method",
+            "POST",
+            f"/repos/{github}/git/refs",
+            "-f",
+            f"ref=refs/heads/{branch}",
+            "-f",
+            f"sha={commit_sha}",
+            timeout=timeout,
+        )
+
+    # Get existing file SHA if it exists on branch
+    sha: str | None = None
+    try:
+        existing_file = gh_json(
+            repo, "api", f"/repos/{github}/contents/{path}?ref={branch}", timeout=timeout
+        )
+        if isinstance(existing_file, dict) and existing_file.get("sha"):
+            sha = str(existing_file["sha"])
+    except Exception:  # noqa: BLE001
+        sha = None
+
+    args = [
+        "api",
+        "--method",
+        "PUT",
+        f"/repos/{github}/contents/{path}",
+        "-f",
+        f"message=Update {path}",
+        "-f",
+        f"content={b64_content}",
+        "-f",
+        f"branch={branch}",
+    ]
+    if sha:
+        args.extend(["-f", f"sha={sha}"])
+    gh(repo, *args, timeout=timeout)
+
+    return f"https://raw.githubusercontent.com/{github}/{branch}/{path}"
+
+
 def stage_reddit_candidate(
     *,
     repo: Path,
@@ -73,14 +174,71 @@ def stage_reddit_candidate(
     dry_run: bool,
     destination: str = "reddit",
     key: str = DEFAULT_MANIFEST_KEY,
+    github: str | None = None,
+    branch: str = "release-manifests",
     timeout: float = 120,
 ) -> PublicationReceipt:
-    """Upload or update the Reddit candidate manifest on Cloudflare R2."""
+    """Upload or update the Reddit candidate manifest on GitHub (or Cloudflare R2)."""
     page_url = str(candidate.get("url", ""))
     source_id = str(candidate.get("source_id", ""))
     candidate_id = str(candidate.get("id", ""))
     external_id = f"staged:{source_id}" if source_id else f"staged:{candidate_id}"
 
+    if github:
+        if dry_run:
+            return PublicationReceipt(
+                channel="reddit",
+                destination=destination,
+                page_url=page_url,
+                public_url=f"dry-run://github/{github}/{branch}/{key}",
+                external_id=external_id,
+                metadata={
+                    "status": "staged_to_github",
+                    "candidate_id": candidate_id,
+                    "source_id": source_id,
+                    "github": github,
+                    "branch": branch,
+                },
+            )
+
+        manifest_url = f"https://raw.githubusercontent.com/{github}/{branch}/{key}"
+        existing_candidates = _fetch_manifest_from_url(manifest_url, timeout=15)
+        merged = [
+            c
+            for c in existing_candidates
+            if c.get("id") != candidate_id and (not source_id or c.get("source_id") != source_id)
+        ]
+        merged.append(dict(candidate))
+        manifest = {
+            "updated_at": int(time.time()),
+            "candidates": merged,
+        }
+
+        public_url = _upload_github_manifest(
+            repo=repo,
+            github=github,
+            branch=branch,
+            path=key,
+            manifest=manifest,
+            timeout=timeout,
+        )
+
+        return PublicationReceipt(
+            channel="reddit",
+            destination=destination,
+            page_url=page_url,
+            public_url=public_url,
+            external_id=external_id,
+            metadata={
+                "status": "staged_to_github",
+                "candidate_id": candidate_id,
+                "source_id": source_id,
+                "github": github,
+                "branch": branch,
+            },
+        )
+
+    # Fallback to R2 staging when github is not provided
     if dry_run:
         return PublicationReceipt(
             channel="reddit",
@@ -91,22 +249,7 @@ def stage_reddit_candidate(
             metadata={"status": "staged_to_r2", "candidate_id": candidate_id, "source_id": source_id},
         )
 
-    # Fetch existing manifest if available to merge
-    existing_candidates: list[dict[str, Any]] = []
-    try:
-        req = urllib.request.Request(
-            f"https://{ASSET_HOST}/{key}",
-            headers={"User-Agent": "dev-agents/release-comms"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("candidates"), list):
-                existing_candidates = [c for c in data["candidates"] if isinstance(c, dict)]
-            elif isinstance(data, list):
-                existing_candidates = [c for c in data if isinstance(c, dict)]
-    except Exception:  # noqa: BLE001
-        existing_candidates = []
-
+    existing_candidates = _fetch_manifest_from_url(f"https://{ASSET_HOST}/{key}", timeout=15)
     merged = [
         c
         for c in existing_candidates
@@ -149,39 +292,54 @@ def prune_published_reddit_candidates(
     repo: Path,
     published_source_ids: set[str],
     key: str = DEFAULT_MANIFEST_KEY,
+    github: str | None = None,
+    branch: str = "release-manifests",
     env: Mapping[str, str] | None = None,
     timeout: float = 30.0,
     dry_run: bool = False,
 ) -> int:
-    """Remove published candidates from the R2 candidate manifest.
+    """Remove published candidates from the candidate manifest (GitHub or R2).
 
     Returns the number of candidates removed.
     """
     if not published_source_ids or dry_run:
         return 0
 
-    existing_candidates: list[dict[str, Any]] = []
-    try:
-        req = urllib.request.Request(
-            f"https://{ASSET_HOST}/{key}",
-            headers={"User-Agent": "dev-agents/release-comms"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("candidates"), list):
-                existing_candidates = [c for c in data["candidates"] if isinstance(c, dict)]
-            elif isinstance(data, list):
-                existing_candidates = [c for c in data if isinstance(c, dict)]
-    except Exception:  # noqa: BLE001
-        return 0
+    if github:
+        manifest_url = f"https://raw.githubusercontent.com/{github}/{branch}/{key}"
+        existing_candidates = _fetch_manifest_from_url(manifest_url, timeout=15)
+        remaining_candidates = [
+            c
+            for c in existing_candidates
+            if str(c.get("source_id", "")) not in published_source_ids
+            and str(c.get("id", "")) not in published_source_ids
+        ]
+        pruned_count = len(existing_candidates) - len(remaining_candidates)
+        if pruned_count == 0:
+            return 0
 
+        manifest = {
+            "updated_at": int(time.time()),
+            "candidates": remaining_candidates,
+        }
+        _upload_github_manifest(
+            repo=repo,
+            github=github,
+            branch=branch,
+            path=key,
+            manifest=manifest,
+            timeout=timeout,
+        )
+        return pruned_count
+
+    # Fallback to R2
+    existing_candidates = _fetch_manifest_from_url(f"https://{ASSET_HOST}/{key}", timeout=15)
     remaining_candidates = [
         c
         for c in existing_candidates
         if str(c.get("source_id", "")) not in published_source_ids
         and str(c.get("id", "")) not in published_source_ids
     ]
-
     pruned_count = len(existing_candidates) - len(remaining_candidates)
     if pruned_count == 0:
         return 0
@@ -442,6 +600,7 @@ def sync_reddit_status(
                     repo=project.repo,
                     published_source_ids=published_ids,
                     env=env,
+                    github=getattr(project, "github", None),
                 )
             except Exception:  # noqa: BLE001, S110
                 pass

@@ -60,8 +60,14 @@ the built-in skills as a fallback:
 Live publishing is owned by `dev-agents`. Bluesky, Instagram, X, Discord, and
 GitHub Discussions are delivered by the daemon's direct adapters. Feed-oriented
 channels use the square, compressed Cloudflare R2 image variant; long-form
-Discussion bodies retain the canonical asset URL. Reddit is out of the
-contract: reuse the GitHub Discussion body for a manual Reddit post.
+Discussion bodies retain the canonical asset URL. Reddit is delivered via the
+`dev-agent-publisher` Devvit companion app (`apps/reddit-devvit`): `dev-agents`
+stages candidate JSON manifests to `raw.githubusercontent.com` on the target
+repository's `release-manifests` branch, and the companion app pulls them to
+manage cadence gates and native Reddit submission. Live status is reconciled
+automatically or via `dev-agents release-comms sync-reddit <project>`. External
+subreddits can be exported for manual posting with `dev-agents release-comms
+export-reddit <project> <run-id>`.
 
 The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.

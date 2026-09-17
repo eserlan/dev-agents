@@ -586,3 +586,135 @@ def test_sync_reddit_status_triggers_manifest_pruning(monkeypatch: pytest.Monkey
     assert "src-prune" in pruned_calls[0]
 
 
+def test_stage_reddit_candidate_github_dry_run(tmp_path: Path) -> None:
+    candidate = {
+        "id": "reddit-pr-200-gh",
+        "title": "GitHub Post",
+        "body": "Body text",
+        "url": "https://codexcryptica.com/answers/gh",
+        "source_id": "pr-200",
+    }
+    receipt = stage_reddit_candidate(
+        repo=tmp_path,
+        candidate=candidate,
+        env={},
+        dry_run=True,
+        github="eserlan/Codex-Cryptica",
+        branch="release-manifests",
+    )
+    assert receipt.channel == "reddit"
+    assert receipt.destination == "reddit"
+    assert receipt.page_url == "https://codexcryptica.com/answers/gh"
+    assert receipt.public_url == "dry-run://github/eserlan/Codex-Cryptica/release-manifests/announcements/reddit-candidates.json"
+    assert receipt.external_id == "staged:pr-200"
+    assert receipt.metadata is not None
+    assert receipt.metadata["status"] == "staged_to_github"
+    assert receipt.metadata["github"] == "eserlan/Codex-Cryptica"
+    assert receipt.metadata["branch"] == "release-manifests"
+
+
+def test_stage_reddit_candidate_github_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    candidate = {
+        "id": "reddit-pr-200-live",
+        "title": "Live GH Post",
+        "body": "Body text",
+        "url": "https://codexcryptica.com/answers/live-gh",
+        "source_id": "pr-200",
+    }
+
+    uploaded: list[dict[str, Any]] = []
+
+    def fake_upload_github_manifest(*, repo: Path, github: str, branch: str, path: str, manifest: Any, timeout: float) -> str:
+        uploaded.append({
+            "github": github,
+            "branch": branch,
+            "path": path,
+            "manifest": manifest,
+        })
+        return f"https://raw.githubusercontent.com/{github}/{branch}/{path}"
+
+    monkeypatch.setattr("dev_agents.workflows.reddit._upload_github_manifest", fake_upload_github_manifest)
+    monkeypatch.setattr("dev_agents.workflows.reddit._fetch_manifest_from_url", lambda url, timeout=15.0: [])
+
+    receipt = stage_reddit_candidate(
+        repo=tmp_path,
+        candidate=candidate,
+        env={},
+        dry_run=False,
+        github="eserlan/Codex-Cryptica",
+        branch="release-manifests",
+    )
+
+    assert receipt.channel == "reddit"
+    assert receipt.public_url == "https://raw.githubusercontent.com/eserlan/Codex-Cryptica/release-manifests/announcements/reddit-candidates.json"
+    assert receipt.external_id == "staged:pr-200"
+    assert receipt.metadata["status"] == "staged_to_github"
+    assert len(uploaded) == 1
+    assert uploaded[0]["github"] == "eserlan/Codex-Cryptica"
+    assert len(uploaded[0]["manifest"]["candidates"]) == 1
+    assert uploaded[0]["manifest"]["candidates"][0]["id"] == "reddit-pr-200-live"
+
+
+def test_prune_published_reddit_candidates_github(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    existing = [
+        {"id": "c-1", "source_id": "s-1"},
+        {"id": "c-2", "source_id": "s-2"},
+    ]
+    uploaded_manifests: list[dict[str, Any]] = []
+
+    def fake_fetch(url: str, timeout: float = 15.0) -> list[dict[str, Any]]:
+        return list(existing)
+
+    def fake_upload(*, repo: Path, github: str, branch: str, path: str, manifest: Any, timeout: float) -> str:
+        uploaded_manifests.append(dict(manifest))
+        return f"https://raw.githubusercontent.com/{github}/{branch}/{path}"
+
+    monkeypatch.setattr("dev_agents.workflows.reddit._fetch_manifest_from_url", fake_fetch)
+    monkeypatch.setattr("dev_agents.workflows.reddit._upload_github_manifest", fake_upload)
+
+    pruned = prune_published_reddit_candidates(
+        repo=tmp_path,
+        published_source_ids={"s-1"},
+        github="eserlan/Codex-Cryptica",
+        branch="release-manifests",
+    )
+
+    assert pruned == 1
+    assert len(uploaded_manifests) == 1
+    remaining = uploaded_manifests[0]["candidates"]
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == "c-2"
+
+
+def test_upload_github_manifest_invokes_gh(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from dev_agents.workflows.reddit import _upload_github_manifest
+
+    gh_calls: list[tuple[str, ...]] = []
+
+    def fake_gh(repo: Path, *args: str, **kwargs: Any) -> str:
+        gh_calls.append(args)
+        return ""
+
+    def fake_gh_json(repo: Path, *args: str, **kwargs: Any) -> Any:
+        gh_calls.append(args)
+        if "contents" in args[1]:
+            return {"sha": "existing_blob_sha"}
+        return {}
+
+    monkeypatch.setattr("dev_agents.runtime.gh", fake_gh)
+    monkeypatch.setattr("dev_agents.runtime.gh_json", fake_gh_json)
+
+    url = _upload_github_manifest(
+        repo=tmp_path,
+        github="owner/repo",
+        branch="release-manifests",
+        path="announcements/reddit-candidates.json",
+        manifest={"updated_at": 123, "candidates": []},
+    )
+
+    assert url == "https://raw.githubusercontent.com/owner/repo/release-manifests/announcements/reddit-candidates.json"
+    put_calls = [c for c in gh_calls if "PUT" in c]
+    assert len(put_calls) == 1
+    assert "sha=existing_blob_sha" in put_calls[0]
+
+

@@ -8,7 +8,7 @@
     "http": {
       "enable": true,
       "domains": [
-        "assets.codexcryptica.com"
+        "raw.githubusercontent.com"
       ]
     }
   }

@@ -121,7 +121,7 @@ capabilities:
   http:
     enable: true
     domains:
-      - "assets.codexcryptica.com"  # Configured R2 CDN domain
+      - "raw.githubusercontent.com"  # GitHub raw manifest domain (permitted under Devvit HTTP policy)
 ```
 
 #### Self-Healing Scheduler Registration
@@ -184,12 +184,12 @@ Devvit.addTrigger({
 
 ---
 
-### 4.3. Ingestion Bridge (Cloudflare R2 Push / Pull)
+### 4.3. Ingestion Bridge (GitHub Raw Push / Pull)
 
 1. When `release-comms` runs and Reddit is in `recommended_channels`:
    - `release_publish.py` generates the candidate JSON payload.
-   - Pushes to Cloudflare R2 at `announcements/reddit-candidates.json` using `wrangler r2 object put` (already authenticated in daemon environment).
-2. The Devvit app's hourly scheduler (or mod clicking "Sync Queue Now") calls `fetch("https://assets.codexcryptica.com/announcements/reddit-candidates.json")`.
+   - Pushes to the target repo's `release-manifests` branch at `announcements/reddit-candidates.json` using `gh api` (with fallback to Cloudflare R2 if configured).
+2. The Devvit app's hourly scheduler (or mod clicking "Sync Queue Now") calls `fetch("https://raw.githubusercontent.com/<owner>/<repo>/release-manifests/announcements/reddit-candidates.json")`.
 3. Devvit checks `seen:<source_id>`. If unseen, adds the post to Redis `reddit:queue:approved` and marks `seen:<source_id> = true`.
 
 ---

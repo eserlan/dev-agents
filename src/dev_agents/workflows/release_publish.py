@@ -9,7 +9,6 @@ receipt immediately, making failed runs safe to retry.
 from __future__ import annotations
 
 import json
-import os
 import random
 import re
 import shutil
@@ -702,6 +701,7 @@ def publish_release_drafts(
                     candidate=candidate,
                     env=env,
                     dry_run=dry_run,
+                    github=project.github,
                 )
                 record_receipt(receipt)
                 result["reddit"].append(receipt.__dict__)
