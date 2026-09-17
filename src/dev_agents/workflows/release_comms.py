@@ -658,20 +658,22 @@ def run_release_comms(
     )
     repository = StateRepository(database_path, project_name, project.repo)
     existing = repository.get_run("release-comms", str(promote_run_id))
-    raw_resume_metadata = (
-        existing.metadata.get("_release_comms_resume", {})
-        if existing is not None and existing.status == "scheduled"
-        else {}
-    )
-    resume_metadata = raw_resume_metadata if isinstance(raw_resume_metadata, dict) else {}
-    if existing is not None and existing.status == "scheduled":
-        next_at = str(existing.metadata.get("next_publication_at", ""))
-        try:
-            due = datetime.fromisoformat(next_at)
-        except ValueError:
-            due = datetime.now(UTC)
-        if due > datetime.now(UTC):
-            raise DuplicateRunError(f"release-comms run {promote_run_id} is scheduled for {next_at}")
+    resume_metadata: dict[str, Any] = {}
+    existing_metadata: dict[str, Any] = {}
+    if existing is not None and existing.status in ("scheduled", "failed"):
+        existing_metadata = existing.metadata
+        raw_resume_metadata = existing_metadata.get("_release_comms_resume", {})
+        resume_metadata = raw_resume_metadata if isinstance(raw_resume_metadata, dict) else {}
+        if existing.status == "scheduled":
+            next_at = str(existing_metadata.get("next_publication_at", ""))
+            try:
+                due = datetime.fromisoformat(next_at)
+            except ValueError:
+                due = datetime.now(UTC)
+            if due > datetime.now(UTC):
+                raise DuplicateRunError(
+                    f"release-comms run {promote_run_id} is scheduled for {next_at}"
+                )
         if evaluator_result is None:
             evaluator_result = parse_evaluator_result(resume_metadata.get("evaluator_result"))
         if writer_result is None:
@@ -681,7 +683,7 @@ def run_release_comms(
         str(promote_run_id),
         delivery_id=delivery_id,
         metadata={
-            **(existing.metadata if existing is not None and existing.status == "scheduled" else {}),
+            **existing_metadata,
             "promote_run_id": str(promote_run_id),
             "dry_run": dry_run,
         },
@@ -783,6 +785,19 @@ def run_release_comms(
 
         schedule_report_refresh(project_name, project)
         return result
+    final_evaluator_result = final_state.get("evaluator_result")
+    final_writer_result = final_state.get("writer_result")
+    resume_for_retry = (
+        {}
+        if result.completed or final_evaluator_result is None or final_writer_result is None
+        else {
+            "_release_comms_resume": {
+                "evaluator_result": asdict(final_evaluator_result),
+                "writer_result": asdict(final_writer_result),
+                "image_overrides": final_state.get("image_overrides", {}),
+            }
+        }
+    )
     repository.complete_run(
         "release-comms",
         str(promote_run_id),
@@ -791,6 +806,7 @@ def run_release_comms(
         metadata={
             "postworthy": result.postworthy,
             "drafts": result.drafts,
+            **resume_for_retry,
         },
     )
     from dev_agents.visualize import schedule_report_refresh

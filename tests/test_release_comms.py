@@ -216,6 +216,71 @@ def test_live_release_comms_schedules_and_resumes_publications(
     assert published_pages == ["https://example.com/a", "https://example.com/b"]
 
 
+def test_failed_release_comms_persists_drafts_and_retries_without_regenerating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed run (e.g. an unresolved image) must be retryable like a scheduled one:
+    content already drafted should be reused, not regenerated, on the next attempt."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "release.db"
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(state_path=database, image_generation=False),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
+    )
+
+    evaluator_calls = 0
+
+    def fake_evaluator_pass(**kwargs: object) -> EvaluatorResult:
+        nonlocal evaluator_calls
+        evaluator_calls += 1
+        return EvaluatorResult(
+            postworthy=True, reason="Launch", recommended_channels=["bluesky"]
+        )
+
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.run_evaluator_pass", fake_evaluator_pass
+    )
+
+    evaluation = EvaluatorResult(
+        postworthy=True, reason="Launch", recommended_channels=["bluesky"]
+    )
+    # An unresolved "capture:" image with no override raises a PublicationError,
+    # which publish_release_drafts catches as a per-draft error (not an exception).
+    drafts = WriterResult(
+        bluesky=[{"pageUrl": "https://example.com/a", "text": "A", "image": "capture:shot.png"}]
+    )
+
+    first = run_release_comms(
+        project, "demo", "release-1", dry_run=False, publish_approved=True,
+        evaluator_result=evaluation, writer_result=drafts,
+    )
+    assert first.completed is False
+    assert first.scheduled is False
+
+    state = StateRepository(database, "demo", repo)
+    record = state.get_run("release-comms", "release-1")
+    assert record is not None
+    assert record.status == "failed"
+    resume = record.metadata["_release_comms_resume"]
+    assert resume["writer_result"]["bluesky"][0]["pageUrl"] == "https://example.com/a"
+
+    # Retrying without re-supplying evaluator/writer results must reuse the persisted
+    # drafts (evaluator/writer passes must not run again) rather than regenerate them.
+    second = run_release_comms(project, "demo", "release-1", dry_run=False, publish_approved=True)
+    assert second.drafts is not None
+    assert second.drafts["bluesky"][0]["pageUrl"] == "https://example.com/a"
+    assert evaluator_calls == 0
+
+
 def _ok(stdout: str) -> Any:
     return SimpleNamespace(stdout=stdout, returncode=0)
 
