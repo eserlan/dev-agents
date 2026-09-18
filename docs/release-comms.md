@@ -90,6 +90,53 @@ The daemon resumes scheduled runs every `scheduler_poll_seconds` (30 seconds by
 default). The scheduled run stores its drafts, image URLs, and next wake time in
 SQLite, so a daemon restart resumes the queue without regenerating content.
 
+## Pinterest setup
+
+Pinterest is an opt-in destination (`publish_pinterest` in `release_publish.py`), wired the
+same way as Instagram: it rides on the Bluesky draft's image + text, so it only fires for
+messages that already resolved an image. Nothing below is required unless a project adds
+`pinterest` to its `destinations` list.
+
+1. **Create a Pinterest business account** for the target product (a personal account cannot
+   create an app). Business accounts are free to convert at pinterest.com/business/create.
+2. **Register an app** at [developers.pinterest.com/apps](https://developers.pinterest.com/apps).
+   Note the app's client ID/secret — only needed once, to mint the access token below.
+3. **Generate an access token** via Pinterest's OAuth flow, granting at minimum the
+   `pins:write` and `boards:read` scopes. Pinterest access tokens expire (the standard OAuth
+   token lifetime); the daemon does **not** refresh them, so plan to re-mint the token
+   periodically (or run Pinterest's refresh-token flow externally and update the secret) —
+   treat this the same as rotating any other credential, not a one-time setup step.
+4. **Create (or pick) a board** to pin to, and get its `board_id`: call
+   `GET https://api.pinterest.com/v5/boards` with the access token, or read the ID out of the
+   board's Pinterest URL/settings.
+5. **Set daemon environment variables** (same environment the systemd unit runs under, not the
+   target repository's `.env`):
+   - `PINTEREST_ACCESS_TOKEN` — the token from step 3.
+   - `PINTEREST_BOARD_ID` — the board ID from step 4.
+   - `PINTEREST_API_URL` — optional, only for pointing at a mock/staging API in tests; defaults
+     to `https://api.pinterest.com/v5`.
+6. **Enable the destination** in `config/projects.yaml` for the project:
+   ```yaml
+   release_comms:
+     destinations:
+       - bluesky
+       - pinterest
+   ```
+7. **Dry-run first.** `dev-agents release-comms evaluate <project> <promote_run_id>` (without
+   `--publish`) exercises the same code path and returns a `dry-run://pinterest/<page_url>`
+   receipt without calling the Pinterest API — confirms the image resolves and the batch wiring
+   picks up the channel before any credentials are needed.
+8. **Verify a live pin once `--publish`/`auto_publish` is on**: check the run's publication
+   receipt (`public_url` becomes `https://www.pinterest.com/pin/<id>/`) and confirm the pin
+   appears on the configured board, since Pinterest's API does not surface most content-policy
+   rejections as a distinct error — a silent-looking failure is usually a scope, expired-token,
+   or board-permission problem rather than a code bug.
+
+Pinterest's own image guidance favors a taller 2:3 crop; this pipeline currently delivers the
+same 1080×1080 square R2 variant used for Instagram/Bluesky (via `social_delivery_image_url`).
+That renders fine but isn't Pinterest-optimal — revisit if Pinterest engagement matters enough
+to justify a second image variant.
+
 ## Webhook Integration
 
 The workflow integrates with deployment pipelines (such as GitHub Actions deployment / promotion workflows):

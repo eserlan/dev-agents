@@ -8,6 +8,7 @@ from dev_agents.workflows.release_publish import (
     PublicationError,
     PublicationReceipt,
     publish_discord,
+    publish_pinterest,
     publish_release_drafts,
     resolve_image,
     social_delivery_image_url,
@@ -74,6 +75,56 @@ def test_discord_execution_uses_canonical_host_and_wait_receipt(
     assert str(seen["url"]).startswith("https://discord.com/api/webhooks/123/token?")
     assert "wait=true" in str(seen["url"])
     assert seen["headers"] == {"User-Agent": "dev-agents/release-comms"}
+
+
+def test_publish_pinterest_creates_a_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_http(url: str, **kwargs: object) -> dict[str, object]:
+        seen["url"] = url
+        seen["payload"] = kwargs.get("payload")
+        seen["headers"] = kwargs.get("headers")
+        return {"id": "pin123"}
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish._http_json", fake_http)
+    receipt = publish_pinterest(
+        title="Demo",
+        description="Hello https://codexcryptica.com/answers/demo",
+        page_url="https://codexcryptica.com/answers/demo",
+        image_url="https://other.example/og/demo.jpg",
+        env={"PINTEREST_ACCESS_TOKEN": "token", "PINTEREST_BOARD_ID": "board1"},
+        dry_run=False,
+    )
+
+    assert receipt == PublicationReceipt(
+        "pinterest",
+        "pinterest",
+        "https://codexcryptica.com/answers/demo",
+        "https://www.pinterest.com/pin/pin123/",
+        "pin123",
+    )
+    assert seen["url"] == "https://api.pinterest.com/v5/pins"
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert payload["board_id"] == "board1"
+    assert payload["link"] == "https://codexcryptica.com/answers/demo"
+    assert payload["media_source"] == {
+        "source_type": "image_url",
+        "url": "https://other.example/og/demo.jpg",
+    }
+    assert seen["headers"] == {"Authorization": "Bearer token"}
+
+
+def test_publish_pinterest_requires_credentials() -> None:
+    with pytest.raises(PublicationError, match="PINTEREST_ACCESS_TOKEN"):
+        publish_pinterest(
+            title="Demo",
+            description="Hello",
+            page_url="https://example.com/a",
+            image_url="https://assets.codexcryptica.com/og/a.jpg",
+            env={},
+            dry_run=False,
+        )
 
 
 def test_resolve_image_uses_draft_key_or_page_slug() -> None:
@@ -160,14 +211,16 @@ def test_publish_release_drafts_dry_run_emits_receipts_without_network(tmp_path:
             "github_discussions": [],
             "discord": "Hello",
         },
-        recommended_channels=["bluesky", "instagram", "x", "discord"],
+        recommended_channels=["bluesky", "instagram", "x", "pinterest", "discord"],
         env={},
         dry_run=True,
         already_published=set(),
         on_receipt=seen.append,
     )
     assert errors == []
-    assert {receipt.channel for receipt in seen} == {"bluesky", "instagram", "x", "discord"}
+    assert {receipt.channel for receipt in seen} == {
+        "bluesky", "instagram", "x", "pinterest", "discord",
+    }
     assert len(publications["discord"]) == 1
 
 

@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from dev_agents.runtime import run_agent, run_with_fallback
+from dev_agents.runtime import repo_git_lock, run_agent, run_with_fallback
 
 
 @dataclass(frozen=True)
@@ -141,29 +141,34 @@ def ensure_shas_present(
     wanted = [new_sha] if not previous_sha else [new_sha, previous_sha]
     if all(_sha_present(repo, sha) for sha in wanted):
         return
-    try:
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            cwd=repo,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    for sha in wanted:
-        if _sha_present(repo, sha):
-            continue
+    # This runs against the same shared checkout the PR/issue fixers fetch and
+    # worktree against; without the lock, a concurrent fetch elsewhere can win the
+    # ref compare-and-swap and leave these SHAs looking unfetchable. See
+    # repo_git_lock's docstring.
+    with repo_git_lock(repo):
         try:
             subprocess.run(
-                ["git", "fetch", "origin", sha],
+                ["git", "fetch", "origin"],
                 cwd=repo,
                 capture_output=True,
                 timeout=timeout_seconds,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            continue
+            pass
+        for sha in wanted:
+            if _sha_present(repo, sha):
+                continue
+            try:
+                subprocess.run(
+                    ["git", "fetch", "origin", sha],
+                    cwd=repo,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
 
 
 def collect_release_delta(

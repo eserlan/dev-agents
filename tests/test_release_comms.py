@@ -125,8 +125,10 @@ def test_run_release_comms_claims_promote_run_and_respects_configured_db(
         lambda r, run_id: ("newsha", "prevsha"),
     )
 
-    evaluation = EvaluatorResult(postworthy=False, reason="chore")
-    run_release_comms(project, "demo", "123", evaluator_result=evaluation)
+    evaluation = EvaluatorResult(postworthy=True, reason="Launch")
+    run_release_comms(
+        project, "demo", "123", evaluator_result=evaluation, writer_result=WriterResult()
+    )
 
     with pytest.raises(DuplicateRunError):
         run_release_comms(project, "demo", "123", evaluator_result=evaluation)
@@ -136,6 +138,36 @@ def test_run_release_comms_claims_promote_run_and_respects_configured_db(
     assert record.attempt == 1
     assert database.exists()
     assert not (tmp_path / "custom-state.db.db").exists()
+
+
+def test_run_release_comms_not_postworthy_is_rejected_and_permanent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A not-postworthy run is 'rejected', not 'completed' -- distinguishable in the
+    state DB from a real publish -- but just as permanent: previous_sha is now
+    pinned at first resolution, so a rejection is a stable verdict against a fixed
+    diff, not something that should be silently re-run."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "release.db"
+    project = ProjectConfig(
+        repo=repo, github="owner/repo", release_comms=ReleaseCommsConfig(state_path=database)
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+
+    evaluation = EvaluatorResult(postworthy=False, reason="chore")
+    first = run_release_comms(project, "demo", "456", evaluator_result=evaluation)
+    assert first.completed is True
+
+    record = StateRepository(database, "demo", repo).get_run("release-comms", "456")
+    assert record is not None
+    assert record.status == "rejected"
+
+    with pytest.raises(DuplicateRunError):
+        run_release_comms(project, "demo", "456", evaluator_result=evaluation)
 
 
 def test_live_release_comms_schedules_and_resumes_publications(
@@ -279,6 +311,59 @@ def test_failed_release_comms_persists_drafts_and_retries_without_regenerating(
     assert second.drafts is not None
     assert second.drafts["bluesky"][0]["pageUrl"] == "https://example.com/a"
     assert evaluator_calls == 0
+
+
+def test_failed_release_comms_pins_shas_and_does_not_reresolve(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """resolve_promote_shas must run once per run, not once per retry -- otherwise
+    later promotions/reverts on main shift what 'previous' means and a real release
+    can flip to a false 'net revert' the longer a retry is delayed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "release.db"
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(state_path=database, image_generation=False),
+    )
+    resolve_calls = 0
+
+    def fake_resolve(r: Path, run_id: str) -> tuple[str, str]:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return "newsha", "prevsha"
+
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas", fake_resolve
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
+    )
+
+    evaluation = EvaluatorResult(
+        postworthy=True, reason="Launch", recommended_channels=["bluesky"]
+    )
+    drafts = WriterResult(
+        bluesky=[{"pageUrl": "https://example.com/a", "text": "A", "image": "capture:shot.png"}]
+    )
+
+    first = run_release_comms(
+        project, "demo", "release-1", dry_run=False, publish_approved=True,
+        evaluator_result=evaluation, writer_result=drafts,
+    )
+    assert first.completed is False
+    assert resolve_calls == 1
+
+    record = StateRepository(database, "demo", repo).get_run("release-comms", "release-1")
+    assert record is not None
+    assert record.metadata["_release_comms_resume"]["new_sha"] == "newsha"
+    assert record.metadata["_release_comms_resume"]["previous_sha"] == "prevsha"
+
+    second = run_release_comms(project, "demo", "release-1", dry_run=False, publish_approved=True)
+    assert second.new_sha == "newsha"
+    assert second.previous_sha == "prevsha"
+    assert resolve_calls == 1
 
 
 def _ok(stdout: str) -> Any:

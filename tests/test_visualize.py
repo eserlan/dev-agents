@@ -274,6 +274,7 @@ def test_release_comms_graph_branches_to_publication_channels() -> None:
     assert channel_ids == {
         "channel:bluesky",
         "channel:instagram",
+        "channel:pinterest",
         "channel:discord",
         "channel:github_discussions",
         "channel:x",

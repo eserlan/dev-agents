@@ -475,6 +475,47 @@ def _form_json(url: str, body: bytes | None, *, method: str = "POST") -> dict[st
     return value
 
 
+def publish_pinterest(
+    *,
+    title: str,
+    description: str,
+    page_url: str,
+    image_url: str,
+    env: Mapping[str, str],
+    dry_run: bool,
+) -> PublicationReceipt:
+    delivery_url = social_delivery_image_url(image_url)
+    if dry_run:
+        return PublicationReceipt("pinterest", "pinterest", page_url, f"dry-run://pinterest/{page_url}")
+    token = env.get("PINTEREST_ACCESS_TOKEN", "").strip()
+    board_id = env.get("PINTEREST_BOARD_ID", "").strip()
+    if not token or not board_id:
+        raise PublicationError("PINTEREST_ACCESS_TOKEN and PINTEREST_BOARD_ID are required")
+    api = env.get("PINTEREST_API_URL", "https://api.pinterest.com/v5").rstrip("/")
+    payload: dict[str, Any] = {
+        "board_id": board_id,
+        "media_source": {"source_type": "image_url", "url": delivery_url},
+    }
+    if title.strip():
+        payload["title"] = title.strip()[:100]
+    if description.strip():
+        payload["description"] = description.strip()[:800]
+    if page_url:
+        payload["link"] = page_url
+    created = _http_json(
+        f"{api}/pins",
+        method="POST",
+        payload=payload,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    pin_id = str(created.get("id", ""))
+    if not pin_id:
+        raise PublicationError("Pinterest pin creation returned no ID")
+    return PublicationReceipt(
+        "pinterest", "pinterest", page_url, f"https://www.pinterest.com/pin/{pin_id}/", pin_id
+    )
+
+
 def publish_x(*, text: str, page_url: str, env: Mapping[str, str], dry_run: bool) -> PublicationReceipt:
     if dry_run:
         return PublicationReceipt("x", "x", page_url, f"dry-run://x/{page_url}")
@@ -533,7 +574,15 @@ def publish_release_drafts(
     """
     result: dict[str, list[dict[str, Any]]] = {
         name: []
-        for name in ("bluesky", "github_discussions", "instagram", "x", "discord", "reddit")
+        for name in (
+            "bluesky",
+            "github_discussions",
+            "instagram",
+            "x",
+            "pinterest",
+            "discord",
+            "reddit",
+        )
     }
     errors: list[str] = []
     message_batches_published = 0
@@ -602,7 +651,7 @@ def publish_release_drafts(
             pending = any(
                 channel in recommended_channels
                 and publication_key(channel, channel, page_url) not in already_published
-                for channel in ("bluesky", "instagram", "x")
+                for channel in ("bluesky", "instagram", "x", "pinterest")
             )
         if discussion is not None and "github_discussions" in recommended_channels:
             pending = pending or publication_key(
@@ -654,6 +703,14 @@ def publish_release_drafts(
                     result["x"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"x {page_url}: {error}")
+            if "pinterest" in recommended_channels and publication_key("pinterest", "pinterest", page_url) not in already_published:
+                try:
+                    pin_title = str((discussion or {}).get("title", "")) or draft_text.strip().split(".")[0][:100]
+                    receipt = publish_pinterest(title=pin_title, description=prepare_bluesky_text(draft_text, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
+                    record_receipt(receipt)
+                    result["pinterest"].append(receipt.__dict__)
+                except Exception as error:  # noqa: BLE001
+                    errors.append(f"pinterest {page_url}: {error}")
             if "discord" in recommended_channels:
                 try:
                     for receipt in publish_discord(
@@ -729,7 +786,7 @@ def pending_publication_count(
         if not isinstance(draft, dict):
             continue
         page_url = str(draft.get("pageUrl", ""))
-        for channel in ("bluesky", "instagram", "x"):
+        for channel in ("bluesky", "instagram", "x", "pinterest"):
             if channel in recommended_channels and publication_key(channel, channel, page_url) not in already_published:
                 count += 1
         if "discord" in recommended_channels:

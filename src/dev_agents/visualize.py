@@ -463,6 +463,7 @@ def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
             for channel, label in (
                 ("bluesky", "Bluesky"),
                 ("instagram", "Instagram"),
+                ("pinterest", "Pinterest"),
                 ("discord", "Discord"),
                 ("github_discussions", "GitHub Discussions"),
                 ("x", "X"),
@@ -1089,7 +1090,7 @@ def _interactive_app(data: dict[str, Any]) -> str:
     </nav>
     <section id="index-panel" class="run-index" role="tabpanel" aria-labelledby="daemon-tab">
       <div class="index-header"><div><h2>Daemon run index</h2><p class="subtitle">Recent jobs are visible; jobs older than 1 hour are collapsed. Report messages older than 1 day are omitted.</p></div><strong id="index-summary"></strong></div>
-      <div class="index-filters"><input id="index-search" type="search" placeholder="Search run, event, PR, error…" aria-label="Search daemon runs"><details id="index-workflow-filter" class="workflow-filter"><summary>Workflows: <span id="index-workflow-summary">All workflows</span></summary><div id="index-workflow-options" class="workflow-options" role="group" aria-label="Filter by workflow"></div></details><select id="index-status" aria-label="Filter by status"><option value="">All statuses</option><option value="completed">completed</option><option value="failed">failed</option><option value="running">running</option><option value="pending">pending</option><option value="scheduled">scheduled</option></select></div>
+      <div class="index-filters"><input id="index-search" type="search" placeholder="Search run, event, PR, error…" aria-label="Search daemon runs"><details id="index-workflow-filter" class="workflow-filter"><summary>Workflows: <span id="index-workflow-summary">All workflows</span></summary><div id="index-workflow-options" class="workflow-options" role="group" aria-label="Filter by workflow"></div></details><select id="index-status" aria-label="Filter by status"><option value="">All statuses</option><option value="completed">completed</option><option value="rejected">rejected</option><option value="failed">failed</option><option value="running">running</option><option value="pending">pending</option><option value="scheduled">scheduled</option></select></div>
       <div id="index-columns" class="index-columns" role="row" aria-label="Sort runs by column"></div>
       <div id="index-rows" class="index-rows"></div>
       <div id="index-details" class="index-details" hidden></div>

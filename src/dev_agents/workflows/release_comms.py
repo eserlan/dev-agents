@@ -202,6 +202,18 @@ def build_release_comms_workflow() -> Any:
     graph = StateGraph(ReleaseCommsState)
 
     def resolve_context(state: ReleaseCommsState) -> dict[str, Any]:
+        # Pinned by a prior attempt (retry/resume) takes priority: re-deriving the
+        # "previous successful promote" from a live `gh run list` on every retry
+        # means later promotions/reverts on main shift what "previous" means, so a
+        # release can flip from postworthy to a false "net revert" the longer a
+        # retry is delayed -- pin it once, on first resolution, instead.
+        if state.get("new_sha"):
+            _emit(
+                state,
+                "resolved",
+                {"new_sha": state["new_sha"], "previous_sha": state.get("previous_sha"), "pinned": True},
+            )
+            return {}
         repo = state["repo"]
         promote_run_id = state["promote_run_id"]
         new_sha, previous_sha = resolve_promote_shas(repo, promote_run_id)
@@ -386,7 +398,7 @@ def build_release_comms_workflow() -> Any:
         enabled_destinations = state["config"].destinations
         recommended_channels = recommend_channels(writer_res, enabled=enabled_destinations)
         if writer_res.bluesky:
-            for extra in ("instagram", "x"):
+            for extra in ("instagram", "x", "pinterest"):
                 if extra in enabled_destinations and extra not in recommended_channels:
                     recommended_channels.append(extra)
         updated = EvaluatorResult(
@@ -660,7 +672,14 @@ def run_release_comms(
     existing = repository.get_run("release-comms", str(promote_run_id))
     resume_metadata: dict[str, Any] = {}
     existing_metadata: dict[str, Any] = {}
-    if existing is not None and existing.status in ("scheduled", "failed"):
+    pinned_new_sha: str | None = None
+    pinned_previous_sha: str | None = None
+    # "running" is included so a stale/interrupted claim (e.g. the daemon restarted
+    # mid-run) can reuse its carried-over drafts on retry; claim_run() below is the
+    # actual safety gate (it refuses to reclaim a run that is genuinely still active).
+    # "rejected" is a permanent verdict (claim_run refuses to reclaim it, same as
+    # "completed") so it is deliberately excluded here: nothing to resume.
+    if existing is not None and existing.status in ("scheduled", "failed", "running"):
         existing_metadata = existing.metadata
         raw_resume_metadata = existing_metadata.get("_release_comms_resume", {})
         resume_metadata = raw_resume_metadata if isinstance(raw_resume_metadata, dict) else {}
@@ -678,6 +697,8 @@ def run_release_comms(
             evaluator_result = parse_evaluator_result(resume_metadata.get("evaluator_result"))
         if writer_result is None:
             writer_result = parse_writer_result(resume_metadata.get("writer_result"))
+        pinned_new_sha = resume_metadata.get("new_sha") or None
+        pinned_previous_sha = resume_metadata.get("previous_sha") or None
     claim = repository.claim_run(
         "release-comms",
         str(promote_run_id),
@@ -750,6 +771,7 @@ def run_release_comms(
                 "release-comms", str(promote_run_id)
             ),
             "publication_sink": persist_publication,
+            **({"new_sha": pinned_new_sha, "previous_sha": pinned_previous_sha} if pinned_new_sha else {}),
         }
         final_state = app.invoke(initial_state)
         result = cast(ReleaseCommsRunResult, final_state["result"])
@@ -770,6 +792,8 @@ def run_release_comms(
                     "evaluator_result": asdict(final_state.get("evaluator_result")),
                     "writer_result": asdict(final_state.get("writer_result")),
                     "image_overrides": final_state.get("image_overrides", {}),
+                    "new_sha": final_state.get("new_sha"),
+                    "previous_sha": final_state.get("previous_sha"),
                 },
             },
         )
@@ -787,21 +811,37 @@ def run_release_comms(
         return result
     final_evaluator_result = final_state.get("evaluator_result")
     final_writer_result = final_state.get("writer_result")
+    if not result.completed:
+        final_status = "failed"
+    elif not result.postworthy:
+        final_status = "rejected"
+    else:
+        final_status = "completed"
+    # Pin the resolved SHAs (and any drafted content) for "failed" (re-triggerable,
+    # must resume against the same diff) and "rejected" (not re-triggerable --
+    # claim_run() refuses to reclaim it -- but recorded for audit: a human reviewing
+    # why a release was rejected can see exactly what diff was evaluated).
     resume_for_retry = (
-        {}
-        if result.completed or final_evaluator_result is None or final_writer_result is None
-        else {
+        {
             "_release_comms_resume": {
-                "evaluator_result": asdict(final_evaluator_result),
-                "writer_result": asdict(final_writer_result),
+                "evaluator_result": (
+                    asdict(final_evaluator_result) if final_evaluator_result is not None else None
+                ),
+                "writer_result": (
+                    asdict(final_writer_result) if final_writer_result is not None else None
+                ),
                 "image_overrides": final_state.get("image_overrides", {}),
+                "new_sha": final_state.get("new_sha"),
+                "previous_sha": final_state.get("previous_sha"),
             }
         }
+        if final_status in ("failed", "rejected")
+        else {}
     )
     repository.complete_run(
         "release-comms",
         str(promote_run_id),
-        status="completed" if result.completed else "failed",
+        status=final_status,
         error=None if result.completed else "publishing failed",
         metadata={
             "postworthy": result.postworthy,
