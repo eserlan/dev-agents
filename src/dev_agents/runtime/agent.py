@@ -96,8 +96,18 @@ def run_agent(
     timeout_seconds: float,
     heartbeat_seconds: float = 30.0,
     reasoning_effort: str = "medium",
+    on_progress: Callable[[int], None] | None = None,
+    progress_interval_seconds: float = 600.0,
 ) -> AgentResult:
-    """Run a provider, forwarding output to a durable log and emitting heartbeats."""
+    """Run a provider, forwarding output to a durable log and emitting heartbeats.
+
+    `on_progress`, if given, fires roughly every `progress_interval_seconds`
+    (elapsed seconds since start) -- much coarser than the log's own
+    `heartbeat_seconds` liveness marker. It exists for callers that want to
+    surface long-running work somewhere a human is actually watching (e.g. a
+    PR comment), where a mark every 30s would be spam but silence for a
+    30-40 minute review reads as hung.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\n=== agent started provider={provider} ===\n")
@@ -109,10 +119,13 @@ def run_agent(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        deadline = time.monotonic() + timeout_seconds
+        start = time.monotonic()
+        deadline = start + timeout_seconds
+        last_progress_at = start
         timed_out = False
         while process.poll() is None:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = deadline - now
             if remaining <= 0:
                 timed_out = True
                 process.kill()
@@ -123,6 +136,10 @@ def run_agent(
             if process.poll() is None:
                 stream.write("=== agent heartbeat ===\n")
                 stream.flush()
+                now = time.monotonic()
+                if on_progress is not None and now - last_progress_at >= progress_interval_seconds:
+                    last_progress_at = now
+                    on_progress(int(now - start))
         returncode = process.wait()
         stream.write(f"=== agent finished exit={returncode} timed_out={timed_out} ===\n")
     return AgentResult(returncode=returncode, timed_out=timed_out)

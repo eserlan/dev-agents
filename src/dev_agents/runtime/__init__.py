@@ -16,7 +16,7 @@ from dev_agents.runtime.state import (
     legacy_json_path,
     state_database_path,
 )
-from dev_agents.runtime.worktree import isolated_worktree
+from dev_agents.runtime.worktree import isolated_worktree, repo_git_lock, repo_worktree_semaphore
 
 __all__ = [
     "AgentResult",
@@ -35,6 +35,8 @@ __all__ = [
     "isolated_worktree",
     "legacy_json_path",
     "remove_older_than",
+    "repo_git_lock",
+    "repo_worktree_semaphore",
     "repository_slug",
     "run_agent",
     "run_with_fallback",

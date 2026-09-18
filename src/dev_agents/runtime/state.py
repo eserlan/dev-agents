@@ -708,13 +708,13 @@ class StateRepository:
                         and (datetime.now(UTC) - _parse_timestamp(str(row["started_at"]))).total_seconds()
                         >= self.STALE_RUN_SECONDS
                     )
-                    if row["status"] == "completed" or (
+                    if row["status"] in ("completed", "rejected") or (
                         existing_delivery["status"] == "running" and not delivery_is_stale
                     ):
                         return RunClaim(False, self._run_record(row))
 
             row = self._select_run(connection, self.project_name, workflow, run_id)
-            if row is not None and row["status"] == "completed":
+            if row is not None and row["status"] in ("completed", "rejected"):
                 return RunClaim(False, self._run_record(row))
             if row is not None and row["status"] == "running":
                 started = _parse_timestamp(str(row["started_at"]))
@@ -807,8 +807,8 @@ class StateRepository:
         metadata: dict[str, Any] | None = None,
     ) -> RunRecord:
         """Commit the terminal status of a run and its delivery claim atomically."""
-        if status not in {"completed", "failed"}:
-            raise ValueError("terminal run status must be completed or failed")
+        if status not in {"completed", "failed", "rejected"}:
+            raise ValueError("terminal run status must be completed, failed, or rejected")
         now = _timestamp()
         with self._transaction(immediate=True) as connection:
             row = self._select_run(connection, self.project_name, workflow, run_id)
