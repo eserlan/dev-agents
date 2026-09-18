@@ -24,7 +24,7 @@ Every post follows this four-part arc, in order — don't skip parts:
 4. **Direct link** — the specific feature/page URL in `pageUrl` (never the
    homepage). The post must stay interesting without clicking; the link is a
    quiet next step. An image is attached by the publisher from `pageUrl`, so
-   always set it when you know the page.
+   set it when you have direct evidence for that exact page.
 5. **Image** — every draft names its art in `image`. Prefer an exact key from
    Known assets below that actually shows the feature. When no existing asset
    fits, write `capture:<pageUrl>` to request a fresh screenshot instead of
@@ -32,6 +32,16 @@ Every post follows this four-part arc, in order — don't skip parts:
 
 Known assets (exact R2 keys — reuse one when it fits):
 {known_assets}
+
+Link integrity (wrong links ship to every channel):
+- Set `pageUrl` only to a page evidenced in this release context (the feature
+  description, commits, or files changed above). Never invent or guess a
+  help/blog slug by name similarity.
+- Never substitute a similar-sounding existing page that describes a different
+  mechanism (e.g. a Google Drive backup article for an internal Cloud Save
+  sync feature). A wrong link is worse than no link.
+- When no dedicated page for the feature is evidenced, leave `pageUrl` empty
+  (`""`). Empty is always acceptable.
 
 Voice rules:
 - One GM talking to another, first-person, conversational. ("I needed a way

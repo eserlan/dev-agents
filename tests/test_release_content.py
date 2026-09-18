@@ -92,6 +92,13 @@ def test_load_skill_prompt_rejects_traversal() -> None:
         load_skill_prompt("../escape")
 
 
+def test_writer_prompts_require_pageurl_evidence() -> None:
+    for skill_id in ("release-shortform", "release-longform"):
+        body = load_skill_prompt(skill_id)
+        assert "Never invent or guess" in body
+        assert "leave `pageUrl` empty" in body
+
+
 def test_render_template_leaves_unknown_braces() -> None:
     rendered = render_template("a {known} b {unknown} c", {"known": "X"})
     assert rendered == "a X b {unknown} c"
