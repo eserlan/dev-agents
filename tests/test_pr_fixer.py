@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,10 +11,12 @@ from dev_agents.pr_fixer import (
     _agent_report,
     _fix_summary_body,
     _normalise_review_report,
+    _prompt,
     _publish_fix_summary,
     _publish_pr_run_comment,
     _pull_request_checks,
     _review_is_due,
+    _review_progress_body,
     _review_prompt,
     _review_skill,
     _review_started_body,
@@ -103,6 +106,53 @@ def test_normalise_review_report_rejects_incomplete_findings() -> None:
     ) is None
 
 
+def test_normalise_review_report_coerces_near_miss_field_names() -> None:
+    """A finding with the right content under the wrong key name is recoverable."""
+    report = _normalise_review_report(
+        {
+            "verdict": "findings",
+            "findings": [
+                {
+                    "severity": "HIGH",
+                    "category": "security",
+                    "file": "src/auth.ts",
+                    "line": 12,
+                    "message": "Token is logged in plaintext.",
+                    "remediation": "Redact the token before logging.",
+                }
+            ],
+            "categories_checked": [],
+            "validation": [],
+            "fixes": [],
+        }
+    )
+
+    assert report is not None
+    finding = report["findings"][0]
+    assert finding["location"] == "src/auth.ts:12"
+    assert finding["impact"] == "Token is logged in plaintext."
+
+
+def test_normalise_review_report_still_rejects_genuinely_missing_fields() -> None:
+    """Aliasing must never fabricate a category or remediation that was never given."""
+    assert _normalise_review_report(
+        {
+            "verdict": "findings",
+            "findings": [
+                {
+                    "severity": "HIGH",
+                    "file": "src/auth.ts",
+                    "line": 12,
+                    "message": "Token is logged in plaintext.",
+                }
+            ],
+            "categories_checked": [],
+            "validation": [],
+            "fixes": [],
+        }
+    ) is None
+
+
 def test_review_skill_prefers_canonical_path(tmp_path: Path) -> None:
     canonical = tmp_path / ".agent/skills/codex-review/SKILL.md"
     canonical.parent.mkdir(parents=True)
@@ -128,8 +178,30 @@ def test_review_prompt_requires_lifecycle_comments(tmp_path: Path) -> None:
     )
 
     assert "pr-review run=pr-review-42-abc123" in prompt
-    assert "Do not create additional PR comments" in prompt
+    assert "Never edit, PATCH, or" in prompt
+    assert "as new PR comments" in prompt
     assert "DEV_AGENTS_REVIEW_REPORT_BEGIN" in prompt
+
+
+def test_review_prompt_shows_a_concrete_findings_example(tmp_path: Path) -> None:
+    """An empty findings:[] example gives no guidance on the finding OBJECT
+    shape, so the agent guesses -- confirmed live (PR #205 on LearBear): it
+    produced {pass, file, line, message} instead of the five required fields,
+    three times in a row within the same run. Both prompt variants must show a
+    concrete non-empty example using the exact required field names."""
+    review_prompt = _review_prompt(
+        tmp_path,
+        42,
+        {"headRefOid": "abc123", "headRefName": "feature/review-me"},
+        "staging",
+        [],
+        run_id="pr-review-42-abc123",
+    )
+    fix_prompt = _prompt(tmp_path, 42, ["comment:1"], "staging", [])
+    for prompt in (review_prompt, fix_prompt):
+        assert '"verdict":"findings"' in prompt
+        for field in ("severity", "category", "location", "impact", "remediation"):
+            assert f'"{field}"' in prompt
 
 
 def test_target_validation_uses_codex_cryptica_affected_scripts(tmp_path: Path) -> None:
@@ -388,6 +460,139 @@ def test_failed_review_with_pushed_fix_uses_targeted_follow_up(tmp_path: Path) -
     assert plan["round"] == 1
     assert plan["scope"] == "targeted-post-fix"
     assert plan["parent_run_id"] == run_id
+
+
+def test_superseded_review_does_not_exhaust_the_chain(tmp_path: Path) -> None:
+    """A run whose accept_provider check detected a concurrent push (Jules, a
+    human, or an overlapping run landing a new commit mid-review) must not be
+    recorded as a genuine failure: it must not set review_exhausted_head_sha
+    (which would permanently block ever reviewing the new head) and must leave
+    _review_plan free to offer a fresh full review for it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=database)
+    service = PrFixerService("demo", project, config)
+    run_id = "pr-review-42-old-sha"
+    service.state.claim_run(
+        "pr-review",
+        run_id,
+        metadata={"pull_request": 42, "head_sha": "old-sha", "review_round": 1},
+    )
+
+    result = service._finalize(
+        {
+            "number": 42,
+            "workflow": "pr-review",
+            "run_id": run_id,
+            "claimed": True,
+            "review_only": True,
+            "review_round": 1,
+            "fixed": False,
+            "meta": {"headRefOid": "old-sha"},
+            "report": {"superseded_by": "jules-pushed-sha"},
+        }
+    )
+
+    assert result == {"started": False}
+    record = service.state.get_run("pr-review", run_id)
+    assert record is not None
+    assert record.status == "failed"
+    assert record.error == "superseded by a concurrent push to the same branch"
+    assert record.metadata.get("review_exhausted_head_sha") is None
+    assert record.metadata.get("review_fix_pushed") is None
+
+    # The new head must be freely reviewable, not permanently blocked.
+    plan = service._review_plan(42, "jules-pushed-sha")
+    assert plan is not None
+    assert plan["round"] == 0
+    assert plan["scope"] == "full"
+
+
+def test_clean_review_auto_pushes_unpushed_base_merge(monkeypatch, tmp_path: Path) -> None:
+    """isolated_worktree merges origin/{base} into the branch to surface conflicts
+    before the agent runs. When base has moved and that merge is clean, local HEAD
+    ends up one commit ahead of origin/{branch} even though the agent found nothing
+    to fix -- a housekeeping commit, not agent output. The agent's own "clean status"
+    self-check doesn't catch this (a committed-but-unpushed commit leaves git status
+    empty), so the daemon must push it itself as a provable fast-forward rather than
+    reporting a real review as failed."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    for command in (
+        ["git", "init", "-b", "staging"],
+        ["git", "config", "user.email", "test@example.com"],
+        ["git", "config", "user.name", "Test User"],
+    ):
+        subprocess.run(command, cwd=origin, check=True, capture_output=True)
+    (origin / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=origin, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=origin, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/x"], cwd=origin, check=True, capture_output=True
+    )
+    (origin / "feature.txt").write_text("feature\n", encoding="utf-8")
+    subprocess.run(["git", "add", "feature.txt"], cwd=origin, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "feature"], cwd=origin, check=True, capture_output=True
+    )
+    pr_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=origin, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "staging"], cwd=origin, check=True, capture_output=True)
+    # Advance base AFTER the PR branch diverged, so isolated_worktree's setup
+    # merge produces a real (clean, no-conflict) merge commit.
+    (origin / "unrelated.md").write_text("later base change\n", encoding="utf-8")
+    subprocess.run(["git", "add", "unrelated.md"], cwd=origin, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated base change"], cwd=origin, check=True, capture_output=True
+    )
+
+    checkout = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", str(origin), str(checkout)], check=True, capture_output=True
+    )
+
+    def fake_run_agent(_provider: str, _prompt: str, *, log_path: Path, **_kwargs: Any) -> Any:
+        log_path.write_text(
+            "DEV_AGENTS_REVIEW_REPORT_BEGIN\n"
+            "FINDINGS: none\n"
+            "FIXES: none\n"
+            'REPORT_JSON: {"verdict":"clean","findings":[],'
+            '"categories_checked":["general"],"validation":["tests passed"],"fixes":[]}\n'
+            "DEV_AGENTS_REVIEW_REPORT_END\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, timed_out=False)
+
+    monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", fake_run_agent)
+
+    project = ProjectConfig(repo=checkout, github="owner/repo")
+    config = PrFixerConfig(
+        state_path=tmp_path / "state.db",
+        worktree_dir=tmp_path / "worktrees",
+        base_branch="staging",
+    )
+    service = PrFixerService("demo", project, config)
+
+    succeeded, report = service._fix(
+        42,
+        "feature/x",
+        [],
+        review_only=True,
+        meta={"headRefOid": pr_head},
+        run_id="pr-review-42-test",
+    )
+
+    assert succeeded is True
+    assert report.get("review_report", {}).get("verdict") == "clean"
+    assert "superseded_by" not in report
+    # The housekeeping merge commit must actually be on origin now.
+    origin_feature_head = subprocess.run(
+        ["git", "rev-parse", "feature/x"], cwd=origin, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert origin_feature_head != pr_head
 
 
 def test_internal_review_stops_after_targeted_follow_up_fix(monkeypatch, tmp_path: Path) -> None:
@@ -791,13 +996,24 @@ def test_review_started_comment_links_to_report_run() -> None:
     assert "[Open this run in dev-agents report](https://dev-agents-reports.vercel.app?workflow=pr-review&run=pr-review-3056-head)" in body
 
 
-def test_review_lifecycle_updates_one_comment(monkeypatch, tmp_path: Path) -> None:
+def test_review_progress_body_reuses_the_started_marker() -> None:
+    """Must share _review_started_body's exact marker so progress notes for one
+    run stay correlatable; publishing posts each as a new comment."""
+    body = _review_progress_body(
+        3056, "pr-review-3056-head", {"headRefOid": "abc123"}, None, 0, elapsed_seconds=754
+    )
+
+    assert "<!-- dev-agents:pr-review run=pr-review-3056-head -->" in body
+    assert "12m elapsed" in body
+    assert "abc123" in body
+
+
+def test_review_lifecycle_posts_new_comment(monkeypatch, tmp_path: Path) -> None:
+    """A matching lifecycle comment must not be overwritten: always POST new."""
     calls: list[tuple[str, ...]] = []
 
     def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
         calls.append(args)
-        if args[:3] == ("gh", "api", "repos/owner/repo/issues/42/comments"):
-            return '[[{"id": 77, "body": "<!-- dev-agents:pr-review run=run-1 -->\\nstarted"}]]'
         return ""
 
     monkeypatch.setattr("dev_agents.pr_fixer.repository_slug", lambda _repo: "owner/repo")
@@ -807,30 +1023,20 @@ def test_review_lifecycle_updates_one_comment(monkeypatch, tmp_path: Path) -> No
         tmp_path, 42, "run-1", "review-final", "<!-- dev-agents:pr-review run=run-1 -->\\nfinal"
     )
     assert any(
-        call[:5]
-        == (
-            "gh",
-            "api",
-            "repos/owner/repo/issues/comments/77",
-            "--method",
-            "PATCH",
-        )
-        for call in calls
-    )
-    assert not any(
         call[:4] == ("gh", "api", "repos/owner/repo/issues/42/comments", "-f")
         for call in calls
     )
+    assert not any("PATCH" in call for call in calls)
+    assert not any("--paginate" in call for call in calls)
 
 
-def test_publish_fix_summary_updates_existing_run_comment(monkeypatch, tmp_path: Path) -> None:
+def test_publish_fix_summary_posts_new_comment(monkeypatch, tmp_path: Path) -> None:
+    """A matching summary comment must not be overwritten: always POST new."""
     calls: list[tuple[str, ...]] = []
     body = "<!-- dev-agents:pr-fixer-summary run=run-1 -->\nsummary"
 
     def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
         calls.append(args)
-        if args[:3] == ("gh", "api", "repos/owner/repo/issues/42/comments"):
-            return '[[{"id": 77, "body": "<!-- dev-agents:pr-fixer-summary run=run-1 -->"}]]'
         return ""
 
     monkeypatch.setattr("dev_agents.pr_fixer.repository_slug", lambda _repo: "owner/repo")
@@ -838,22 +1044,10 @@ def test_publish_fix_summary_updates_existing_run_comment(monkeypatch, tmp_path:
 
     assert _publish_fix_summary(tmp_path, 42, "run-1", body) is True
     assert any(
-        call[:5]
-        == (
-            "gh",
-            "api",
-            "repos/owner/repo/issues/comments/77",
-            "--method",
-            "PATCH",
-        )
+        call[:4] == ("gh", "api", "repos/owner/repo/issues/42/comments", "-f")
         for call in calls
     )
-    assert not any(
-        len(call) > 3
-        and call[0:3] == ("gh", "api", "repos/owner/repo/issues/42/comments")
-        and call[3] == "-f"
-        for call in calls
-    )
+    assert not any("PATCH" in call for call in calls)
 
 
 def test_publish_fix_summary_creates_comment_when_run_comment_is_missing(

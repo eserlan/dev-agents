@@ -124,6 +124,32 @@ def _pull_request_checks(repo: Path, number: int) -> list[dict[str, Any]]:
     return checks
 
 
+def _coerce_finding_aliases(item: dict[str, Any]) -> dict[str, Any]:
+    """Fill in a missing canonical field from a common near-miss synonym.
+
+    A prompt example can lower how often the agent invents its own field
+    names, but it cannot guarantee compliance -- this meets it partway for the
+    recoverable cases (the content is there, just mislabeled), without
+    fabricating anything for fields that are genuinely absent (those still
+    correctly fail validation below; there is no synonym worth guessing at
+    for "category" or "remediation", since a wrong guess there would be worse
+    than rejecting the report and retrying).
+    """
+    coerced = dict(item)
+    if "location" not in coerced:
+        file = coerced.get("file") or coerced.get("path")
+        line = coerced.get("line")
+        if isinstance(file, str) and file:
+            coerced["location"] = f"{file}:{line}" if line not in (None, "") else file
+    if "impact" not in coerced:
+        for alias in ("message", "description", "summary"):
+            candidate = coerced.get(alias)
+            if isinstance(candidate, str) and candidate:
+                coerced["impact"] = candidate
+                break
+    return coerced
+
+
 def _normalise_review_report(value: Any) -> dict[str, Any] | None:
     """Validate the review JSON without retaining unbounded agent output."""
     if not isinstance(value, dict) or value.get("verdict") not in {"clean", "findings"}:
@@ -133,6 +159,11 @@ def _normalise_review_report(value: Any) -> dict[str, Any] | None:
     validation = value.get("validation")
     fixes = value.get("fixes")
     required_finding_fields = {"severity", "category", "location", "impact", "remediation"}
+    if isinstance(findings, list):
+        findings = [
+            _coerce_finding_aliases(item) if isinstance(item, dict) else item
+            for item in findings
+        ]
     if not isinstance(findings, list) or not all(
         isinstance(item, dict)
         and required_finding_fields <= set(item)

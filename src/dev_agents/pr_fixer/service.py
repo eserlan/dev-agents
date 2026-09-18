@@ -25,6 +25,7 @@ from dev_agents.runtime import (
     StateRepository,
     isolated_worktree,
     legacy_json_path,
+    repo_git_lock,
     run_agent,
     run_with_fallback,
 )
@@ -35,6 +36,7 @@ from .comments import (
     _fix_summary_body,
     _publish_fix_summary,
     _review_completed_body,
+    _review_progress_body,
     _review_started_body,
 )
 from .github_ops import (
@@ -210,18 +212,26 @@ class PrFixerService:
             and external_author is not None
             and resume_label not in labels
         ):
-            _pkg._publish_pr_run_comment(
-                self.project.repo,
-                number,
-                f"pr-review-pause-{number}-{head_sha}",
-                "external-agent-paused",
-                _external_agent_pause_body(
-                    number, head_sha, external_author, self.config.external_agent_resume_label
-                ),
-            )
-            _log(
-                f"paused pr={number} reason=external-agent-commit author={external_author}"
-            )
+            # This branch is re-entered by every webhook delivery for the PR (one
+            # check_run.completed per CI job, plus periodic reconciliation) for as
+            # long as the pause holds -- often many times for the same head SHA.
+            # Only re-announce (log + the comment fetch/patch round-trip) the first
+            # time we see this exact SHA paused; a new push still gets a fresh one.
+            pause_key = f"external-agent-pause:{head_sha}"
+            if self.state.unprocessed_feedback("pr-fixer", str(number), [pause_key]):
+                _pkg._publish_pr_run_comment(
+                    self.project.repo,
+                    number,
+                    f"pr-review-pause-{number}-{head_sha}",
+                    "external-agent-paused",
+                    _external_agent_pause_body(
+                        number, head_sha, external_author, self.config.external_agent_resume_label
+                    ),
+                )
+                _log(
+                    f"paused pr={number} reason=external-agent-commit author={external_author}"
+                )
+                self.state.mark_feedback_processed("pr-fixer", str(number), [pause_key])
             return {
                 "meta": meta,
                 "keys": keys,
@@ -441,6 +451,37 @@ class PrFixerService:
         number = state["number"]
         workflow = state.get("workflow", "pr-fixer")
         if state.get("review_only"):
+            superseded_head = state.get("report", {}).get("superseded_by")
+            if superseded_head:
+                # Someone else pushed to this branch while the review was running.
+                # Complete the claim (so it isn't left "running" forever) without
+                # posting a misleading failure comment or setting any of the
+                # chain/exhaustion metadata that _review_plan reads -- otherwise
+                # this would either burn a review-chain round on nothing, or worse,
+                # permanently block review of the very head that superseded us.
+                # The webhook for that new push already queued its own run.
+                self.state.record_event(
+                    workflow,
+                    state["run_id"],
+                    "finalize",
+                    "review_superseded",
+                    metadata={
+                        "reviewed_head_sha": state.get("meta", {}).get("headRefOid"),
+                        "superseded_by": superseded_head,
+                    },
+                )
+                self.state.complete_run(
+                    workflow,
+                    state["run_id"],
+                    status="failed",
+                    error="superseded by a concurrent push to the same branch",
+                    metadata={
+                        "reviewed_head_sha": state.get("meta", {}).get("headRefOid"),
+                        "superseded_by": superseded_head,
+                    },
+                )
+                _log(f"review-superseded pr={number} superseded_by={superseded_head}")
+                return {"started": False}
             if not state.get("fixed"):
                 recovery_metadata: dict[str, Any] = {}
                 try:
@@ -580,6 +621,28 @@ class PrFixerService:
             self.state.complete_run(workflow, state["run_id"])
             return {"started": False}
         if not state.get("fixed"):
+            superseded_head = state.get("report", {}).get("superseded_by")
+            if superseded_head:
+                # Same race as the review path: someone else pushed to this branch
+                # while we were fixing it. The feedback keys we targeted stay
+                # "unseen" (never marked processed), so the next reconcile/webhook
+                # naturally retries against the new head -- nothing more to do here.
+                self.state.record_event(
+                    workflow,
+                    state["run_id"],
+                    "finalize",
+                    "fix_superseded",
+                    metadata={"superseded_by": superseded_head},
+                )
+                self.state.complete_run(
+                    workflow,
+                    state["run_id"],
+                    status="failed",
+                    error="superseded by a concurrent push to the same branch",
+                    metadata={"superseded_by": superseded_head},
+                )
+                _log(f"fix-superseded pr={number} superseded_by={superseded_head}")
+                return {"started": False}
             self.state.record_event(
                 workflow, state["run_id"], "finalize", "fix_failed", status="failed"
             )
@@ -663,7 +726,13 @@ class PrFixerService:
         succeeded = False
         report: dict[str, Any] = {}
         try:
-            with isolated_worktree(self.project.repo, root, branch, base) as (worktree, conflicts):
+            with isolated_worktree(
+                self.project.repo,
+                root,
+                branch,
+                base,
+                max_concurrent=self.config.max_concurrent_worktree_runs,
+            ) as (worktree, conflicts):
                 _log(f"worktree pr={number} path={worktree}")
                 if conflicts:
                     _log(f"merge-conflict pr={number} paths={','.join(conflicts)}")
@@ -691,6 +760,25 @@ class PrFixerService:
                         else _prompt(worktree, number, keys, base, conflicts)
                     )
                     _log(f"agent-start pr={number} provider={provider} log={log}")
+
+                    def on_progress(elapsed_seconds: int) -> None:
+                        # Fix-mode has no lifecycle "started" comment yet to patch
+                        # in place, so this is review-only for now -- see
+                        # _review_progress_body's docstring for why it reuses the
+                        # same marker instead of posting a new comment each time.
+                        if not review_only or run_id is None:
+                            return
+                        _pkg._publish_pr_run_comment(
+                            self.project.repo,
+                            number,
+                            run_id,
+                            "review-progress",
+                            _review_progress_body(
+                                number, run_id, meta or {}, None, review_round, elapsed_seconds
+                            ),
+                        )
+                        _log(f"review-progress pr={number} elapsed_minutes={elapsed_seconds // 60}")
+
                     result = run_agent(
                         PR_FIX_PROVIDER,
                         prompt,
@@ -699,6 +787,7 @@ class PrFixerService:
                         timeout_seconds=self.config.timeout_minutes * 60,
                         heartbeat_seconds=self.config.heartbeat_seconds,
                         reasoning_effort=self.config.reasoning_effort,
+                        on_progress=on_progress,
                     )
                     report.update(_agent_report(log))
                     result_code = result.returncode
@@ -707,24 +796,99 @@ class PrFixerService:
                     _log(f"agent-finished pr={number} provider={provider} exit={result_code}")
                     return result
 
+                original_head = str((meta or {}).get("headRefOid", ""))
+                superseded_by: list[str] = []
+
                 def accept_provider(_provider: str, result: Any) -> bool:
-                    _pkg._run(worktree, "git", "fetch", "origin", branch, check=False)
-                    pushed = _pkg._run(worktree, "git", "rev-parse", "HEAD", check=False) == _pkg._run(
-                        worktree, "git", "rev-parse", f"origin/{branch}", check=False
-                    )
-                    return bool(
-                        result.returncode == 0
-                        and pushed
-                        and not _pkg._run(
-                            worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False
+                    # A worktree shares refs/remotes/* with the common .git dir, so this
+                    # fetch races the same way a fetch against the main checkout would --
+                    # see repo_git_lock's docstring. The explicit refspec matters just
+                    # as much here as in isolated_worktree's own fetch: a bare
+                    # `fetch origin <branch>` only populates FETCH_HEAD, leaving the
+                    # origin/{branch} ref this function compares against stale --
+                    # confirmed live (PR #198 on LearBear): after 3 separate review
+                    # attempts each freshly fetched, origin/{branch} still resolved to
+                    # a commit two pushes behind the real remote tip, so every attempt
+                    # falsely detected "supersession" against a push that never
+                    # actually happened.
+                    with repo_git_lock(self.project.repo):
+                        _pkg._run(
+                            worktree,
+                            "git",
+                            "fetch",
+                            "origin",
+                            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                            check=False,
                         )
-                        and _pkg._run(worktree, "git", "status", "--porcelain") == ""
+                    origin_head = _pkg._run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
+                    local_head = _pkg._run(worktree, "git", "rev-parse", "HEAD", check=False)
+                    conflict_markers = _pkg._run(
+                        worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False
+                    )
+                    worktree_clean = _pkg._run(worktree, "git", "status", "--porcelain") == ""
+
+                    if (
+                        local_head
+                        and origin_head
+                        and local_head != origin_head
+                        and origin_head == original_head
+                        and not conflict_markers
+                        and worktree_clean
+                    ):
+                        # isolated_worktree merges origin/{base} into the branch during
+                        # setup to surface conflicts before the agent starts. When that
+                        # merge is clean but the agent finds nothing to fix, local HEAD
+                        # ends up one commit ahead of origin/{branch} -- a housekeeping
+                        # sync commit, not agent output -- and the agent has proven
+                        # unreliable about remembering to push it itself (its own
+                        # "clean" check is git status, which only catches uncommitted
+                        # changes, not a committed-but-unpushed commit). Push it here
+                        # mechanically, but only as a provable fast-forward (origin is
+                        # an ancestor of local HEAD) so this can never discard or
+                        # overwrite anything already on origin, and only when nothing
+                        # else moved origin since we started (an actual divergence is
+                        # handled by the supersession check below, not auto-pushed).
+                        try:
+                            _pkg._run(worktree, "git", "merge-base", "--is-ancestor", origin_head, "HEAD")
+                        except RuntimeError:
+                            pass
+                        else:
+                            with repo_git_lock(self.project.repo):
+                                _pkg._run(worktree, "git", "push", "origin", f"HEAD:{branch}", check=False)
+                            origin_head = _pkg._run(
+                                worktree, "git", "rev-parse", f"origin/{branch}", check=False
+                            )
+
+                    pushed = local_head == origin_head
+                    if (
+                        not pushed
+                        and origin_head
+                        and original_head
+                        and origin_head != original_head
+                    ):
+                        # A run can take 5-20+ minutes (an agent pass plus validation).
+                        # If origin has moved to a head that is neither what we started
+                        # from nor what we ourselves just pushed, someone else (an
+                        # external agent like Jules, a human, or an overlapping run)
+                        # pushed to this same branch while we were working. Our result
+                        # was computed against an already-superseded head -- it is not
+                        # evidence of a genuine review/fix failure, and must not consume
+                        # a review-chain round or trip the exhaustion guard.
+                        superseded_by.append(origin_head)
+                    return bool(
+                        result.returncode == 0 and pushed and not conflict_markers and worktree_clean
                     )
 
                 # PR reviews and fixes are intentionally Codex-only. Keep the legacy providers
                 # field for config compatibility, but never let another agent handle PR code.
                 accepted = run_with_fallback((PR_FIX_PROVIDER,), run_provider, accept_provider)
-                if accepted:
+                if superseded_by:
+                    report["superseded_by"] = superseded_by[-1]
+                    _log(
+                        f"review-superseded pr={number} original_head={original_head} "
+                        f"new_head={superseded_by[-1]}"
+                    )
+                elif accepted:
                     if review_only and not report.get("report_valid", False):
                         _log(
                             f"review-report-invalid pr={number} "
@@ -884,46 +1048,38 @@ class PrFixerService:
                 "number,labels",
             )
             prs = json.loads(raw)
-        except (RuntimeError, json.JSONDecodeError) as error:
+            if not isinstance(prs, list):
+                raise TypeError("GitHub returned a non-list PR response")
+            eligible = 0
+            for pr in prs:
+                if any(label.get("name", "").lower() == "paused" for label in pr.get("labels", [])):
+                    continue
+                number = pr.get("number")
+                if isinstance(number, int):
+                    eligible += 1
+                    _pkg.Thread(target=self._handle_reconciled, args=(number,), daemon=True).start()
+            self.state.record_event(
+                "pr-reconcile",
+                run_id,
+                "reconcile",
+                "jobs_dispatched",
+                metadata={"open_prs": len(prs), "eligible_prs": eligible},
+            )
+            self.state.complete_run(
+                "pr-reconcile",
+                run_id,
+                metadata={"open_prs": len(prs), "eligible_prs": eligible},
+            )
+        except Exception as error:  # noqa: BLE001 - a leaked "running" claim never
+            # gets picked up again (nothing polls stale non-terminal reconcile rows),
+            # and reconcile_loop below has no guard either, so anything narrower than
+            # Exception here (e.g. a sqlite3.OperationalError under contention) used
+            # to both strand this claim forever and kill the whole reconcile thread.
             self.state.record_event(
                 "pr-reconcile", run_id, "reconcile", "failed", status="failed", metadata={"error": str(error)}
             )
             self.state.complete_run("pr-reconcile", run_id, status="failed", error=str(error))
             _log(f"reconcile-failed error={error}")
-            return
-        if not isinstance(prs, list):
-            reconcile_error = "GitHub returned a non-list PR response"
-            self.state.record_event(
-                "pr-reconcile",
-                run_id,
-                "reconcile",
-                "failed",
-                status="failed",
-                metadata={"error": reconcile_error},
-            )
-            self.state.complete_run("pr-reconcile", run_id, status="failed", error=reconcile_error)
-            _log(f"reconcile-failed error={reconcile_error}")
-            return
-        eligible = 0
-        for pr in prs:
-            if any(label.get("name", "").lower() == "paused" for label in pr.get("labels", [])):
-                continue
-            number = pr.get("number")
-            if isinstance(number, int):
-                eligible += 1
-                _pkg.Thread(target=self._handle_reconciled, args=(number,), daemon=True).start()
-        self.state.record_event(
-            "pr-reconcile",
-            run_id,
-            "reconcile",
-            "jobs_dispatched",
-            metadata={"open_prs": len(prs), "eligible_prs": eligible},
-        )
-        self.state.complete_run(
-            "pr-reconcile",
-            run_id,
-            metadata={"open_prs": len(prs), "eligible_prs": eligible},
-        )
 
     def _handle_reconciled(self, number: int) -> None:
         """Run a reconciled PR without allowing worker errors to escape the thread."""
@@ -936,4 +1092,9 @@ class PrFixerService:
         while True:
             time.sleep(self.config.reconcile_interval_seconds)
             _log("reconcile-start")
-            self.reconcile()
+            try:
+                self.reconcile()
+            except Exception as error:  # noqa: BLE001 - this loop must never die; a
+                # silent thread death here means no PR is ever reconciled again for
+                # the rest of the process's life, with nothing visibly wrong.
+                _log(f"reconcile_loop error={error}")

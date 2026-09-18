@@ -101,12 +101,18 @@ Commit and push HEAD to the PR branch.
 Do not close or merge the PR.
 
 At the end, print this exact plain-text block to stdout (no markdown fence), with one concise line
-for each field. REPORT_JSON must be valid compact JSON matching the supplied skill's schema:
+for each field. REPORT_JSON must be valid compact JSON matching the supplied skill's schema, with
+your actual verdict and findings -- never the literal example below. The first example shows the
+"clean" shape; if you found actionable issues, use "verdict":"findings" instead and populate
+findings/fixes using EXACTLY these five field names per finding -- severity, category, location,
+impact, remediation (all strings) -- not any other shape, as in the second example:
 {REVIEW_REPORT_BEGIN}
 FINDINGS: <what the supplied feedback identified>
 FIXES: <what changed, or none>
-REPORT_JSON: {{"verdict":"clean|findings","findings":[],"categories_checked":[],"validation":[],"fixes":[]}}
-{REVIEW_REPORT_END}"""
+REPORT_JSON: {{"verdict":"clean","findings":[],"categories_checked":[],"validation":[],"fixes":[]}}
+{REVIEW_REPORT_END}
+Example of a "findings" verdict's REPORT_JSON line (same field names, your own real content):
+REPORT_JSON: {{"verdict":"findings","findings":[{{"severity":"medium","category":"correctness","location":"src/file.ts:42","impact":"what breaks and for whom","remediation":"the smallest correct fix"}}],"categories_checked":["general"],"validation":["bun run test: 1234 passed"],"fixes":[{{"location":"src/file.ts:42","summary":"what changed"}}]}}"""
 
 
 def _review_prompt(
@@ -181,21 +187,28 @@ Validation protocol:
 {validation_instructions}
 
 Review communication protocol:
-- The daemon owns one evolving lifecycle comment for this run, marked
-  `<!-- dev-agents:pr-review run={report_id} -->`.
-- Do not create additional PR comments for findings or fixes. Before editing, use `gh api` to PATCH
-  the existing comment containing that marker with a concise findings update, then PATCH it again
-  immediately before edits begin when concrete fixes are needed. Never use `gh pr comment` for
-  review progress. The daemon will make the final update with the structured findings, what changed,
+- The daemon posts lifecycle comments for this run, marked
+  `<!-- dev-agents:pr-review run={report_id} -->`. Never edit, PATCH, or
+  overwrite an existing comment, including the lifecycle comment.
+- Share findings or fix updates as new PR comments (one concise comment per
+  update) instead of editing an existing comment. The daemon will post the
+  final update with the structured findings, what changed,
   commit, files, and validation. Keep the full detail in the required report block and persisted
   run timeline.
 - At the end, print this exact plain-text block to stdout (no markdown fence), with one concise line
-  for each field. Use `none` when appropriate:
+  for each field. Use `none` when appropriate. REPORT_JSON must be valid compact JSON matching the
+  supplied skill's schema, with your actual verdict and findings -- never the literal example below.
+  The first example shows the "clean" shape; if you found actionable issues, use "verdict":"findings"
+  instead and populate findings/fixes using EXACTLY these five field names per finding -- severity,
+  category, location, impact, remediation (all strings) -- not any other shape, as in the second
+  example:
   {REVIEW_REPORT_BEGIN}
   FINDINGS: <what {pass_description} found>
   FIXES: <what changed, or none>
-  REPORT_JSON: {{"verdict":"clean|findings","findings":[],"categories_checked":[],"validation":[],"fixes":[]}}
+  REPORT_JSON: {{"verdict":"clean","findings":[],"categories_checked":[],"validation":[],"fixes":[]}}
   {REVIEW_REPORT_END}
+  Example of a "findings" verdict's REPORT_JSON line (same field names, your own real content):
+  REPORT_JSON: {{"verdict":"findings","findings":[{{"severity":"medium","category":"correctness","location":"src/file.ts:42","impact":"what breaks and for whom","remediation":"the smallest correct fix"}}],"categories_checked":["general"],"validation":["bun run test: 1234 passed"],"fixes":[{{"location":"src/file.ts:42","summary":"what changed"}}]}}
 - Do not include credentials, tokens, or private user data in comments or the report.
 
 {no_fix_condition}, make no code changes. If the worktree contains a

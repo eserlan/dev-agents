@@ -40,6 +40,7 @@ from .comments import (
     _review_completed_body,
     _review_findings_body,
     _review_fixes_started_body,
+    _review_progress_body,
     _review_started_body,
 )
 from .github_ops import (
@@ -91,6 +92,7 @@ __all__ = [
     "_review_findings_body",
     "_review_fixes_started_body",
     "_review_is_due",
+    "_review_progress_body",
     "_review_prompt",
     "_review_skill",
     "_review_started_body",

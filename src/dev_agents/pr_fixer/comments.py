@@ -7,7 +7,6 @@ plain local import.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +48,32 @@ def _review_started_body(
 ### 🤖 Luna review started
 
 Luna has started {scope} for PR #{number}.
+
+- PR head: `{meta.get('headRefOid', 'unknown')}`
+- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
+- Run: `{run_id}`
+{_report_line(report_url)}
+"""
+
+
+def _review_progress_body(
+    number: int,
+    run_id: str,
+    meta: dict[str, Any],
+    report_url: str | None,
+    review_round: int,
+    elapsed_seconds: int,
+) -> str:
+    """A periodic progress note so a long review doesn't read as hung.
+
+    Reuses the same `pr-review` marker as `_review_started_body` for
+    correlation; publishing posts it as a new comment.
+    """
+    minutes = max(1, elapsed_seconds // 60)
+    return f"""<!-- dev-agents:pr-review run={run_id} -->
+### 🤖 Luna review in progress
+
+Still working on PR #{number} -- {minutes}m elapsed so far.
 
 - PR head: `{meta.get('headRefOid', 'unknown')}`
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
@@ -219,119 +244,36 @@ The automated fixer addressed {reason_text} on PR #{number}.
 def _publish_pr_run_comment(
     repo: Path, number: int, run_id: str, phase: str, body: str
 ) -> bool:
-    """Create or update the single lifecycle comment for a PR run."""
+    """Post a new lifecycle comment for a PR run; never overwrites an existing one."""
     try:
         slug = _pkg.repository_slug(repo)
-        raw = _pkg._run(
+        _pkg._run(
             repo,
             "gh",
             "api",
             f"repos/{slug}/issues/{number}/comments",
-            "--paginate",
-            "--slurp",
+            "-f",
+            f"body={body}",
         )
-        pages = json.loads(raw) if raw else []
-        comments: list[dict[str, Any]] = []
-        for page in pages if isinstance(pages, list) else []:
-            if isinstance(page, list):
-                comments.extend(item for item in page if isinstance(item, dict))
-            elif isinstance(page, dict):
-                comments.append(page)
-        if phase.startswith("review"):
-            markers = [
-                f"<!-- dev-agents:pr-review run={run_id} -->",
-                # Migrate a lifecycle comment created by an older daemon version.
-                *(
-                    f"<!-- dev-agents:pr-{legacy_phase} run={run_id} -->"
-                    for legacy_phase in (
-                        "review-started",
-                        "review-findings",
-                        "review-fixes-started",
-                    )
-                ),
-            ]
-        else:
-            markers = [f"<!-- dev-agents:pr-{phase} run={run_id} -->"]
-        existing = next(
-            (
-                comment
-                for marker in markers
-                for comment in comments
-                if marker in str(comment.get("body", ""))
-            ),
-            None,
-        )
-        if existing and existing.get("id") is not None:
-            _pkg._run(
-                repo,
-                "gh",
-                "api",
-                f"repos/{slug}/issues/comments/{existing['id']}",
-                "--method",
-                "PATCH",
-                "-f",
-                f"body={body}",
-            )
-        else:
-            _pkg._run(
-                repo,
-                "gh",
-                "api",
-                f"repos/{slug}/issues/{number}/comments",
-                "-f",
-                f"body={body}",
-            )
-    except (RuntimeError, json.JSONDecodeError) as error:
+    except RuntimeError as error:
         _log(f"run-comment-failed pr={number} phase={phase} error={error}")
         return False
     return True
 
 
 def _publish_fix_summary(repo: Path, number: int, run_id: str, body: str) -> bool:
-    """Create or update the bot's single summary comment for one fixer run."""
+    """Post the bot's summary as a new comment for one fixer run."""
     try:
         slug = _pkg.repository_slug(repo)
-        raw = _pkg._run(
+        _pkg._run(
             repo,
             "gh",
             "api",
             f"repos/{slug}/issues/{number}/comments",
-            "--paginate",
-            "--slurp",
+            "-f",
+            f"body={body}",
         )
-        pages = json.loads(raw) if raw else []
-        comments: list[dict[str, Any]] = []
-        for page in pages if isinstance(pages, list) else []:
-            if isinstance(page, list):
-                comments.extend(item for item in page if isinstance(item, dict))
-            elif isinstance(page, dict):
-                comments.append(page)
-        marker = f"<!-- dev-agents:pr-fixer-summary run={run_id} -->"
-        existing = next(
-            (comment for comment in comments if marker in str(comment.get("body", ""))),
-            None,
-        )
-        if existing and existing.get("id") is not None:
-            _pkg._run(
-                repo,
-                "gh",
-                "api",
-                f"repos/{slug}/issues/comments/{existing['id']}",
-                "--method",
-                "PATCH",
-                "-f",
-                f"body={body}",
-            )
-        else:
-            _pkg._run(
-                repo,
-                "gh",
-                "api",
-                f"repos/{slug}/issues/{number}/comments",
-                "-f",
-                f"body={body}",
-            )
-    except (RuntimeError, json.JSONDecodeError) as error:
+    except RuntimeError as error:
         _log(f"summary-comment-failed pr={number} error={error}")
         return False
     return True
