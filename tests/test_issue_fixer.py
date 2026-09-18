@@ -9,6 +9,8 @@ from dev_agents.issue_fixer import (
     _existing_issue_pr,
     _issue_result_body,
     _open_bug_issues,
+    _prompt,
+    _publish_issue_comment,
 )
 from dev_agents.runtime import StateRepository
 
@@ -51,6 +53,61 @@ def test_issue_result_body_mentions_pr_or_blocker() -> None:
     assert "https://github.com/example/pr/1" in _issue_result_body(
         92, "run-1", "https://github.com/example/pr/1", "fixed"
     )
+
+
+def test_publish_issue_comment_posts_new_comment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue updates must not overwrite an existing comment: always POST new."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: object) -> str:
+        calls.append(args)
+        return ""
+
+    monkeypatch.setattr("dev_agents.issue_fixer.repository_slug", lambda _repo: "owner/repo")
+    monkeypatch.setattr("dev_agents.issue_fixer._run", fake_run)
+
+    assert _publish_issue_comment(tmp_path, 92, "<!-- marker -->\nhello") is True
+    assert calls == [
+        ("gh", "api", "repos/owner/repo/issues/92/comments", "-f", "body=<!-- marker -->\nhello")
+    ]
+
+
+def test_prompt_defaults_to_fix_framing(tmp_path: Path) -> None:
+    prompt = _prompt(
+        tmp_path,
+        {"number": 42, "title": "Button misaligned", "url": "https://x/42"},
+        "main",
+        "dev-agents/issue-42",
+        [],
+    )
+    assert prompt.startswith("Fix GitHub issue #42")
+    assert "implement the smallest complete fix" in prompt
+    assert "Commit the fix and push" in prompt
+
+
+def test_prompt_uses_enhancement_framing_for_gui_fix_kind(tmp_path: Path) -> None:
+    prompt = _prompt(
+        tmp_path,
+        {"number": 42, "title": "Add dark mode toggle", "url": "https://x/42"},
+        "main",
+        "dev-agents/issue-42",
+        [],
+        kind="enhancement",
+    )
+    assert prompt.startswith("Implement the GUI enhancement described in GitHub issue #42")
+    assert "implement the smallest complete version of the enhancement" in prompt
+    assert "Commit the enhancement and push" in prompt
+    # Must not carry over "fix"-specific wording that would misdescribe an
+    # enhancement as a defect.
+    assert "the concrete blocker" in prompt  # still applies: enhancement can still be blocked
+    assert "what was fixed" not in prompt
+
+
+def test_issue_fixer_config_kind_defaults_to_fix() -> None:
+    assert IssueFixerConfig().kind == "fix"
+    assert IssueFixerConfig(label="gui-fix", kind="enhancement").kind == "enhancement"
 
 
 def test_collect_issue_claims_labeled_open_issue(

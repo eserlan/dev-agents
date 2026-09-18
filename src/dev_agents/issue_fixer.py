@@ -18,7 +18,14 @@ from langgraph.graph import END, START, StateGraph
 
 from dev_agents.config import IssueFixerConfig, PrFixerConfig, ProjectConfig
 from dev_agents.context.instructions import discover_instructions
-from dev_agents.runtime import StateRepository, repository_slug, run_agent
+from dev_agents.pr_fixer import _log
+from dev_agents.runtime import (
+    StateRepository,
+    repo_git_lock,
+    repo_worktree_semaphore,
+    repository_slug,
+    run_agent,
+)
 from dev_agents.runtime.agent import AgentResult
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
@@ -113,47 +120,9 @@ def _existing_issue_pr(repo: Path, number: int) -> dict[str, Any] | None:
     return None
 
 
-def _publish_issue_comment(repo: Path, number: int, marker: str, body: str) -> bool:
-    """Create or update one idempotent issue comment."""
+def _publish_issue_comment(repo: Path, number: int, body: str) -> bool:
+    """Post one new issue comment; never overwrites an existing one."""
     slug = repository_slug(repo)
-    try:
-        raw = _run(repo, "gh", "api", f"repos/{slug}/issues/{number}/comments")
-        comments = json.loads(raw)
-    except (RuntimeError, json.JSONDecodeError):
-        return False
-    markers = [marker]
-    if marker.startswith("dev-agents:issue-fix issue="):
-        # Migrate comments created before issue lifecycle updates were collapsed.
-        markers.extend(
-            (
-                marker.replace("issue-fix ", "issue-fix-started "),
-                marker.replace("issue-fix ", "issue-fix-result "),
-            )
-        )
-    existing = next(
-        (
-            item
-            for item in comments
-            if isinstance(item, dict)
-            and any(candidate in str(item.get("body", "")) for candidate in markers)
-        ),
-        None,
-    )
-    if isinstance(existing, dict) and existing.get("id"):
-        try:
-            _run(
-                repo,
-                "gh",
-                "api",
-                f"repos/{slug}/issues/comments/{existing['id']}",
-                "-X",
-                "PATCH",
-                "-f",
-                f"body={body}",
-            )
-        except RuntimeError:
-            return False
-        return True
     try:
         _run(
             repo,
@@ -190,13 +159,34 @@ def _issue_result_body(number: int, run_id: str, pr_url: str | None, summary: st
 """
 
 
+_KIND_FRAMING = {
+    "fix": {
+        "verb": "Fix",
+        "goal": "implement the smallest complete fix",
+        "artifact": "fix",
+        "report_field": "what was fixed, or the concrete blocker",
+        "title_prefix": "fix",
+    },
+    "enhancement": {
+        "verb": "Implement the GUI enhancement described in",
+        "goal": "implement the smallest complete version of the enhancement",
+        "artifact": "enhancement",
+        "report_field": "what was implemented, or the concrete blocker",
+        "title_prefix": "feat",
+    },
+}
+
+
 def _prompt(
     repo: Path,
     issue: dict[str, Any],
     base_branch: str,
     branch: str,
     conflicts: list[str],
+    *,
+    kind: str = "fix",
 ) -> str:
+    framing = _KIND_FRAMING.get(kind, _KIND_FRAMING["fix"])
     instructions = discover_instructions(repo).documents
     instruction_text = "\n\n".join(
         f"## {item.path.relative_to(repo)}\n{item.content}" for item in instructions
@@ -205,7 +195,7 @@ def _prompt(
     title = str(issue.get("title", "Untitled issue"))
     body = str(issue.get("body") or "(issue has no body)")[:30_000]
     conflict_text = "\n".join(f"- {path}" for path in conflicts) or "None"
-    return f"""Fix GitHub issue #{issue.get('number')} in this isolated worktree.
+    return f"""{framing['verb']} GitHub issue #{issue.get('number')} in this isolated worktree.
 
 Issue title: {title}
 Issue URL: {issue.get('url', '')}
@@ -221,19 +211,19 @@ Read and obey these repository instructions:
 Branch: {branch} (based on {base_branch})
 Merge-conflict paths: {conflict_text}
 
-Investigate the issue and implement the smallest complete fix. Treat security acceptance criteria
+Investigate the issue and {framing['goal']}. Treat security acceptance criteria
 as binding. Do not guess at production data or revoke legitimate access without evidence; make
 the code and migration safe for every deployment environment. Add focused tests, and use the
 target repository's optimized validation commands when available. Keep independent lint, test,
 and type-check commands parallel where practical.
 
-Commit the fix and push the branch to origin. Do not merge or close the issue/PR. If the issue is
-not safely actionable from the repository, leave the tree clean and explain the blocker instead
-of inventing a solution.
+Commit the {framing['artifact']} and push the branch to origin. Do not merge or close the issue/PR.
+If the issue is not safely actionable from the repository, leave the tree clean and explain the
+blocker instead of inventing a solution.
 
 At the end, print exactly these fields as short plain-text lines:
 ISSUE_FIX_REPORT_BEGIN
-SUMMARY: <what was fixed, or the concrete blocker>
+SUMMARY: <{framing['report_field']}>
 VALIDATION: <commands and results>
 ISSUE_FIX_REPORT_END
 """
@@ -241,49 +231,82 @@ ISSUE_FIX_REPORT_END
 
 @contextmanager
 def _isolated_issue_worktree(
-    repo: Path, root: Path, branch: str, base_branch: str
+    repo: Path, root: Path, branch: str, base_branch: str, *, max_concurrent: int = 2
 ) -> Iterator[tuple[Path, list[str]]]:
     root.mkdir(parents=True, exist_ok=True)
-    worktree = Path(tempfile.mkdtemp(prefix="issue-", dir=root))
+    # Shared with pr_fixer's isolated_worktree via repo_git_lock/repo_worktree_semaphore
+    # (both keyed by repo path): fetch/worktree-add mutate the same central checkout,
+    # and PR review/fix + issue fix each run a full validation build, so both the git
+    # ref race and the CPU oversubscription risk are shared, not per-workflow.
+    semaphore = repo_worktree_semaphore(repo, max_concurrent)
+    semaphore.acquire()
     try:
-        _run(repo, "git", "fetch", "origin", base_branch)
-        remote_branch = _run(
-            repo,
-            "git",
-            "ls-remote",
-            "--exit-code",
-            "--heads",
-            "origin",
-            branch,
-            check=False,
-        )
-        if remote_branch:
-            _run(
-                repo,
-                "git",
-                "fetch",
-                "origin",
-                f"refs/heads/{branch}:refs/remotes/origin/{branch}",
+        worktree = Path(tempfile.mkdtemp(prefix="issue-", dir=root))
+        lock = repo_git_lock(repo)
+        try:
+            with lock:
+                # See the matching note in runtime/worktree.py's isolated_worktree:
+                # a bare `fetch origin <branch>` only populates FETCH_HEAD, not
+                # refs/remotes/origin/<branch>, which the merge step below reads.
+                _run(
+                    repo,
+                    "git",
+                    "fetch",
+                    "origin",
+                    f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}",
+                )
+                remote_branch = _run(
+                    repo,
+                    "git",
+                    "ls-remote",
+                    "--exit-code",
+                    "--heads",
+                    "origin",
+                    branch,
+                    check=False,
+                )
+                if remote_branch:
+                    _run(
+                        repo,
+                        "git",
+                        "fetch",
+                        "origin",
+                        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    )
+                    _run(
+                        repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{branch}"
+                    )
+                else:
+                    _run(
+                        repo,
+                        "git",
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(worktree),
+                        f"origin/{base_branch}",
+                    )
+                    _run(worktree, "git", "switch", "-c", branch)
+            # rerere has no business in a one-shot automated worktree merge -- see
+            # the matching note in runtime/worktree.py's isolated_worktree.
+            merge = subprocess.run(
+                ["git", "-c", "rerere.enabled=false", "merge", f"origin/{base_branch}", "--no-edit"],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            _run(repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{branch}")
-        else:
-            _run(repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{base_branch}")
-            _run(worktree, "git", "switch", "-c", branch)
-        merge = subprocess.run(
-            ["git", "merge", f"origin/{base_branch}", "--no-edit"],
-            cwd=worktree,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        conflicts = _run(
-            worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False
-        ).splitlines()
-        if merge.returncode != 0 and not conflicts:
-            raise RuntimeError(f"merge failed for base branch {base_branch}: {merge.stderr.strip()}")
-        yield worktree, conflicts
+            conflicts = _run(
+                worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False
+            ).splitlines()
+            if merge.returncode != 0 and not conflicts:
+                raise RuntimeError(f"merge failed for base branch {base_branch}: {merge.stderr.strip()}")
+            yield worktree, conflicts
+        finally:
+            with lock:
+                _run(repo, "git", "worktree", "remove", "--force", str(worktree), check=False)
     finally:
-        _run(repo, "git", "worktree", "remove", "--force", str(worktree), check=False)
+        semaphore.release()
 
 
 class IssueFixerRunState(TypedDict, total=False):
@@ -374,6 +397,7 @@ class IssueFixerService:
             "issue_claimed",
             metadata={"issue": number, "label": self.config.label},
         )
+        _log(f"issue-fixer issue={number} run_id={run_id} phase=claimed")
         return {
             "issue": issue,
             "run_id": run_id,
@@ -390,7 +414,6 @@ class IssueFixerService:
         _publish_issue_comment(
             self.project.repo,
             number,
-            f"dev-agents:issue-fix issue={number} run={run_id}",
             _issue_start_body(number, run_id, issue),
         )
         log_dir = (
@@ -398,6 +421,7 @@ class IssueFixerService:
             or Path.home() / ".local/state/dev-agents" / self.project_name / "logs"
         ).expanduser()
         log_path = log_dir / f"issue-{number}-{run_id.rsplit('-', 1)[-1]}.log"
+        _log(f"issue-fixer issue={number} run_id={run_id} phase=remediating log={log_path}")
         fixed = False
         summary = "Agent did not produce a clean pushed fix."
         validation = f"Agent log: {log_path}"
@@ -407,6 +431,7 @@ class IssueFixerService:
                 (self.pr_config.worktree_dir or Path.home() / ".cache/dev-agents/pr-fixer").expanduser(),
                 state["branch"],
                 self.config.base_branch,
+                max_concurrent=self.pr_config.max_concurrent_worktree_runs,
             ) as (worktree, conflicts):
                 base_sha = _run(worktree, "git", "rev-parse", f"origin/{self.config.base_branch}")
                 remote_before = _run(
@@ -424,7 +449,14 @@ class IssueFixerService:
                 else:
                     result: AgentResult = run_agent(
                         ISSUE_FIX_PROVIDER,
-                        _prompt(worktree, issue, self.config.base_branch, state["branch"], conflicts),
+                        _prompt(
+                            worktree,
+                            issue,
+                            self.config.base_branch,
+                            state["branch"],
+                            conflicts,
+                            kind=self.config.kind,
+                        ),
                         cwd=worktree,
                         log_path=log_path,
                         timeout_seconds=self.config.timeout_minutes * 60,
@@ -470,7 +502,8 @@ class IssueFixerService:
                 "--head",
                 state["branch"],
                 "--title",
-                f"fix: {str(issue.get('title', 'bug'))[:60]}",
+                f"{_KIND_FRAMING.get(self.config.kind, _KIND_FRAMING['fix'])['title_prefix']}: "
+                f"{str(issue.get('title', 'bug'))[:60]}",
                 "--body",
                 f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->\n\nFixes #{number}.\n\nCreated by the dev-agents issue fixer; the normal PR review and validation pipeline will run.",
             )
@@ -509,8 +542,11 @@ class IssueFixerService:
         _publish_issue_comment(
             self.project.repo,
             number,
-            f"dev-agents:issue-fix issue={number} run={run_id}",
             _issue_result_body(number, run_id, pr_url, f"{summary}\n\n{validation}"),
+        )
+        _log(
+            f"issue-fixer issue={number} run_id={run_id} phase=finalized "
+            f"fixed={bool(state.get('fixed'))} pr_url={pr_url} summary={summary}"
         )
         return {"fixed": bool(state.get("fixed"))}
 
@@ -525,23 +561,36 @@ class IssueFixerService:
             return
         try:
             issues = _open_bug_issues(self.project.repo, self.config)
+            _log(f"issue-fixer reconcile label={self.config.label} open_issues={len(issues)}")
             for issue in issues:
                 number = issue.get("number")
                 if isinstance(number, int):
                     Thread(target=self._handle_reconciled, args=(number,), daemon=True).start()
             self.state.complete_run(
-                "issue-reconcile", run_id, metadata={"open_bug_issues": len(issues)}
+                "issue-reconcile",
+                run_id,
+                metadata={"label": self.config.label, "open_issues": len(issues)},
             )
-        except (RuntimeError, json.JSONDecodeError) as error:
+        except Exception as error:  # noqa: BLE001 - a leaked "running" claim never
+            # gets picked up again (nothing polls stale non-terminal reconcile rows),
+            # and reconcile_loop below has no guard either, so anything narrower than
+            # Exception here (e.g. a sqlite3.OperationalError under contention) used
+            # to both strand this claim forever and kill the whole reconcile thread.
+            _log(f"issue-fixer reconcile error={error}")
             self.state.complete_run("issue-reconcile", run_id, status="failed", error=str(error))
 
     def _handle_reconciled(self, number: int) -> None:
         try:
             self.handle(number)
         except Exception as error:  # noqa: BLE001 - one issue must not stop polling
-            print(f"[issue-fixer] issue={number} failed: {error}", flush=True)
+            _log(f"issue-fixer issue={number} failed: {error}")
 
     def reconcile_loop(self) -> None:
         while True:
             time.sleep(max(30, self.pr_config.reconcile_interval_seconds))
-            self.reconcile()
+            try:
+                self.reconcile()
+            except Exception as error:  # noqa: BLE001 - this loop must never die; a
+                # silent thread death here means no PR/issue is ever reconciled again
+                # for the rest of the process's life, with nothing visibly wrong.
+                _log(f"issue-fixer reconcile_loop error={error}")

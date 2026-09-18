@@ -14,8 +14,9 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
@@ -74,19 +75,20 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
         os.environ.get(project.release_comms.webhook_secret_env) if project.release_comms else None
     )
 
-    _cleanup_artifacts(project_name, config)
+    _cleanup_artifacts(project_name, project, config)
     service = PrFixerService(project_name, project, config)
-    issue_service = (
-        IssueFixerService(
-            project_name,
-            project,
-            project.issue_fixer,
-            config,
-            service.state,
-        )
-        if project.issue_fixer is not None
-        else None
-    )
+    # Every configured label queue (e.g. a "bug" fix queue and a separate
+    # "gui-fix" enhancement queue) gets its own IssueFixerService, sharing the
+    # PR fixer's state repository. Each service filters by its own label, so
+    # dispatching an "issues" webhook or reconcile tick to all of them is safe
+    # -- only the one whose label matches actually acts.
+    issue_fixer_configs = list(project.issue_fixers)
+    if project.issue_fixer is not None:
+        issue_fixer_configs = [project.issue_fixer, *issue_fixer_configs]
+    issue_services = [
+        IssueFixerService(project_name, project, issue_fixer_config, config, service.state)
+        for issue_fixer_config in issue_fixer_configs
+    ]
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -97,7 +99,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                     {
                         "ok": self.path == "/health",
                         "active_jobs": len(service.active)
-                        + (len(issue_service.active) if issue_service is not None else 0),
+                        + sum(len(issue_service.active) for issue_service in issue_services),
                     }
                 ).encode()
             )
@@ -162,6 +164,11 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                             base_branch=config.base_branch,
                             providers=config.providers,
                             dry_run=False,
+                            log_path=(
+                                config.log_dir / "degodify.log"
+                                if config.log_dir is not None
+                                else None
+                            ),
                             supplied_candidate=candidate,
                             on_event=degodify_phase,
                         )
@@ -296,7 +303,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
             if event == "issues":
                 issue_number = payload.get("issue", {}).get("number")
                 if (
-                    issue_service is None
+                    not issue_services
                     or payload.get("repository", {}).get("full_name") != project.github
                     or action not in _ACTIONS["issues"]
                     or not isinstance(issue_number, int)
@@ -308,7 +315,6 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                     self.send_response(200)
                     self.end_headers()
                     return
-                assert issue_service is not None
                 claim = service.state.claim_run(
                     "github-webhook",
                     f"delivery:{delivery}",
@@ -323,7 +329,13 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
                 def run_issue() -> None:
                     try:
-                        started = issue_service.handle(issue_number)
+                        # Each service filters by its own label internally, so
+                        # dispatching to all of them is safe -- only the queue
+                        # whose label the issue actually carries will act.
+                        started = any(
+                            issue_service.handle(issue_number)
+                            for issue_service in issue_services
+                        )
                         service.state.complete_run(
                             "github-webhook",
                             f"delivery:{delivery}",
@@ -430,6 +442,13 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
         interval = max(5, comms_config.scheduler_poll_seconds)
         last_reddit_sync = 0.0
         MAX_FAILED_RETRY_ATTEMPTS = 5
+        MAX_SCHEDULED_RESUME_ATTEMPTS = 15
+        # Gate how often a *new* run may start (independent of any one run's own
+        # internal message-to-message pacing) so a backlog of several distinct
+        # releases drains at the same human cadence as a single release's batches,
+        # instead of firing every due/retryable run in one poll tick. In-memory
+        # only: a daemon restart resets it, same as the rest of this loop's state.
+        next_start_slot = datetime.now(UTC)
         while True:
             time.sleep(interval)
             now = datetime.now(UTC)
@@ -449,6 +468,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                     _log(f"periodic reddit sync error: {error}")
 
             for run in claims.list_runs("release-comms", limit=100):
+                attempt_cap: int | None = None
                 if run.status == "scheduled":
                     try:
                         next_at = datetime.fromisoformat(
@@ -458,15 +478,39 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                         next_at = now
                     if next_at > now:
                         continue
-                elif run.status != "failed":
-                    # Only scheduled (delay-timer) and failed (retry-until-posted) runs
-                    # are resumed here; completed/running runs are left alone.
+                    # "scheduled" is the normal healthy multi-batch pacing flow (one
+                    # resume per feature/page), not a failure, so it gets a much more
+                    # generous cap than a genuine failure -- but it still needs one.
+                    # Confirmed live: a resume/redraft mismatch left one run's
+                    # pending-publication count permanently non-zero with nothing
+                    # left it could actually publish, so it resumed (and re-ran a
+                    # real evaluator/writer LLM pass) every cycle forever with zero
+                    # progress until this cap existed.
+                    attempt_cap = MAX_SCHEDULED_RESUME_ATTEMPTS
+                elif run.status == "failed":
+                    attempt_cap = MAX_FAILED_RETRY_ATTEMPTS
+                elif run.status == "running":
+                    # A "running" run that has sat past the staleness window was
+                    # interrupted (e.g. the daemon restarted mid-run) and orphaned --
+                    # claim_run() is the real safety gate against reclaiming a run
+                    # that is genuinely still in flight.
+                    try:
+                        started = datetime.fromisoformat(run.started_at)
+                    except ValueError:
+                        continue
+                    if (now - started).total_seconds() < StateRepository.STALE_RUN_SECONDS:
+                        continue
+                    attempt_cap = MAX_FAILED_RETRY_ATTEMPTS
+                else:
+                    # Only scheduled (delay-timer), failed, and stale-running
+                    # (retry-until-posted) runs are resumed here; completed runs
+                    # and actively-running runs are left alone.
                     continue
-                elif run.attempt >= MAX_FAILED_RETRY_ATTEMPTS:
+                if attempt_cap is not None and run.attempt >= attempt_cap:
                     if not run.metadata.get("_release_comms_retry_exhausted"):
                         _log(
                             f"release-comms run_id={run.run_id} giving up after "
-                            f"{run.attempt} attempts (cap={MAX_FAILED_RETRY_ATTEMPTS})"
+                            f"{run.attempt} attempts (cap={attempt_cap})"
                         )
                         claims.update_run(
                             "release-comms",
@@ -474,10 +518,17 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                             metadata={"_release_comms_retry_exhausted": True},
                         )
                     continue
+                if now < next_start_slot:
+                    # Another run already claimed this poll's start slot; leave this
+                    # one for a later tick instead of starting it alongside others.
+                    continue
                 with active_lock:
                     if run.run_id in active:
                         continue
                     active.add(run.run_id)
+                delay_min = max(0.0, comms_config.publication_delay_min_seconds)
+                delay_max = max(delay_min, comms_config.publication_delay_max_seconds)
+                next_start_slot = now + timedelta(seconds=random.uniform(delay_min, delay_max))
 
                 def resume(run_id: str = run.run_id, attempt: int = run.attempt) -> None:
                     try:
@@ -512,7 +563,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
     _log(f"listening on 127.0.0.1:{config.port}{config.webhook_path} for {project.github}")
     Thread(target=service.reconcile_loop, daemon=True).start()
-    if issue_service is not None:
+    for issue_service in issue_services:
         Thread(target=issue_service.reconcile, daemon=True).start()
         Thread(target=issue_service.reconcile_loop, daemon=True).start()
     Thread(target=release_comms_scheduler, daemon=True).start()

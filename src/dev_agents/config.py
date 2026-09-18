@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class IssueFixerConfig(BaseModel):
-    """Opt-in configuration for the label-driven issue fixer."""
+    """Opt-in configuration for one label-driven issue queue.
+
+    A project can run several of these concurrently (see
+    ``ProjectConfig.issue_fixers``) -- e.g. a "bug" queue and a separate
+    "gui-fix" queue for GUI enhancements -- each with its own label, branch
+    prefix, and framing.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     label: str = "bug"
+    # "fix" frames the work as fixing a defect; "enhancement" frames it as
+    # implementing an improvement. Drives prompt wording and the PR title
+    # prefix ("fix: ..." vs "feat: ..."), not the validation/review pipeline,
+    # which is identical either way.
+    kind: Literal["fix", "enhancement"] = "fix"
     base_branch: str = "main"
     branch_prefix: str = "dev-agents/issue-"
     timeout_minutes: int = 30
@@ -36,7 +48,12 @@ class ProjectConfig(BaseModel):
     report_vercel_min_interval_seconds: int = 3600
     report_vercel_max_deployments_24h: int = 24
     pr_fixer: PrFixerConfig | None = None
+    # Kept for backward compatibility with existing single-queue configs;
+    # combined with issue_fixers (below) at daemon startup into one list.
     issue_fixer: IssueFixerConfig | None = None
+    # Additional label-driven queues beyond the single `issue_fixer` above,
+    # e.g. a "bug" queue plus a "gui-fix" enhancement queue running together.
+    issue_fixers: list[IssueFixerConfig] = []
     release_comms: ReleaseCommsConfig | None = None
 
 
@@ -90,6 +107,11 @@ class PrFixerConfig(BaseModel):
     auto_merge_issue_fixes_only: bool = False
     log_retention_days: int = 30
     worktree_retention_days: int = 2
+    # Shared cap on simultaneous worktrees (PR review/fix + issue fix combined) for
+    # this project: each one runs a full validation build alongside its agent, and
+    # several running at once can oversubscribe a small machine's CPU well past its
+    # core count.
+    max_concurrent_worktree_runs: int = 2
     auto_merge_quiet_seconds: int = 60
     heartbeat_seconds: int = 30
     pause_on_external_agent_commits: bool = True
