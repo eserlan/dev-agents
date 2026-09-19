@@ -159,6 +159,22 @@ def _issue_result_body(number: int, run_id: str, pr_url: str | None, summary: st
 """
 
 
+def _pr_result_body(number: int, run_id: str, summary: str) -> str:
+    marker = f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->"
+    return f"""{marker}
+### 🤖 Dev-agents issue fixer result
+
+Fixes #{number}.
+
+{summary}
+"""
+
+
+def _pr_number_from_url(pr_url: str) -> int | None:
+    match = re.search(r"/pull/(\d+)", pr_url)
+    return int(match.group(1)) if match else None
+
+
 _KIND_FRAMING = {
     "fix": {
         "verb": "Fix",
@@ -539,11 +555,19 @@ class IssueFixerService:
             metadata={"issue": number, "pr_url": pr_url, "summary": summary},
         )
         validation = state.get("validation", "Validation was not reported.")
-        _publish_issue_comment(
-            self.project.repo,
-            number,
-            _issue_result_body(number, run_id, pr_url, f"{summary}\n\n{validation}"),
-        )
+        pr_number = _pr_number_from_url(pr_url) if pr_url else None
+        if pr_number is not None:
+            _publish_issue_comment(
+                self.project.repo,
+                pr_number,
+                _pr_result_body(number, run_id, f"{summary}\n\n{validation}"),
+            )
+        else:
+            _publish_issue_comment(
+                self.project.repo,
+                number,
+                _issue_result_body(number, run_id, pr_url, f"{summary}\n\n{validation}"),
+            )
         _log(
             f"issue-fixer issue={number} run_id={run_id} phase=finalized "
             f"fixed={bool(state.get('fixed'))} pr_url={pr_url} summary={summary}"

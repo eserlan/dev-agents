@@ -9,6 +9,8 @@ from dev_agents.issue_fixer import (
     _existing_issue_pr,
     _issue_result_body,
     _open_bug_issues,
+    _pr_number_from_url,
+    _pr_result_body,
     _prompt,
     _publish_issue_comment,
 )
@@ -53,6 +55,86 @@ def test_issue_result_body_mentions_pr_or_blocker() -> None:
     assert "https://github.com/example/pr/1" in _issue_result_body(
         92, "run-1", "https://github.com/example/pr/1", "fixed"
     )
+
+
+def test_pr_number_from_url_extracts_trailing_number() -> None:
+    assert _pr_number_from_url("https://github.com/owner/repo/pull/3205") == 3205
+    assert _pr_number_from_url("https://github.com/owner/repo/issues/92") is None
+
+
+def test_pr_result_body_links_the_originating_issue() -> None:
+    body = _pr_result_body(92, "run-1", "Implemented and pushed the issue fix.")
+    assert "Fixes #92." in body
+    assert "Implemented and pushed the issue fix." in body
+
+
+def test_finalize_posts_result_to_the_pr_when_one_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A successful run's detailed result must land on the PR it opened, not the issue."""
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    state = StateRepository(tmp_path / "state.db", "lear-bear", tmp_path)
+    service = IssueFixerService(
+        "lear-bear", project, IssueFixerConfig(), PrFixerConfig(), state
+    )
+    calls: list[tuple[Path, int, str]] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._publish_issue_comment",
+        lambda repo, number, body: calls.append((repo, number, body)) or True,
+    )
+    state.claim_run("issue-fixer", "issue-fix-92-abc123", metadata={"issue": 92})
+
+    result = service._finalize(
+        {
+            "number": 92,
+            "run_id": "issue-fix-92-abc123",
+            "claimed": True,
+            "skip": False,
+            "fixed": True,
+            "pr_url": "https://github.com/owner/repo/pull/3205",
+            "summary": "Implemented and pushed the issue fix.",
+            "validation": "exit=0",
+        }
+    )
+
+    assert result["fixed"] is True
+    assert len(calls) == 1
+    _, posted_number, posted_body = calls[0]
+    assert posted_number == 3205
+    assert "Fixes #92." in posted_body
+
+
+def test_finalize_posts_failure_to_the_issue_when_no_pr_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    state = StateRepository(tmp_path / "state.db", "lear-bear", tmp_path)
+    service = IssueFixerService(
+        "lear-bear", project, IssueFixerConfig(), PrFixerConfig(), state
+    )
+    calls: list[tuple[Path, int, str]] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._publish_issue_comment",
+        lambda repo, number, body: calls.append((repo, number, body)) or True,
+    )
+    state.claim_run("issue-fixer", "issue-fix-92-abc123", metadata={"issue": 92})
+
+    service._finalize(
+        {
+            "number": 92,
+            "run_id": "issue-fix-92-abc123",
+            "claimed": True,
+            "skip": False,
+            "fixed": False,
+            "pr_url": None,
+            "summary": "Agent did not produce a clean pushed fix.",
+            "validation": "exit=1",
+        }
+    )
+
+    assert len(calls) == 1
+    _, posted_number, _ = calls[0]
+    assert posted_number == 92
 
 
 def test_publish_issue_comment_posts_new_comment(
