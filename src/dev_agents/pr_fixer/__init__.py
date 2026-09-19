@@ -32,6 +32,7 @@ from ._shared import (
     _log,
 )
 from .comments import (
+    _auto_pause_body,
     _external_agent_pause_body,
     _fix_summary_body,
     _publish_fix_summary,
@@ -72,6 +73,7 @@ __all__ = [
     "PrFixerService",
     "Thread",
     "_agent_report",
+    "_auto_pause_body",
     "_cleanup_artifacts",
     "_external_agent_commit",
     "_external_agent_pause_body",

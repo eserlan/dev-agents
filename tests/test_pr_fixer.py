@@ -462,6 +462,93 @@ def test_failed_review_with_pushed_fix_uses_targeted_follow_up(tmp_path: Path) -
     assert plan["parent_run_id"] == run_id
 
 
+def test_failed_review_auto_pauses_after_max_consecutive_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run_id that keeps failing (e.g. the provider is out of quota) must stop
+    retrying and spamming comments once it hits the configured failure cap."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=database, max_consecutive_failures=3)
+    service = PrFixerService("demo", project, config)
+    run_id = "pr-review-42-sha"
+    service.state.claim_run(
+        "pr-review", run_id, metadata={"pull_request": 42, "head_sha": "sha", "review_round": 0}
+    )
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer.service._pkg._run",
+        lambda _repo, *args, **_kwargs: calls.append(args) or "",
+    )
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer.service._pkg._feedback",
+        lambda *_args: ({"headRefOid": "sha"}, []),
+    )
+
+    service._finalize(
+        {
+            "number": 42,
+            "workflow": "pr-review",
+            "run_id": run_id,
+            "claimed": True,
+            "review_only": True,
+            "review_round": 0,
+            "attempt": 3,
+            "fixed": False,
+            "meta": {"headRefOid": "sha"},
+            "report": {},
+        }
+    )
+
+    label_calls = [call for call in calls if call[:3] == ("gh", "pr", "edit")]
+    assert label_calls == [("gh", "pr", "edit", "42", "--add-label", "paused")]
+
+
+def test_failed_review_does_not_auto_pause_below_the_failure_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=database, max_consecutive_failures=3)
+    service = PrFixerService("demo", project, config)
+    run_id = "pr-review-42-sha"
+    service.state.claim_run(
+        "pr-review", run_id, metadata={"pull_request": 42, "head_sha": "sha", "review_round": 0}
+    )
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer.service._pkg._run",
+        lambda _repo, *args, **_kwargs: calls.append(args) or "",
+    )
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer.service._pkg._feedback",
+        lambda *_args: ({"headRefOid": "sha"}, []),
+    )
+
+    service._finalize(
+        {
+            "number": 42,
+            "workflow": "pr-review",
+            "run_id": run_id,
+            "claimed": True,
+            "review_only": True,
+            "review_round": 0,
+            "attempt": 2,
+            "fixed": False,
+            "meta": {"headRefOid": "sha"},
+            "report": {},
+        }
+    )
+
+    assert [call for call in calls if call[:3] == ("gh", "pr", "edit")] == []
+
+
 def test_superseded_review_does_not_exhaust_the_chain(tmp_path: Path) -> None:
     """A run whose accept_provider check detected a concurrent push (Jules, a
     human, or an overlapping run landing a new commit mid-review) must not be

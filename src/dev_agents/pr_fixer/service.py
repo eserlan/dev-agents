@@ -32,6 +32,7 @@ from dev_agents.runtime import (
 
 from ._shared import MAX_INTERNAL_REVIEW_ROUNDS, PR_FIX_PROVIDER, _log
 from .comments import (
+    _auto_pause_body,
     _external_agent_pause_body,
     _fix_summary_body,
     _publish_fix_summary,
@@ -60,6 +61,7 @@ class PrFixerRunState(TypedDict, total=False):
     unseen: list[str]
     state_path: Path
     run_id: str
+    attempt: int
     claimed: bool
     skip: bool
     fixed: bool
@@ -346,6 +348,7 @@ class PrFixerService:
             "state_path": state_path,
             "run_id": run_id,
             "workflow": workflow,
+            "attempt": claim.record.attempt,
             "review_only": review_only,
             "review_round": review_plan["round"] if review_only and review_plan else 0,
             "review_scope": review_plan["scope"] if review_only and review_plan else "full",
@@ -445,6 +448,31 @@ class PrFixerService:
             )
         return {"started": fixed, "fixed": fixed, "report": report, "report_url": report_url}
 
+    def _auto_pause_if_exhausted(
+        self, number: int, run_id: str, attempt: int, reason: str
+    ) -> None:
+        """Apply the `paused` label after too many consecutive failures on one run_id.
+
+        A "failed" run stays reclaimable (unlike "completed"/"rejected"), so a
+        persistent failure -- a provider quota outage, for example -- would
+        otherwise retry and re-comment forever on reconcile's poll interval.
+        """
+        if attempt < self.config.max_consecutive_failures:
+            return
+        try:
+            _pkg._run(self.project.repo, "gh", "pr", "edit", str(number), "--add-label", "paused")
+        except RuntimeError as error:
+            _log(f"auto-pause-label-failed pr={number} run_id={run_id} error={error}")
+            return
+        _pkg._publish_pr_run_comment(
+            self.project.repo,
+            number,
+            run_id,
+            "auto-paused",
+            _auto_pause_body(number, run_id, attempt, reason),
+        )
+        _log(f"auto-paused pr={number} run_id={run_id} attempt={attempt} reason={reason}")
+
     def _finalize(self, state: PrFixerRunState) -> dict[str, Any]:
         if state.get("skip") or not state.get("claimed"):
             return {"started": False}
@@ -532,6 +560,12 @@ class PrFixerService:
                         int(state.get("review_round", 0)),
                         failure="The review agent did not complete successfully; see the daemon log.",
                     ),
+                )
+                self._auto_pause_if_exhausted(
+                    number,
+                    state["run_id"],
+                    int(state.get("attempt", 1)),
+                    "the review agent kept failing",
                 )
                 return {"started": False}
             refreshed_meta, _ = _pkg._feedback(self.project.repo, number)
@@ -651,6 +685,12 @@ class PrFixerService:
                 state["run_id"],
                 status="failed",
                 error="agent did not complete the fix",
+            )
+            self._auto_pause_if_exhausted(
+                number,
+                state["run_id"],
+                int(state.get("attempt", 1)),
+                "the fix agent kept failing",
             )
             return {"started": False}
         slug = _pkg.repository_slug(self.project.repo)

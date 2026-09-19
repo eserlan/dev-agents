@@ -119,6 +119,10 @@ class PrFixerConfig(BaseModel):
     external_agent_resume_label: str = "dev-agents-resume"
     degodify_webhook_path: str = "/degodify"
     degodify_webhook_secret_env: str = "DEGODIFY_WEBHOOK_SECRET"
+    # After this many consecutive failed attempts at the same run_id (e.g. a
+    # provider quota outage), auto-apply the "paused" label instead of letting
+    # reconcile retry-and-comment on it forever.
+    max_consecutive_failures: int = 3
 
 
 class ProjectsConfig(BaseModel):

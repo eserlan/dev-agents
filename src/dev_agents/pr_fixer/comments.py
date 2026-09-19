@@ -28,6 +28,17 @@ Apply the `{resume_label}` label when the external agent is finished and you wan
 """
 
 
+def _auto_pause_body(number: int, run_id: str, attempt: int, reason: str) -> str:
+    return f"""<!-- dev-agents:pr-auto-paused run={run_id} -->
+### 🤖 Dev-agents auto-paused
+
+PR #{number} failed {attempt} consecutive automation attempts ({reason}), so dev-agents applied
+the `paused` label to stop retrying and posting duplicate comments here.
+
+Remove the `paused` label once the underlying issue is resolved to resume automation.
+"""
+
+
 def _report_line(report_url: str | None) -> str:
     return f"- Report: [Open this run in dev-agents report]({report_url})\n" if report_url else ""
 
