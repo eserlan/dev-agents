@@ -57,6 +57,24 @@ class ProjectConfig(BaseModel):
     release_comms: ReleaseCommsConfig | None = None
 
 
+class ContentQueueConfig(BaseModel):
+    """Opt-in configuration for cadence-driven social posts from a target
+    repo's own marketing backlog file (see ``dev_agents.workflows.content_queue``),
+    as distinct from release-comms's deploy-triggered drafting."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    log_path: str = ".social/bluesky-posts.md"
+    rules_issue: int | None = None
+    # How often the daemon checks whether today's post is still due -- not the
+    # posting cadence itself, which stays at most once/day via claim_run.
+    poll_seconds: int = 600
+    # Whether the scheduler may also turn a bare backlog item into a new
+    # Drafted entry (never auto-published) when nothing is ready to publish.
+    auto_draft: bool = False
+
+
 class ReleaseCommsConfig(BaseModel):
     """Opt-in configuration for the release communications workflow."""
 
@@ -86,6 +104,7 @@ class ReleaseCommsConfig(BaseModel):
     publication_delay_min_seconds: float = 900.0
     publication_delay_max_seconds: float = 1800.0
     scheduler_poll_seconds: int = 30
+    content_queue: ContentQueueConfig | None = None
 
 
 class PrFixerConfig(BaseModel):

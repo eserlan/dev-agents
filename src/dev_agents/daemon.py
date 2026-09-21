@@ -39,6 +39,14 @@ from dev_agents.pr_fixer import (
     _state_path,
 )
 from dev_agents.runtime import StateRepository, state_database_path
+from dev_agents.workflows.content_queue import (
+    draft_backlog_item,
+    next_backlog_item,
+    next_publishable_drafted,
+    parse_queue_file,
+    publish_drafted_item,
+    read_queue_file,
+)
 from dev_agents.workflows.degodify import DegodifyFile, run_degodify
 from dev_agents.workflows.release_comms import run_release_comms
 
@@ -561,12 +569,77 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
                 Thread(target=resume, daemon=True).start()
 
+    def content_queue_scheduler() -> None:
+        """Publish/draft from the target repo's marketing backlog file, at most
+        once per day, independent of any deploy or release-comms run."""
+        comms_config = project.release_comms
+        queue_config = comms_config.content_queue if comms_config is not None else None
+        if comms_config is None or queue_config is None or not queue_config.enabled:
+            return
+        state_path = state_database_path(
+            comms_config.state_path, project.repo / ".dev-agents/release-comms-state.db"
+        )
+        claims = StateRepository(state_path, project_name, project.repo)
+        interval = max(60, queue_config.poll_seconds)
+        while True:
+            time.sleep(interval)
+            today = datetime.now(UTC).date().isoformat()
+            run_id = f"content-queue-{today}"
+            claim = claims.claim_run("content-queue", run_id, metadata={})
+            if not claim.claimed:
+                continue
+
+            def run(run_id: str = run_id) -> None:
+                try:
+                    content, _ = read_queue_file(project, queue_config.log_path)
+                    queue = parse_queue_file(content)
+                    item = next_publishable_drafted(queue.drafted)
+                    if item is not None:
+                        result = publish_drafted_item(
+                            project=project,
+                            project_name=project_name,
+                            config=queue_config,
+                            item=item,
+                            dry_run=not comms_config.auto_publish,
+                            publish_approved=comms_config.auto_publish,
+                        )
+                        claims.complete_run(
+                            "content-queue",
+                            run_id,
+                            metadata={"heading": item.heading, "completed": result.completed},
+                        )
+                        _log(
+                            f"content-queue published heading={item.heading!r} completed={result.completed}"
+                        )
+                        return
+                    if queue_config.auto_draft:
+                        backlog_item = next_backlog_item(queue.backlog)
+                        if backlog_item is not None:
+                            log_dir = comms_config.log_dir or project.repo / ".dev-agents/release-comms"
+                            draft_backlog_item(
+                                project=project,
+                                item=backlog_item,
+                                config=queue_config,
+                                providers=comms_config.providers,
+                                log_dir=log_dir,
+                                run_id=f"content-queue-draft-{backlog_item.index}",
+                                timeout_seconds=comms_config.timeout_minutes * 60,
+                            )
+                            _log(f"content-queue drafted backlog item #{backlog_item.index}")
+                    claims.complete_run("content-queue", run_id, metadata={})
+                except Exception as error:  # noqa: BLE001 - scheduler keeps serving
+                    _log(f"content-queue error: {error}")
+                    claims.complete_run("content-queue", run_id, status="failed", error=str(error))
+
+            Thread(target=run, daemon=True).start()
+
     _log(f"listening on 127.0.0.1:{config.port}{config.webhook_path} for {project.github}")
     Thread(target=service.reconcile_loop, daemon=True).start()
     for issue_service in issue_services:
         Thread(target=issue_service.reconcile, daemon=True).start()
         Thread(target=issue_service.reconcile_loop, daemon=True).start()
     Thread(target=release_comms_scheduler, daemon=True).start()
+    Thread(target=content_queue_scheduler, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", config.port), Handler).serve_forever()
 
 

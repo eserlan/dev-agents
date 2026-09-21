@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dev_agents.config import (
     ConfigError,
+    ContentQueueConfig,
     ReleaseCommsConfig,
     load_projects_config,
     select_project,
@@ -21,6 +22,14 @@ from dev_agents.visualize import (
     deploy_report_to_vercel,
     render_report,
     write_report,
+)
+from dev_agents.workflows.content_queue import (
+    draft_backlog_item,
+    next_backlog_item,
+    next_publishable_drafted,
+    parse_queue_file,
+    publish_drafted_item,
+    read_queue_file,
 )
 from dev_agents.workflows.degodify import run_degodify
 from dev_agents.workflows.inspection import inspect_project
@@ -97,6 +106,18 @@ def build_parser() -> argparse.ArgumentParser:
     sync_reddit.add_argument(
         "--subreddit", help="Optional subreddit override (e.g. codexcryptica)"
     )
+    post_queue = comms_subcommands.add_parser(
+        "post-queue", help="Publish the next ready item from the content-queue backlog file"
+    )
+    post_queue.add_argument("project", help="Configured project name")
+    post_queue.add_argument("--config", type=Path, default=Path("config/projects.yaml"))
+    post_queue.add_argument("--publish", action="store_true", help="Publish for real (default: dry run)")
+    draft_queue = comms_subcommands.add_parser(
+        "draft-queue",
+        help="Draft the next backlog item into the content-queue file (never publishes)",
+    )
+    draft_queue.add_argument("project", help="Configured project name")
+    draft_queue.add_argument("--config", type=Path, default=Path("config/projects.yaml"))
     visualize = subcommands.add_parser(
         "visualize", help="Render LangGraph flows and persisted run timelines as HTML"
     )
@@ -274,6 +295,64 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (ConfigError, RepositoryError, RuntimeError) as error:
             parser.exit(2, f"error: {error}\n")
+    if arguments.command == "release-comms" and arguments.release_comms_command == "post-queue":
+        try:
+            config = load_projects_config(arguments.config)
+            project = select_project(config, arguments.project)
+            comms_config = project.release_comms or ReleaseCommsConfig()
+            queue_config = comms_config.content_queue or ContentQueueConfig()
+            content, _ = read_queue_file(project, queue_config.log_path)
+            item = next_publishable_drafted(parse_queue_file(content).drafted)
+            if item is None:
+                parser.exit(2, "error: no publishable item in the Drafted section\n")
+            queue_result = publish_drafted_item(
+                project=project,
+                project_name=arguments.project,
+                config=queue_config,
+                item=item,
+                dry_run=not arguments.publish,
+                publish_approved=arguments.publish,
+            )
+        except (ConfigError, RepositoryError, RuntimeError) as error:
+            parser.exit(2, f"error: {error}\n")
+        print(
+            json.dumps(
+                {
+                    "heading": item.heading,
+                    "published": queue_result.published,
+                    "completed": queue_result.completed,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0 if queue_result.completed else 1
+    if arguments.command == "release-comms" and arguments.release_comms_command == "draft-queue":
+        try:
+            config = load_projects_config(arguments.config)
+            project = select_project(config, arguments.project)
+            comms_config = project.release_comms or ReleaseCommsConfig()
+            queue_config = comms_config.content_queue or ContentQueueConfig()
+            content, _ = read_queue_file(project, queue_config.log_path)
+            backlog_item = next_backlog_item(parse_queue_file(content).backlog)
+            if backlog_item is None:
+                parser.exit(2, "error: no unblocked item in the Backlog section\n")
+            log_dir = comms_config.log_dir or project.repo / ".dev-agents/release-comms"
+            drafted = draft_backlog_item(
+                project=project,
+                item=backlog_item,
+                config=queue_config,
+                providers=comms_config.providers,
+                log_dir=log_dir,
+                run_id=f"content-queue-draft-{backlog_item.index}",
+                timeout_seconds=comms_config.timeout_minutes * 60,
+            )
+        except (ConfigError, RepositoryError, RuntimeError) as error:
+            parser.exit(2, f"error: {error}\n")
+        if drafted is None:
+            parser.exit(2, "error: the writer pass did not return a usable draft\n")
+        print(json.dumps({"heading": drafted.heading, "text": drafted.text, "link": drafted.link}, indent=2))
+        return 0
     if arguments.command == "visualize":
         try:
             config = load_projects_config(arguments.config)
