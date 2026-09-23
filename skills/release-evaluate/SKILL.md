@@ -39,6 +39,12 @@ House rules — err on the side of sharing:
 - importance: "high" for new tools, generators, or major features; "medium"
   for typical content batches and meaningful tool improvements; "low" for
   single small tweaks that still clear the bar.
+- Channels: any release featuring new or substantially updated answer, blog,
+  article, or guide pages MUST list `github_discussions` in `recommended_channels`.
+  That drives the long-form discussion post — one new page is enough, no minimum
+  batch. Add `reddit` too when the topic has broad GM/player interest (system
+  advice, campaign techniques, genre guides); skip `reddit` for narrow or
+  site-specific pages. Short-form coverage (bluesky/discord) is unchanged.
 
 Respond with ONLY a fenced ```json block shaped like:
 {"postworthy": true, "reason": "<one sentence>", "importance": "low|medium|high",
