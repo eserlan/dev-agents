@@ -190,6 +190,19 @@ _KIND_FRAMING = {
         "report_field": "what was implemented, or the concrete blocker",
         "title_prefix": "feat",
     },
+    "copy": {
+        "verb": "Address the copy review in",
+        "goal": "make the requested copy edits while preserving the intended meaning and voice",
+        "artifact": "copy changes",
+        "report_field": "what copy was changed, or the concrete blocker",
+        "title_prefix": "docs",
+        "guidance": """Treat this as a focused copyediting request. Locate the source passage in the
+target repository and use surrounding content for context. Make the requested editorial changes
+while preserving factual claims, game rules, character voice, terminology, Markdown structure,
+links, and formatting. Limit edits to the requested copy; do not make unrelated code or content
+changes. If the requested correction is ambiguous or cannot be verified from the repository,
+leave the copy unchanged and explain what needs clarification.""",
+    },
 }
 
 
@@ -227,11 +240,12 @@ Read and obey these repository instructions:
 Branch: {branch} (based on {base_branch})
 Merge-conflict paths: {conflict_text}
 
-Investigate the issue and {framing['goal']}. Treat security acceptance criteria
-as binding. Do not guess at production data or revoke legitimate access without evidence; make
-the code and migration safe for every deployment environment. Add focused tests, and use the
-target repository's optimized validation commands when available. Keep independent lint, test,
-and type-check commands parallel where practical.
+Investigate the issue and {framing['goal']}. Treat explicit acceptance criteria and target
+repository instructions as binding. Make the smallest complete change and keep it safe for every
+deployment environment. Add focused tests when behavior changes. Use the target repository's
+optimized validation commands when available, and keep independent checks parallel where practical.
+
+{framing.get('guidance', '')}
 
 Commit the {framing['artifact']} and push the branch to origin. Do not merge or close the issue/PR.
 If the issue is not safely actionable from the repository, leave the tree clean and explain the

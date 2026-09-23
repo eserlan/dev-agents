@@ -44,6 +44,15 @@ projects:
       branch_prefix: dev-agents/issue-
       timeout_minutes: 30
       max_open_issues: 5
+    # Separate editorial queue for copy review issues. Applying `copy-fix` starts
+    # a focused copy edit on staging and opens a PR for the normal review pipeline.
+    issue_fixers:
+      - label: copy-fix
+        kind: copy
+        base_branch: staging
+        branch_prefix: dev-agents/copy-fix-
+        timeout_minutes: 30
+        max_open_issues: 5
     # Required for the promote workflow's "Trigger Release Communications Agent"
     # step: without this block, POSTs to /release-comms are rejected with 401.
     release_comms:

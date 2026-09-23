@@ -21,11 +21,9 @@ class IssueFixerConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     label: str = "bug"
-    # "fix" frames the work as fixing a defect; "enhancement" frames it as
-    # implementing an improvement. Drives prompt wording and the PR title
-    # prefix ("fix: ..." vs "feat: ..."), not the validation/review pipeline,
-    # which is identical either way.
-    kind: Literal["fix", "enhancement"] = "fix"
+    # The kind frames the work and determines its PR title prefix; all kinds
+    # use the same isolated branch, validation, and review pipeline.
+    kind: Literal["fix", "enhancement", "copy"] = "fix"
     base_branch: str = "main"
     branch_prefix: str = "dev-agents/issue-"
     timeout_minutes: int = 30
