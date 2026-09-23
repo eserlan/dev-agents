@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 
+# Shared by PR review/fix and issue-fix queues, including GUI enhancements.
+CODEX_MODEL = "gpt-6-luna"
+
 
 @dataclass(frozen=True)
 class AgentResult:
@@ -48,7 +51,7 @@ def provider_command(
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             "-m",
-            "gpt-5.6-luna",
+            CODEX_MODEL,
             "-c",
             f'model_reasoning_effort="{reasoning_effort}"',
             prompt,
