@@ -102,6 +102,22 @@ issue_fixer:
   branch_prefix: dev-agents/issue-
 ```
 
+Additional queues can use their own label and work framing. For Codex Cryptica, the copy review
+queue is configured alongside the existing bug queue:
+
+```yaml
+issue_fixers:
+  - label: copy-fix
+    kind: copy
+    base_branch: staging
+    branch_prefix: dev-agents/copy-fix-
+```
+
+When an open issue in that repository receives the `copy-fix` label, Luna uses the issue and
+surrounding repository content to make the requested copy edits, preserves meaning and formatting,
+then pushes a branch and opens a PR against `staging`. Ambiguous editorial requests are reported
+without guessing. The normal PR review workflow handles the resulting PR.
+
 On startup and during reconciliation, open issues carrying the configured label are claimed in
 SQLite. Luna works in an isolated branch, runs the target repository's validation, pushes the
 branch, and opens a PR containing an issue marker. The normal PR review/fix workflow then owns
