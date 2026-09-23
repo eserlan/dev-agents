@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from dev_agents.runtime.agent import AgentResult, provider_command, run_agent, run_with_fallback
+from dev_agents.runtime.agent import (
+    CODEX_MODEL,
+    AgentResult,
+    provider_command,
+    run_agent,
+    run_with_fallback,
+)
 
 
 def test_codex_provider_command_uses_non_interactive_exec() -> None:
@@ -11,7 +17,7 @@ def test_codex_provider_command_uses_non_interactive_exec() -> None:
         "exec",
         "--dangerously-bypass-approvals-and-sandbox",
         "-m",
-        "gpt-5.6-luna",
+        CODEX_MODEL,
         "-c",
         'model_reasoning_effort="medium"',
         "fix it",

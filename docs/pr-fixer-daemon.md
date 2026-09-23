@@ -4,7 +4,8 @@ The daemon is designed to be a drop-in replacement for the existing `remotecc` P
 listener. It runs the Python listener under systemd and keeps Cloudflare Tunnel as a separate,
 dependent service. Secrets and tunnel credentials stay outside this repository.
 
-PR reviews and fixes are hard-pinned to Codex using the `gpt-5.6-luna` model. The PR-fixer
+PR reviews, PR fixes, and issue-fixer queues (including `gui-fix`) are hard-pinned to Codex
+using the `gpt-6-luna` model. The PR-fixer
 `providers` setting is retained for configuration compatibility, but it cannot enable fallback
 to another agent; `reasoning_effort` controls the Codex reasoning level and defaults to `high`.
 

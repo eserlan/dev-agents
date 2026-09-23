@@ -99,6 +99,13 @@ def test_writer_prompts_require_pageurl_evidence() -> None:
         assert "leave `pageUrl` empty" in body
 
 
+def test_evaluator_prompt_routes_answer_pages_to_longform() -> None:
+    body = load_skill_prompt("release-evaluate")
+    assert "one new page is enough" in body
+    assert "`github_discussions`" in body
+    assert "`reddit`" in body
+
+
 def test_render_template_leaves_unknown_braces() -> None:
     rendered = render_template("a {known} b {unknown} c", {"known": "X"})
     assert rendered == "a X b {unknown} c"
