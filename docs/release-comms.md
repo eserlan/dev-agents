@@ -93,8 +93,16 @@ SQLite, so a daemon restart resumes the queue without regenerating content.
 ## Avoiding repeat announcements
 
 Each promote run used to know only its own publications, so consecutive releases touching the
-same feature were announced again with different wording. Two layers now look back
-`recent_posts_days` days (14 by default) across earlier runs:
+same feature were announced again with different wording. The root cause is overlapping diffs:
+`previous_sha` comes from the last *successful* promote, so two releases in flight together both
+start from the same commit and the second re-evaluates everything in the first. A new run
+therefore starts its diff after the newest commit an earlier release-comms run already evaluated
+(when that commit is an ancestor of this release and newer than the promote-derived start).
+Failed runs are ignored, since they may never announce their range. The event log records the
+original value as `promote_previous_sha` whenever the start moves.
+
+Two more layers back that up, looking back `recent_posts_days` days (14 by default) across
+earlier runs:
 
 1. **Prompt history.** The evaluator and both writers receive a "recently announced" block (page,
    channels, first line of what was said). The evaluator must treat a listed feature as not

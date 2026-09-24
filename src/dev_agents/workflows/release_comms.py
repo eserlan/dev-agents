@@ -36,7 +36,9 @@ from dev_agents.workflows.release_content import (
 )
 from dev_agents.workflows.release_history import (
     Announcement,
+    earlier_release_shas,
     format_recent_posts,
+    narrow_previous_sha,
     recent_announcements,
     repeated_publication_keys,
 )
@@ -97,6 +99,7 @@ class ReleaseCommsState(TypedDict, total=False):
     publications: dict[str, Any]
     existing_publications: list[Any]
     recent_announcements: list[Announcement]
+    handled_shas: list[str]
     publication_sink: Callable[[PublicationReceipt], None]
     dry_run: bool
     publish_approved: bool
@@ -226,7 +229,16 @@ def build_release_comms_workflow() -> Any:
         repo = state["repo"]
         promote_run_id = state["promote_run_id"]
         new_sha, previous_sha = resolve_promote_shas(repo, promote_run_id)
-        _emit(state, "resolved", {"new_sha": new_sha, "previous_sha": previous_sha})
+        promote_previous = previous_sha
+        # Do not re-evaluate commits an earlier release already announced (see
+        # narrow_previous_sha); pinned below like any other first resolution.
+        previous_sha = narrow_previous_sha(
+            repo, previous_sha, new_sha, state.get("handled_shas", [])
+        )
+        payload: dict[str, Any] = {"new_sha": new_sha, "previous_sha": previous_sha}
+        if previous_sha != promote_previous:
+            payload["promote_previous_sha"] = promote_previous
+        _emit(state, "resolved", payload)
         return {
             "new_sha": new_sha,
             "previous_sha": previous_sha,
@@ -805,6 +817,7 @@ def run_release_comms(
             "existing_publications": repository.list_run_publications(
                 "release-comms", str(promote_run_id)
             ),
+            "handled_shas": earlier_release_shas(repository, exclude_run_id=str(promote_run_id)),
             "recent_announcements": recent_announcements(
                 repository, exclude_run_id=str(promote_run_id), days=config.recent_posts_days
             ),
