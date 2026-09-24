@@ -16,6 +16,12 @@ Features:
 Files changed:
 {files_changed}
 
+Already posted in the last two weeks (page, channels, what was said):
+{recent_posts}
+
+Do not reuse the opening, phrasing, or angle of anything above, and do not
+write about a feature that appears there; it has already been announced.
+
 Default shape (lean announcement, not a devlog):
 1. Open with one specific GM, player, or builder problem in plain language.
 2. State the feature's single distinct idea in one sentence.

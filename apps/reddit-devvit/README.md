@@ -30,6 +30,20 @@ Submissions made by `dev-agent-publisher` include the following standard footer 
 <!-- id:<source_id> -->
 ```
 
+## How posts are submitted
+
+When a candidate has a page `url`, the app submits that page as a **link post** and adds the
+write-up as the first comment. Reddit shows the page's own preview image (its `og:image`), so no
+image is uploaded or linked from the app, which avoids image-hosting restrictions. The
+"View Illustration" link that the pipeline adds to the body is dropped from the comment for the
+same reason. If the comment fails after the post is created, the failure is logged and the
+candidate is still marked posted, so it is never submitted twice.
+
+Candidates with no `url` fall back to a text post, with the image (if any) as a plain link.
+
+Because the `<!-- id:... -->` tag now lives in the comment rather than the post, dev-agents
+reconciles link posts by the URL they were submitted with.
+
 ## Fetch Domains
 
 * `raw.githubusercontent.com`: Used by the companion app to pull approved announcement candidate JSON manifests (`announcements/reddit-candidates.json`) staged by the release pipeline for automated community publication.

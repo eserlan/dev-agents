@@ -102,6 +102,9 @@ class ReleaseCommsConfig(BaseModel):
     publication_delay_min_seconds: float = 900.0
     publication_delay_max_seconds: float = 1800.0
     scheduler_poll_seconds: int = 30
+    # How far back earlier releases' announcements count as "already posted": they are shown
+    # to the evaluator and writers, and publishing skips repeats of the same page.
+    recent_posts_days: int = 14
     content_queue: ContentQueueConfig | None = None
 
 

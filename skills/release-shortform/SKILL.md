@@ -16,6 +16,12 @@ Features:
 Files changed:
 {files_changed}
 
+Already posted in the last two weeks (page, channels, what was said):
+{recent_posts}
+
+Do not reuse the opening, phrasing, or angle of anything above, and do not
+write about a feature that appears there; it has already been announced.
+
 Every post follows this four-part arc, in order — don't skip parts:
 1. **Need / problem** — open with the campaign or worldbuilding itch, not the
    feature name.

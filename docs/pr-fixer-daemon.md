@@ -35,6 +35,13 @@ Completed run logs are retained for 30 days by default. Stale temporary worktree
 than two days are removed at daemon startup; active/recent worktrees are left alone. Adjust
 `log_retention_days` and `worktree_retention_days` in the project configuration if needed.
 
+Agent processes run with `TMPDIR=~/.cache/dev-agents/tmp` instead of `/tmp`. Validation tooling the
+agents invoke (node, bunx, `fallow audit`, ...) caches under `$TMPDIR` and never cleans up after
+itself; on a typical desktop `/tmp` is RAM-backed and often quota-limited, and these caches filled
+it until unrelated tools (including the shell) failed with "Disk quota exceeded". After each agent
+run, entries in that directory untouched for 24 hours are removed. Only agent subprocesses are
+redirected; the daemon's own temporary files are unchanged.
+
 When a target repository provides `scripts/affected-workspaces.mjs`, `scripts/lint-changed.mjs`,
 and `scripts/test-changed.mjs`, remediation and review prompts require Luna to follow that
 repository's CI scope selection. Ordinary PRs run the changed-file lint/test validators and the

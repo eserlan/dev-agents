@@ -447,9 +447,15 @@ def fetch_subreddit_posts(
             "source_id": source_match.group(1) if source_match else "",
             "permalink": permalink,
             "url": post_url or str(item.get("url", "")),
+            # For a link post this is the submitted page; for a text post it is the permalink.
+            "link_url": str(item.get("url", "")),
             "created_utc": item.get("created_utc"),
         })
     return posts
+
+
+def _same_page_url(left: str, right: str) -> bool:
+    return bool(left and right) and left.strip().rstrip("/") == right.strip().rstrip("/")
 
 
 def sync_reddit_status(
@@ -517,7 +523,11 @@ def sync_reddit_status(
                 matched_post = post
                 break
             if pub.page_url and (
-                pub.page_url in post.get("selftext", "") or pub.page_url in post.get("url", "")
+                pub.page_url in post.get("selftext", "")
+                or pub.page_url in post.get("url", "")
+                # Link posts carry the page as the post's link and have no id tag in their
+                # body (the write-up is a comment), so match on the submitted URL.
+                or _same_page_url(pub.page_url, str(post.get("link_url", "")))
             ):
                 matched_post = post
                 break

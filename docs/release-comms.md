@@ -90,6 +90,23 @@ The daemon resumes scheduled runs every `scheduler_poll_seconds` (30 seconds by
 default). The scheduled run stores its drafts, image URLs, and next wake time in
 SQLite, so a daemon restart resumes the queue without regenerating content.
 
+## Avoiding repeat announcements
+
+Each promote run used to know only its own publications, so consecutive releases touching the
+same feature were announced again with different wording. Two layers now look back
+`recent_posts_days` days (14 by default) across earlier runs:
+
+1. **Prompt history.** The evaluator and both writers receive a "recently announced" block (page,
+   channels, first line of what was said). The evaluator must treat a listed feature as not
+   postworthy again, including follow-up fixes and URL moves, and returns `postworthy: false`
+   when everything user-facing was already covered.
+2. **Publish guard.** Before publishing, any draft whose page URL ends in the same path segment
+   as an earlier announcement is skipped on the channels that carried it (so `/tools/x` and
+   `/generators/x` count as one page). The skip is recorded as a `repeat_suppressed` event on
+   the run, listing the channels and earlier run IDs. Because only the last path segment is
+   compared, two different pages that share a slug (say `/blog/tips` and `/answers/tips`) are
+   treated as one; that fails toward not posting.
+
 ## Pinterest setup
 
 Pinterest is an opt-in destination (`publish_pinterest` in `release_publish.py`), wired the
@@ -166,4 +183,5 @@ projects:
       auto_publish: false
       webhook_path: /release-comms
       webhook_secret_env: RELEASE_COMMS_WEBHOOK_SECRET
+      recent_posts_days: 14   # lookback for the repeat-announcement checks
 ```

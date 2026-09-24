@@ -66,6 +66,15 @@ report_vercel_scope: your-team-slug
 report_vercel_alias: flow.example.com
 ```
 
+Projects that set the same `report_vercel_alias` (or, without an alias, the same
+`report_vercel_project`) share one combined report. Each refresh registers its project under
+`~/.local/state/dev-agents/shared-reports/<destination>/projects/`, renders every project
+registered there within the last day from its own SQLite state, and deploys the combined
+`dev-agents-flow.html` from that directory. Upload throttling and the deploy lock are therefore
+shared per destination instead of per project, so separate daemons no longer overwrite each other's
+report. The run index gains a Project column and filter; run links carry `&project=<name>` because
+run IDs are only unique within a project.
+
 The worker deploys a directory containing only the report as `index.html` after the local file
 is written. The upload runs in the detached report worker and is best-effort; a missing CLI,
 login, token, or failed upload never changes the workflow result. If using a token, put it in

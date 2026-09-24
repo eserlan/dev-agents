@@ -20,7 +20,7 @@ from dev_agents.runtime import StateRepository, state_database_path
 from dev_agents.visualize import (
     WORKFLOW_NAMES,
     deploy_report_to_vercel,
-    render_report,
+    render_projects_report,
     write_report,
 )
 from dev_agents.workflows.content_queue import (
@@ -357,9 +357,16 @@ def main(argv: list[str] | None = None) -> int:
         try:
             config = load_projects_config(arguments.config)
             project = select_project(config, arguments.project)
-            report = render_report(
-                arguments.project,
-                project,
+            # Projects publishing to the same report destination share one combined report.
+            destination = project.report_vercel_alias or project.report_vercel_project
+            projects = {arguments.project: project} | {
+                name: peer
+                for name, peer in config.projects.items()
+                if destination
+                and (peer.report_vercel_alias or peer.report_vercel_project) == destination
+            }
+            report = render_projects_report(
+                projects,
                 workflow=arguments.workflow,
                 limit=arguments.limit,
             )

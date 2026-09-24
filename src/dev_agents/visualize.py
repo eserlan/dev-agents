@@ -53,7 +53,9 @@ def default_report_path(project_name: str) -> Path:
     return Path.home() / ".local/state/dev-agents" / project_name / "dev-agents-flow.html"
 
 
-def report_run_url(project: ProjectConfig, workflow: str, run_id: str) -> str | None:
+def report_run_url(
+    project: ProjectConfig, workflow: str, run_id: str, *, project_name: str | None = None
+) -> str | None:
     """Return a stable report URL focused on one persisted workflow run."""
     host = project.report_vercel_alias or project.report_vercel_project
     if not host:
@@ -62,7 +64,72 @@ def report_run_url(project: ProjectConfig, workflow: str, run_id: str) -> str | 
     if not base.startswith(("http://", "https://")):
         domain = base if "." in base else f"{base}.vercel.app"
         base = f"https://{domain}"
-    return f"{base}?{urlencode({'workflow': workflow, 'run': run_id})}"
+    parameters = {"workflow": workflow, "run": run_id}
+    if project_name:
+        # Run IDs are only unique per project once several projects share one report.
+        parameters["project"] = project_name
+    return f"{base}?{urlencode(parameters)}"
+
+
+def _shared_report_key(project: ProjectConfig) -> str | None:
+    """Return the public destination whose report this project contributes to, if any."""
+    return project.report_vercel_alias or project.report_vercel_project
+
+
+def _shared_report_root() -> Path:
+    return Path.home() / ".local/state/dev-agents/shared-reports"
+
+
+def _report_slug(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "report"
+
+
+def _shared_report_dir(key: str) -> Path:
+    return _shared_report_root() / _report_slug(key)
+
+
+def _register_report_project(directory: Path, project_name: str, project: ProjectConfig) -> None:
+    """Record this project's configuration so peer daemons can include its state."""
+    projects_dir = directory / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "project_name": project_name,
+        "project": project.model_dump(mode="json"),
+        "registered_at": datetime.now(UTC).isoformat(),
+    }
+    path = projects_dir / f"{_report_slug(project_name)}.json"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(entry, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _shared_report_projects(
+    directory: Path, key: str, project_name: str, project: ProjectConfig
+) -> dict[str, ProjectConfig]:
+    """Return the calling project plus every peer registered for the same destination.
+
+    Registrations older than the report retention window are ignored: such a project has no
+    runs recent enough to show, and this keeps removed projects from lingering forever.
+    """
+    projects = {project_name: project}
+    now = datetime.now(UTC)
+    for path in sorted((directory / "projects").glob("*.json")):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            name = str(entry["project_name"])
+            peer = ProjectConfig.model_validate(entry["project"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        registered_at = _parse_report_deploy_time(entry.get("registered_at"))
+        if (
+            name in projects
+            or registered_at is None
+            or now - registered_at > REPORT_DELETE_AFTER
+            or _shared_report_key(peer) != key
+        ):
+            continue
+        projects[name] = peer
+    return projects
 
 
 def refresh_report_run_url(
@@ -80,7 +147,7 @@ def refresh_report_run_url(
         print(f"Report refresh before comment failed: {error}", file=sys.stderr)
         return None
     deploy_report_to_vercel(project, report)
-    return report_run_url(project, workflow, run_id)
+    return report_run_url(project, workflow, run_id, project_name=project_name)
 
 
 def write_report(output: Path, report: str) -> Path:
@@ -103,12 +170,29 @@ def refresh_project_report(
     output: Path | None = None,
     limit: int = 50,
 ) -> Path:
-    """Generate the project report from its latest state and return its path."""
+    """Generate the project report from its latest state and return the path to deploy.
+
+    Projects that publish to the same Vercel destination share one combined report: each
+    refresh registers the project, renders every registered peer's state alongside it, and
+    returns a shared report path so upload throttling and locking are shared as well.
+    """
     destination = output or default_report_path(project_name)
-    return write_report(
-        destination,
-        render_report(project_name, project, limit=limit),
+    key = _shared_report_key(project)
+    if key is None:
+        return write_report(destination, render_report(project_name, project, limit=limit))
+    shared_dir = _shared_report_dir(key)
+    _register_report_project(shared_dir, project_name, project)
+    report = render_projects_report(
+        _shared_report_projects(shared_dir, key, project_name, project), limit=limit
     )
+    deployed = write_report(shared_dir / "dev-agents-flow.html", report)
+    try:
+        write_report(destination, report)
+    except OSError as error:
+        # The local copy may live on a full or quota-limited volume (e.g. /tmp); the shared
+        # report that gets deployed must not depend on it.
+        print(f"Local report write failed for {destination}: {error}", file=sys.stderr)
+    return deployed
 
 
 def _parse_report_deploy_time(value: Any) -> datetime | None:
@@ -749,9 +833,13 @@ const pubChannelSummary = document.querySelector('#pub-channel-summary');
 const pubSummary = document.querySelector('#pub-summary');
 const pubColumns = document.querySelector('#pub-columns');
 const pubRows = document.querySelector('#pub-rows');
+const indexProject = document.querySelector('#index-project');
 const reportParams = new URLSearchParams(window.location.search);
 const requestedWorkflow = reportParams.get('workflow') || '';
 const requestedRun = reportParams.get('run') || reportParams.get('run_id') || '';
+const requestedProject = reportParams.get('project') || '';
+const reportProjects = report.projects || [];
+const multiProject = reportProjects.length > 1;
 let reportView = reportParams.get('view') === 'release-comms' || requestedWorkflow === 'release-comms' ? 'release-comms' : 'daemon';
 let currentWorkflow = report.workflows[0] || {name: '', graph: {nodes: [], edges: []}, runs: []};
 let currentRun = null;
@@ -773,6 +861,7 @@ const pubColumnDefinitions = [
 ];
 const indexColumnDefinitions = [
   {key: 'status', label: 'Status'},
+  {key: 'project_name', label: 'Project'},
   {key: 'workflow', label: 'Workflow'},
   {key: 'run_id', label: 'Run'},
   {key: 'started_at', label: 'Started'},
@@ -786,6 +875,14 @@ function escapeHtml(value) {
 }
 function pretty(value) { return escapeHtml(JSON.stringify(value ?? {}, null, 2)); }
 function findWorkflow(name) { return report.workflows.find(item => item.name === name) || null; }
+function findRun(project, workflow, runId) { return (report.allRuns || []).find(run => run.project_name === project && run.workflow === workflow && run.run_id === runId) || null; }
+function runKey(run) { return JSON.stringify([run.project_name, run.run_id]); }
+function projectPrefix(run) { return multiProject ? `${escapeHtml(run.project_name)} · ` : ''; }
+function renderProjectOptions() {
+  indexProject.innerHTML = '<option value="">All projects</option>' + reportProjects.map(project => `<option value="${escapeHtml(project)}">${escapeHtml(project)}</option>`).join('');
+  indexProject.hidden = !multiProject;
+  if (requestedProject && reportProjects.includes(requestedProject)) indexProject.value = requestedProject;
+}
 function reportWorkflowNames() {
   const names = [...new Set([
     ...(report.workflows || []).map(workflow => workflow.name),
@@ -894,25 +991,26 @@ function renderIndexColumns() {
 }
 function formatRunDetails(run) {
   const publications = (run.publications || []).map(publication => `<div class="publication-detail"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b>${publication.destination ? ` · ${escapeHtml(publication.destination)}` : ''}${publication.public_url ? ` · <a href="${escapeHtml(publication.public_url)}" target="_blank" rel="noreferrer">${escapeHtml(publication.public_url)}</a>` : ''}${publication.page_url ? `<small>${escapeHtml(publication.page_url)}</small>` : ''}${publication.error ? `<p class="error">${escapeHtml(publication.error)}</p>` : ''}</div>`).join('');
-  return `<div class="run-title"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${escapeHtml(run.workflow)} / ${escapeHtml(run.run_id)}</b></div><p>Started ${escapeHtml(run.started_at)} · completed ${escapeHtml(run.completed_at || '—')} · duration ${escapeHtml(duration(run))}</p>${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}<details><summary>Run metadata</summary><pre>${pretty(run.metadata)}</pre></details><h3>Publications (${publicationCount(run)})</h3>${publications || '<p>No publication receipts recorded.</p>'}<h3>Events (${run.events.length})</h3>${run.events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.node)}</b> · ${escapeHtml(event.event)} <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}</time><pre>${pretty(event.metadata)}</pre></div>`).join('') || '<p>No recorded events.</p>'}`;
+  return `<div class="run-title"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${projectPrefix(run)}${escapeHtml(run.workflow)} / ${escapeHtml(run.run_id)}</b></div><p>Started ${escapeHtml(run.started_at)} · completed ${escapeHtml(run.completed_at || '—')} · duration ${escapeHtml(duration(run))}</p>${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}<details><summary>Run metadata</summary><pre>${pretty(run.metadata)}</pre></details><h3>Publications (${publicationCount(run)})</h3>${publications || '<p>No publication receipts recorded.</p>'}<h3>Events (${run.events.length})</h3>${run.events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.node)}</b> · ${escapeHtml(event.event)} <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}</time><pre>${pretty(event.metadata)}</pre></div>`).join('') || '<p>No recorded events.</p>'}`;
 }
 function openIndexedRun(run) {
   const workflow = findWorkflow(run.workflow);
   if (workflow && isRecentRun(run)) {
-    workflowSelect.value = workflow.name; updateWorkflow(); runSelect.value = run.run_id; updateRun(); document.querySelector('.explorer').scrollIntoView({behavior: 'smooth', block: 'start'}); return;
+    workflowSelect.value = workflow.name; updateWorkflow(); runSelect.value = runKey(run); updateRun(); document.querySelector('.explorer').scrollIntoView({behavior: 'smooth', block: 'start'}); return;
   }
   indexDetails.hidden = false; indexDetails.innerHTML = formatRunDetails(run); indexDetails.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 function indexRowMarkup(run) {
-  return `<button class="index-row" data-workflow="${escapeHtml(run.workflow)}" data-run="${escapeHtml(run.run_id)}"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${escapeHtml(run.workflow)}</b><code>${escapeHtml(run.run_id)}</code><time>${escapeHtml(run.started_at)}</time><span>${escapeHtml(duration(run))}</span><span>${escapeHtml(publicationCount(run))} published</span><small>${escapeHtml(run.database_path.split('/').pop())}</small></button>`;
+  return `<button class="index-row" data-project="${escapeHtml(run.project_name)}" data-workflow="${escapeHtml(run.workflow)}" data-run="${escapeHtml(run.run_id)}"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><small class="project">${escapeHtml(run.project_name)}</small><b>${escapeHtml(run.workflow)}</b><code>${escapeHtml(run.run_id)}</code><time>${escapeHtml(run.started_at)}</time><span>${escapeHtml(duration(run))}</span><span>${escapeHtml(publicationCount(run))} published</span><small>${escapeHtml(run.database_path.split('/').pop())}</small></button>`;
 }
 function bindIndexRows() {
-  indexRows.querySelectorAll('.index-row').forEach(row => row.addEventListener('click', () => openIndexedRun((report.allRuns || []).find(run => run.workflow === row.dataset.workflow && run.run_id === row.dataset.run) || null)));
+  indexRows.querySelectorAll('.index-row').forEach(row => row.addEventListener('click', () => openIndexedRun(findRun(row.dataset.project, row.dataset.workflow, row.dataset.run))));
 }
 function renderIndex() {
-  const query = indexSearch.value.trim().toLowerCase(), status = indexStatus.value, workflows = selectedIndexWorkflows();
+  const query = indexSearch.value.trim().toLowerCase(), status = indexStatus.value, workflows = selectedIndexWorkflows(), project = indexProject.value;
   const filtered = (report.allRuns || []).filter(run => {
-    const searchable = `${run.workflow} ${run.run_id} ${run.delivery_id || ''} ${run.error || ''} ${JSON.stringify(run.metadata)} ${run.events.map(event => `${event.node} ${event.event}`).join(' ')}`.toLowerCase();
+    if (project && run.project_name !== project) return false;
+    const searchable = `${run.project_name} ${run.workflow} ${run.run_id} ${run.delivery_id || ''} ${run.error || ''} ${JSON.stringify(run.metadata)} ${run.events.map(event => `${event.node} ${event.event}`).join(' ')}`.toLowerCase();
     return (!query || searchable.includes(query)) && (!status || run.status === status) && workflows.has(run.workflow);
   });
   const failed = filtered.filter(run => ['failed', 'error'].includes(run.status)).length;
@@ -967,15 +1065,15 @@ function renderPubColumns() {
 }
 function pubRowMarkup(publication) {
   const content = pubContent(publication);
-  return `<button class="index-row pub-row" data-workflow="${escapeHtml(publication.workflow)}" data-run="${escapeHtml(publication.run_id)}"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b><span>${escapeHtml(publication.destination || '—')}</span>${content ? `<a href="${escapeHtml(content)}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">${escapeHtml(content)}</a>` : '<span>—</span>'}<time>${escapeHtml(publication.published_at)}</time><code>${escapeHtml(publication.workflow)}/${escapeHtml(publication.run_id)}</code></button>`;
+  return `<button class="index-row pub-row" data-project="${escapeHtml(publication.project_name)}" data-workflow="${escapeHtml(publication.workflow)}" data-run="${escapeHtml(publication.run_id)}"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b><span>${escapeHtml(publication.destination || '—')}</span>${content ? `<a href="${escapeHtml(content)}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">${escapeHtml(content)}</a>` : '<span>—</span>'}<time>${escapeHtml(publication.published_at)}</time><code>${projectPrefix(publication)}${escapeHtml(publication.workflow)}/${escapeHtml(publication.run_id)}</code></button>`;
 }
 function bindPubRows() {
-  pubRows.querySelectorAll('.pub-row').forEach(row => row.addEventListener('click', () => openIndexedRun((report.allRuns || []).find(run => run.workflow === row.dataset.workflow && run.run_id === row.dataset.run) || null)));
+  pubRows.querySelectorAll('.pub-row').forEach(row => row.addEventListener('click', () => openIndexedRun(findRun(row.dataset.project, row.dataset.workflow, row.dataset.run))));
 }
 function renderPublications() {
   const query = pubSearch.value.trim().toLowerCase(), status = pubStatus.value, channels = selectedPubChannels();
   const filtered = (report.allPublications || []).filter(publication => {
-    const searchable = `${publication.destination} ${publication.page_url} ${publication.public_url || ''} ${publication.run_id} ${publication.error || ''}`.toLowerCase();
+    const searchable = `${publication.project_name} ${publication.destination} ${publication.page_url} ${publication.public_url || ''} ${publication.run_id} ${publication.error || ''}`.toLowerCase();
     return (!query || searchable.includes(query)) && (!status || publication.status === status) && channels.has(publication.channel);
   });
   const failed = filtered.filter(publication => ['failed', 'error'].includes(publication.status)).length;
@@ -1035,13 +1133,13 @@ function updateDetails() {
   nodeDetails.innerHTML = `<h3>${escapeHtml(nodeLabel(node || {label: selectedNode}))}</h3>` + (publicationMarkup ? `<h4>Publication receipts</h4>${publicationMarkup}` : '') + (events.length ? `<h4>Events</h4>${events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.event)}</b> <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}${event.completed_at && event.completed_at !== event.started_at ? ` → ${escapeHtml(event.completed_at)}` : ''}</time><pre>${pretty(event.metadata)}</pre></div>`).join('')}` : '<p>No recorded events for this node in the selected run.</p>');
 }
 function updateRun() {
-  currentRun = currentWorkflow.runs.find(run => run.run_id === runSelect.value) || null; selectedNode = null; emptyState.hidden = Boolean(currentRun);
+  currentRun = currentWorkflow.runs.find(run => runKey(run) === runSelect.value) || null; selectedNode = null; emptyState.hidden = Boolean(currentRun);
   if (!currentRun) { runSummary.innerHTML = '<p>No persisted runs for this workflow.</p>'; eventList.innerHTML = ''; updateDetails(); draw(); return; }
-  runSummary.innerHTML = `<div class="run-title"><span class="status ${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span><b>${escapeHtml(currentRun.run_id)}</b></div><p>Started ${escapeHtml(currentRun.started_at)} · completed ${escapeHtml(currentRun.completed_at || '—')} · attempt ${escapeHtml(currentRun.attempt)}</p>${currentRun.error ? `<p class="error">${escapeHtml(currentRun.error)}</p>` : ''}<details><summary>Run metadata</summary><pre>${pretty(currentRun.metadata)}</pre></details>`;
+  runSummary.innerHTML = `<div class="run-title"><span class="status ${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span><b>${projectPrefix(currentRun)}${escapeHtml(currentRun.run_id)}</b></div><p>Started ${escapeHtml(currentRun.started_at)} · completed ${escapeHtml(currentRun.completed_at || '—')} · attempt ${escapeHtml(currentRun.attempt)}</p>${currentRun.error ? `<p class="error">${escapeHtml(currentRun.error)}</p>` : ''}<details><summary>Run metadata</summary><pre>${pretty(currentRun.metadata)}</pre></details>`;
   eventList.innerHTML = currentRun.events.length ? currentRun.events.map(event => `<button class="event-row" data-node="${escapeHtml(event.node)}"><span>${escapeHtml(event.sequence)}</span><b>${escapeHtml(event.node)}</b><span>${escapeHtml(event.event)}</span><i class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</i></button>`).join('') : '<p>No node events recorded.</p>';
   eventList.querySelectorAll('.event-row').forEach(button => button.addEventListener('click', () => { selectedNode = button.dataset.node; updateDetails(); draw(); })); updateDetails(); draw();
 }
-function updateWorkflow() { currentWorkflow = findWorkflow(workflowSelect.value); runSelect.innerHTML = currentWorkflow.runs.map(run => `<option value="${escapeHtml(run.run_id)}">${escapeHtml(run.status)} · ${escapeHtml(run.run_id)}</option>`).join(''); rebuildLayout(); updateRun(); }
+function updateWorkflow() { currentWorkflow = findWorkflow(workflowSelect.value); runSelect.innerHTML = currentWorkflow.runs.map(run => `<option value="${escapeHtml(runKey(run))}">${projectPrefix(run)}${escapeHtml(run.status)} · ${escapeHtml(run.run_id)}</option>`).join(''); rebuildLayout(); updateRun(); }
 function resetView() { zoom = 1; pan = {x: 18, y: canvas.clientHeight / 2}; draw(); }
 canvas.addEventListener('click', event => {
   if (dragStart && Math.hypot(event.clientX - dragStart.x, event.clientY - dragStart.y) > 4) return;
@@ -1054,10 +1152,11 @@ canvas.addEventListener('pointermove', event => { if (dragging) { pan.x += event
 canvas.addEventListener('pointerup', event => { dragging = false; canvas.releasePointerCapture(event.pointerId); });
 canvas.addEventListener('wheel', event => { event.preventDefault(); const factor = event.deltaY < 0 ? 1.1 : 0.9, bounds = canvas.getBoundingClientRect(), before = worldPoint(event.clientX - bounds.left, event.clientY - bounds.top); zoom = Math.max(.45, Math.min(2.5, zoom * factor)); pan.x = event.clientX - bounds.left - before.x * zoom; pan.y = event.clientY - bounds.top - before.y * zoom; draw(); }, {passive: false});
 workflowSelect.addEventListener('change', updateWorkflow); runSelect.addEventListener('change', updateRun); document.querySelector('#reset-view').addEventListener('click', resetView); window.addEventListener('resize', resizeCanvas);
-indexSearch.addEventListener('input', renderIndex); indexStatus.addEventListener('change', renderIndex);
+indexSearch.addEventListener('input', renderIndex); indexStatus.addEventListener('change', renderIndex); indexProject.addEventListener('change', renderIndex);
 pubSearch.addEventListener('input', renderPublications); pubStatus.addEventListener('change', renderPublications);
 document.querySelector('#daemon-tab').addEventListener('click', () => setReportView('daemon'));
 document.querySelector('#release-comms-tab').addEventListener('click', () => setReportView('release-comms'));
+renderProjectOptions();
 renderIndexColumns();
 renderPubChannelOptions();
 renderPubColumns();
@@ -1072,8 +1171,9 @@ renderIndex();
 if (requestedWorkflow && findWorkflow(requestedWorkflow) && reportWorkflowNames().includes(requestedWorkflow)) {
   workflowSelect.value = requestedWorkflow;
   updateWorkflow();
-  if (requestedRun && currentWorkflow.runs.some(run => run.run_id === requestedRun)) {
-    runSelect.value = requestedRun;
+  const requestedMatch = requestedRun ? currentWorkflow.runs.find(run => run.run_id === requestedRun && (!requestedProject || run.project_name === requestedProject)) : null;
+  if (requestedMatch) {
+    runSelect.value = runKey(requestedMatch);
     updateRun();
   }
 }
@@ -1090,7 +1190,7 @@ def _interactive_app(data: dict[str, Any]) -> str:
     </nav>
     <section id="index-panel" class="run-index" role="tabpanel" aria-labelledby="daemon-tab">
       <div class="index-header"><div><h2>Daemon run index</h2><p class="subtitle">Recent jobs are visible; jobs older than 1 hour are collapsed. Report messages older than 1 day are omitted.</p></div><strong id="index-summary"></strong></div>
-      <div class="index-filters"><input id="index-search" type="search" placeholder="Search run, event, PR, error…" aria-label="Search daemon runs"><details id="index-workflow-filter" class="workflow-filter"><summary>Workflows: <span id="index-workflow-summary">All workflows</span></summary><div id="index-workflow-options" class="workflow-options" role="group" aria-label="Filter by workflow"></div></details><select id="index-status" aria-label="Filter by status"><option value="">All statuses</option><option value="completed">completed</option><option value="rejected">rejected</option><option value="failed">failed</option><option value="running">running</option><option value="pending">pending</option><option value="scheduled">scheduled</option></select></div>
+      <div class="index-filters"><input id="index-search" type="search" placeholder="Search run, event, PR, error…" aria-label="Search daemon runs"><select id="index-project" aria-label="Filter by project" hidden><option value="">All projects</option></select><details id="index-workflow-filter" class="workflow-filter"><summary>Workflows: <span id="index-workflow-summary">All workflows</span></summary><div id="index-workflow-options" class="workflow-options" role="group" aria-label="Filter by workflow"></div></details><select id="index-status" aria-label="Filter by status"><option value="">All statuses</option><option value="completed">completed</option><option value="rejected">rejected</option><option value="failed">failed</option><option value="running">running</option><option value="pending">pending</option><option value="scheduled">scheduled</option></select></div>
       <div id="index-columns" class="index-columns" role="row" aria-label="Sort runs by column"></div>
       <div id="index-rows" class="index-rows"></div>
       <div id="index-details" class="index-details" hidden></div>
@@ -1127,6 +1227,18 @@ def render_report(
     limit: int = 50,
 ) -> str:
     """Render a self-contained interactive canvas report with bounded message history."""
+    return render_projects_report({project_name: project}, workflow=workflow, limit=limit)
+
+
+def render_projects_report(
+    projects: dict[str, ProjectConfig],
+    *,
+    workflow: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Render one interactive report combining the persisted runs of several projects."""
+    if not projects:
+        raise ValueError("at least one project is required")
     generated_at = datetime.now(UTC)
     selected = [workflow] if workflow else list(WORKFLOW_NAMES)
     unknown = set(selected) - set(WORKFLOW_NAMES)
@@ -1134,18 +1246,19 @@ def render_report(
         raise ValueError(f"unknown workflow: {min(unknown)}")
     all_runs: list[dict[str, Any]] = []
     recent_runs: list[dict[str, Any]] = []
-    for path, _database_workflows in _database_paths(project_name, project):
-        runs = _retain_report_runs(
-            _read_runs(path, project_name, None, 0),
-            generated_at,
-        )
-        all_runs.extend(runs)
-        recent_runs.extend(
-            run
-            for run in runs
-            if (activity_at := _run_activity_at(run)) is not None
-            and activity_at >= generated_at - REPORT_HIDE_AFTER
-        )
+    for project_name, project in projects.items():
+        for path, _database_workflows in _database_paths(project_name, project):
+            runs = _retain_report_runs(
+                _read_runs(path, project_name, None, 0),
+                generated_at,
+            )
+            all_runs.extend(runs)
+            recent_runs.extend(
+                run
+                for run in runs
+                if (activity_at := _run_activity_at(run)) is not None
+                and activity_at >= generated_at - REPORT_HIDE_AFTER
+            )
     all_runs = [run for run in all_runs if not workflow or run["workflow"] == workflow]
     all_runs.sort(key=lambda run: run["started_at"], reverse=True)
     recent_runs = [run for run in recent_runs if run["workflow"] in selected]
@@ -1153,6 +1266,7 @@ def render_report(
     recent_runs = recent_runs[:limit]
     all_publications = [
         {
+            "project_name": run["project_name"],
             "workflow": run["workflow"],
             "run_id": run["run_id"],
             "run_started_at": run["started_at"],
@@ -1162,9 +1276,11 @@ def render_report(
         for publication in run["publications"]
     ]
     all_publications.sort(key=lambda publication: publication["published_at"], reverse=True)
+    project_names = list(projects)
+    report_title = ", ".join(project_names)
     data = {
-        "project": project_name,
-        "repository": str(project.repo),
+        "projects": project_names,
+        "repositories": {name: str(config.repo) for name, config in projects.items()},
         "generatedAt": generated_at.timestamp() * 1000,
         "retention": {
             "hideAfterSeconds": int(REPORT_HIDE_AFTER.total_seconds()),
@@ -1177,22 +1293,31 @@ def render_report(
             for name in selected
         ],
     }
+    if len(projects) == 1:
+        only_name, only_project = next(iter(projects.items()))
+        project_summary = (
+            f"<b>project</b> {_text(only_name)} · <b>repository</b> <code>{_text(only_project.repo)}</code>"
+        )
+    else:
+        project_summary = "<b>projects</b> " + " · ".join(
+            f"{_text(name)} (<code>{_text(config.repo)}</code>)" for name, config in projects.items()
+        )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>dev-agents flow — {_text(project_name)}</title>
+<title>dev-agents flow — {_text(report_title)}</title>
 <style>
 :root{{color-scheme:dark;--bg:#0d1117;--panel:#151c26;--panel2:#1b2532;--border:#334155;--text:#e5edf5;--muted:#94a3b8;--gold:#f8d477;--cyan:#7dd3fc;--green:#46d7aa;--red:#ff7280}}
 *{{box-sizing:border-box}}body{{font:14px system-ui,sans-serif;max-width:1500px;margin:0 auto;padding:24px;background:var(--bg);color:var(--text)}}h1,h2,h3{{color:var(--gold);margin-top:0}}h1{{margin-bottom:4px}}code,pre,select,button{{font-family:ui-monospace,SFMono-Regular,monospace}}code{{color:var(--cyan)}}
 .report-tabs{{display:flex;gap:8px;margin-top:24px}}.report-tabs button{{border-radius:8px 8px 0 0;border-bottom:2px solid transparent;color:var(--muted)}}.report-tabs button[aria-selected="true"]{{background:var(--panel);border-color:var(--gold);color:var(--gold)}}
-.subtitle,.hint,.legend{{color:var(--muted)}}.run-index,.explorer{{margin-top:24px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.run-index{{padding:18px}}.index-header{{display:flex;justify-content:space-between;gap:16px;align-items:start}}.index-header h2{{margin-bottom:4px}}.index-header .subtitle{{margin:0}}.index-header strong{{color:var(--cyan);white-space:nowrap}}.index-filters{{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 10px}}input,select,button{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px}}input{{min-width:260px;flex:1}}button{{cursor:pointer}}button:hover{{border-color:var(--gold)}}.index-columns,.index-row{{display:grid;grid-template-columns:86px 125px minmax(150px,1.4fr) minmax(165px,1fr) 70px 100px 145px;align-items:center;gap:10px;text-align:left;font-size:12px}}.index-columns{{margin-bottom:5px}}.index-column{{border:0;background:transparent;color:var(--muted);padding:6px 10px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;text-align:left;white-space:nowrap}}.index-column:hover,.index-column[aria-sort="asc"],.index-column[aria-sort="desc"]{{color:var(--gold)}}.index-rows{{display:grid;gap:5px}}.index-row{{font-family:system-ui}}.index-row code,.index-row time,.index-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row time,.index-row small{{color:var(--muted)}}.index-row b{{overflow:hidden;text-overflow:ellipsis}}.older-runs{{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}}.older-runs summary{{padding:6px 10px}}.older-index-rows{{display:grid;gap:5px;margin-top:6px}}.index-details{{border-top:1px solid var(--border);margin-top:14px;padding-top:14px;max-width:900px}}.publication-detail{{border-left:2px solid var(--green);padding:7px 0 7px 10px;margin:7px 0}}.publication-detail small{{display:block;color:var(--muted);overflow-wrap:anywhere;margin-top:4px}}.publication-detail a{{color:var(--cyan);overflow-wrap:anywhere}}.empty-index{{color:var(--muted)}}.toolbar{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--border);background:#111923}}label{{display:flex;align-items:center;gap:8px;color:var(--muted)}}.hint{{margin-left:auto;font-size:12px}}
+.subtitle,.hint,.legend{{color:var(--muted)}}.run-index,.explorer{{margin-top:24px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.run-index{{padding:18px}}.index-header{{display:flex;justify-content:space-between;gap:16px;align-items:start}}.index-header h2{{margin-bottom:4px}}.index-header .subtitle{{margin:0}}.index-header strong{{color:var(--cyan);white-space:nowrap}}.index-filters{{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 10px}}input,select,button{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px}}input{{min-width:260px;flex:1}}button{{cursor:pointer}}button:hover{{border-color:var(--gold)}}.index-columns,.index-row{{display:grid;grid-template-columns:86px 110px 125px minmax(150px,1.4fr) minmax(165px,1fr) 70px 100px 145px;align-items:center;gap:10px;text-align:left;font-size:12px}}.index-columns{{margin-bottom:5px}}.index-column{{border:0;background:transparent;color:var(--muted);padding:6px 10px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;text-align:left;white-space:nowrap}}.index-column:hover,.index-column[aria-sort="asc"],.index-column[aria-sort="desc"]{{color:var(--gold)}}.index-rows{{display:grid;gap:5px}}.index-row{{font-family:system-ui}}.index-row code,.index-row time,.index-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row time,.index-row small{{color:var(--muted)}}.index-row b{{overflow:hidden;text-overflow:ellipsis}}.older-runs{{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}}.older-runs summary{{padding:6px 10px}}.older-index-rows{{display:grid;gap:5px;margin-top:6px}}.index-details{{border-top:1px solid var(--border);margin-top:14px;padding-top:14px;max-width:900px}}.publication-detail{{border-left:2px solid var(--green);padding:7px 0 7px 10px;margin:7px 0}}.publication-detail small{{display:block;color:var(--muted);overflow-wrap:anywhere;margin-top:4px}}.publication-detail a{{color:var(--cyan);overflow-wrap:anywhere}}.empty-index{{color:var(--muted)}}.toolbar{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--border);background:#111923}}label{{display:flex;align-items:center;gap:8px;color:var(--muted)}}.hint{{margin-left:auto;font-size:12px}}
 .explorer-grid{{display:grid;grid-template-columns:minmax(0,1fr) 350px;min-height:520px}}#graph-host{{position:relative;min-height:520px;background:radial-gradient(#263342 1px,transparent 1px);background-size:22px 22px;overflow:hidden}}canvas{{display:block;width:100%;height:520px;cursor:grab}}canvas:active{{cursor:grabbing}}.empty-state{{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}}.inspector{{padding:18px;overflow:auto;max-height:620px;background:#111923;border-left:1px solid var(--border)}}.inspector hr{{border:0;border-top:1px solid var(--border);margin:18px 0}}.inspector p{{color:var(--muted);line-height:1.45}}.run-title{{display:flex;gap:9px;align-items:center;flex-wrap:wrap}}.run-title b{{overflow-wrap:anywhere}}.status{{display:inline-block;border-radius:999px;padding:2px 7px;font-size:11px;background:#334155;color:var(--muted)}}.status.completed{{background:#123e3c;color:#8af0cf}}.status.failed,.status.error{{background:#542a34;color:#ffb6bd}}.status.running,.status.pending{{background:#4a3a1b;color:#ffe5a1}}.error{{color:#ffb6bd!important}}pre{{white-space:pre-wrap;overflow:auto;background:#0b1016;border-radius:7px;padding:9px;font-size:11px;color:#cbd5e1}}details summary{{cursor:pointer;color:var(--cyan)}}.event-detail{{border-left:2px solid var(--border);padding:6px 0 8px 10px;margin:9px 0}}.event-detail time{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}.event-detail pre{{margin:7px 0 0}}.event-row{{width:100%;display:grid;grid-template-columns:24px 1fr auto auto;gap:7px;align-items:center;text-align:left;margin:5px 0;padding:7px;font-family:system-ui;font-size:12px}}.event-row span:first-child{{color:var(--muted)}}.event-row b{{overflow:hidden;text-overflow:ellipsis}}.event-row span:nth-child(3){{color:var(--muted);overflow:hidden;text-overflow:ellipsis}}.event-row .status{{font-size:10px}}.legend{{display:flex;gap:18px;flex-wrap:wrap;padding:10px 16px 14px;font-size:12px}}.legend span{{display:flex;gap:6px;align-items:center}}.dot{{width:9px;height:9px;border-radius:50%;display:inline-block;background:#64748b}}.dot.completed{{background:var(--green)}}.dot.failed{{background:var(--red)}}
 .workflow-filter{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px;min-width:190px}}.workflow-filter summary{{cursor:pointer;color:var(--muted)}}.workflow-options{{display:grid;gap:6px;margin-top:8px;max-height:240px;overflow:auto}}.workflow-option{{display:flex;align-items:center;gap:7px;color:var(--text);font-size:12px}}
 .pub-columns,.pub-row{{grid-template-columns:86px 110px minmax(130px,1fr) minmax(180px,1.6fr) 145px 145px}}.pub-row{{font-family:system-ui}}.pub-row code,.pub-row time,.pub-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.pub-row time,.pub-row small{{color:var(--muted)}}.pub-row a{{color:var(--cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 @media(max-width:900px){{.pub-columns,.pub-row{{grid-template-columns:80px 1fr auto}}.pub-columns .index-column:nth-child(4),.pub-columns .index-column:nth-child(5),.pub-columns .index-column:nth-child(6),.pub-row time,.pub-row small,.pub-row a{{display:none}}}}
 @media(max-width:900px){{.explorer-grid{{grid-template-columns:1fr}}.inspector{{border-left:0;border-top:1px solid var(--border);max-height:none}}.hint{{width:100%;margin-left:0}}}}
-@media(max-width:900px){{.index-columns,.index-row{{grid-template-columns:80px 1fr auto}}.index-columns .index-column:nth-child(4),.index-columns .index-column:nth-child(6),.index-columns .index-column:nth-child(7),.index-row time,.index-row span:last-of-type,.index-row small{{display:none}}.index-row code{{grid-column:2}}}}
+@media(max-width:900px){{.index-columns,.index-row{{grid-template-columns:80px 1fr auto}}.index-columns .index-column:nth-child(2),.index-columns .index-column:nth-child(5),.index-columns .index-column:nth-child(7),.index-columns .index-column:nth-child(8),.index-row time,.index-row span:last-of-type,.index-row small{{display:none}}.index-row code{{grid-column:2}}}}
 </style></head><body><h1>Workflow run explorer</h1>
-<p class="subtitle"><b>project</b> {_text(project_name)} · <b>repository</b> <code>{_text(project.repo)}</code></p>
+<p class="subtitle">{project_summary}</p>
 <p class="subtitle">Interactive canvas built from persisted SQLite events. This replaces the static Mermaid-first view (the former static LangGraph flow); the graph structure remains available through the generated data.</p>
 {_interactive_app(data)}
 </body></html>"""
