@@ -103,8 +103,16 @@ SQLite, so a daemon restart resumes the queue without regenerating content.
 ## Avoiding repeat announcements
 
 Each promote run used to know only its own publications, so consecutive releases touching the
-same feature were announced again with different wording. Two layers now look back
-`recent_posts_days` days (14 by default) across earlier runs:
+same feature were announced again with different wording. The root cause is overlapping diffs:
+`previous_sha` comes from the last *successful* promote, so two releases in flight together both
+start from the same commit and the second re-evaluates everything in the first. A new run
+therefore starts its diff after the newest commit an earlier release-comms run already evaluated
+(when that commit is an ancestor of this release and newer than the promote-derived start).
+Failed runs are ignored, since they may never announce their range. The event log records the
+original value as `promote_previous_sha` whenever the start moves.
+
+Two more layers back that up, looking back `recent_posts_days` days (14 by default) across
+earlier runs:
 
 1. **Prompt history.** The evaluator and both writers receive a "recently announced" block (page,
    channels, first line of what was said). The evaluator must treat a listed feature as not
@@ -124,12 +132,18 @@ same way as Instagram: it rides on the Bluesky draft's image + text, so it only 
 messages that already resolved an image. Nothing below is required unless a project adds
 `pinterest` to its `destinations` list.
 
+> **Blocked on Pinterest Trial access.** Apps on Trial access cannot create pins in production
+> (`403`, code 29). Until the app is upgraded to Standard, do not add `pinterest` to `destinations`.
+> See [pinterest-standard-access.md](pinterest-standard-access.md) for the status, the upgrade
+> requirements and the demo video plan.
+
 1. **Create a Pinterest business account** for the target product (a personal account cannot
    create an app). Business accounts are free to convert at pinterest.com/business/create.
 2. **Register an app** at [developers.pinterest.com/apps](https://developers.pinterest.com/apps).
    Note the app's client ID/secret — only needed once, to mint the access token below.
 3. **Generate an access token** via Pinterest's OAuth flow, granting at minimum the
-   `pins:write` and `boards:read` scopes. Pinterest access tokens expire (the standard OAuth
+   `boards:read`, `boards:write`, `pins:read`, `pins:write` and `user_accounts:read` scopes
+   (Pinterest names the missing scopes in a 401 if `pins:write`/`boards:write` are absent). Pinterest access tokens expire (the standard OAuth
    token lifetime); the daemon does **not** refresh them, so plan to re-mint the token
    periodically (or run Pinterest's refresh-token flow externally and update the secret) —
    treat this the same as rotating any other credential, not a one-time setup step.

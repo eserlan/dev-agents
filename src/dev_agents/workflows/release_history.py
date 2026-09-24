@@ -8,9 +8,11 @@ so publishing can refuse a repeat even when the agents write about it anyway.
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,6 +24,11 @@ MAX_PROMPT_ENTRIES = 20
 SUMMARY_CHARS = 200
 NO_RECENT_POSTS = "(none)"
 _HISTORY_LIMIT = 1000
+_EARLIER_RUN_LIMIT = 30
+_GIT_TIMEOUT_SECONDS = 60.0
+# Runs whose commits were (or are being) announced, or were judged and deliberately skipped.
+# A failed run is excluded: it may never announce its range, so a later run should still cover it.
+_HANDLED_STATUSES = ("completed", "scheduled", "running", "rejected")
 
 
 @dataclass(frozen=True)
@@ -161,3 +168,55 @@ def repeated_publication_keys(
             for record in announcement.records:
                 keys.add(publication_key(record.channel, record.destination, url))
     return keys, matched_runs
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=repo,
+            capture_output=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def earlier_release_shas(repository: StateRepository, *, exclude_run_id: str) -> list[str]:
+    """Return the commits earlier release-comms runs evaluated up to (their ``new_sha``)."""
+    shas: list[str] = []
+    for run in repository.list_runs("release-comms", limit=_EARLIER_RUN_LIMIT):
+        if run.run_id == exclude_run_id or run.status not in _HANDLED_STATUSES:
+            continue
+        for event in repository.list_run_events("release-comms", run.run_id):
+            new_sha = event.metadata.get("new_sha") if event.event == "resolved" else None
+            if new_sha:
+                shas.append(str(new_sha))
+                break
+    return shas
+
+
+def narrow_previous_sha(
+    repo: Path, previous_sha: str | None, new_sha: str, handled_shas: Iterable[str]
+) -> str | None:
+    """Start a release's diff after the newest commit an earlier release already covered.
+
+    Promote runs derive ``previous_sha`` from the last *successful* promote, so two releases
+    in flight together both start from the same commit and the second re-evaluates (and
+    re-announces) everything in the first. Any earlier handled commit that is an ancestor of
+    ``new_sha`` and newer than ``previous_sha`` moves the start forward; otherwise the promote
+    derived value is kept. Without git history to compare, nothing changes.
+    """
+    best: str | None = None
+    for sha in handled_shas:
+        if not sha or sha == new_sha or not _is_ancestor(repo, sha, new_sha):
+            continue
+        if best is None or _is_ancestor(repo, best, sha):
+            best = sha
+    if best is None:
+        return previous_sha
+    if previous_sha and not _is_ancestor(repo, previous_sha, best):
+        return previous_sha
+    return best
