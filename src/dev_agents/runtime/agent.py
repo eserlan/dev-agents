@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from collections.abc import Callable, Iterable
@@ -9,8 +10,15 @@ from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 
+from dev_agents.runtime.retention import remove_older_than
+
 # Shared by PR review/fix and issue-fix queues, including GUI enhancements.
 CODEX_MODEL = "gpt-6-luna"
+
+# Agents run validation tooling (node, bunx, fallow, ...) that caches under $TMPDIR. On a
+# typical Linux desktop /tmp is RAM-backed and often quota-limited, and those caches are
+# never cleaned up, so they are pointed at a directory on disk that is swept after each run.
+AGENT_TMP_RETENTION_SECONDS = 24 * 3600
 
 
 @dataclass(frozen=True)
@@ -19,6 +27,42 @@ class AgentResult:
 
     returncode: int | None
     timed_out: bool
+
+
+def agent_tmp_root() -> Path:
+    """Return the scratch directory used as $TMPDIR for agent processes."""
+    return Path.home() / ".cache/dev-agents/tmp"
+
+
+def _agent_environment() -> dict[str, str]:
+    """Return the environment for an agent process, with $TMPDIR moved onto disk."""
+    environment = dict(os.environ)
+    root = agent_tmp_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Scratch redirection is an optimisation; never stop an agent from running over it.
+        return environment
+    environment["TMPDIR"] = str(root)
+    return environment
+
+
+def sweep_agent_tmp() -> int:
+    """Remove scratch entries untouched for a day; returns how many were removed.
+
+    Anything younger is left alone so concurrent agents keep their working caches.
+    """
+    root = agent_tmp_root()
+    removed = 0
+    try:
+        for pattern in ("*", ".[!.]*"):
+            for directories in (True, False):
+                removed += remove_older_than(
+                    root, pattern, AGENT_TMP_RETENTION_SECONDS, directories=directories
+                )
+    except OSError:
+        pass
+    return removed
 
 
 def run_with_fallback(
@@ -118,6 +162,7 @@ def run_agent(
         process = subprocess.Popen(
             provider_command(provider, prompt, timeout_seconds, reasoning_effort),
             cwd=cwd,
+            env=_agent_environment(),
             stdout=stream,
             stderr=subprocess.STDOUT,
             text=True,
@@ -145,4 +190,5 @@ def run_agent(
                     on_progress(int(now - start))
         returncode = process.wait()
         stream.write(f"=== agent finished exit={returncode} timed_out={timed_out} ===\n")
+    sweep_agent_tmp()
     return AgentResult(returncode=returncode, timed_out=timed_out)

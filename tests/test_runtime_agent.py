@@ -1,3 +1,5 @@
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from dev_agents.runtime.agent import (
     CODEX_MODEL,
     AgentResult,
+    _agent_environment,
     provider_command,
     run_agent,
     run_with_fallback,
@@ -112,3 +115,59 @@ def test_run_agent_fires_on_progress_at_coarse_interval(
     # ~0.6s runtime / 0.2s interval: at least 2 ticks, not one per 0.05s heartbeat.
     assert 2 <= len(ticks) <= 4
     assert ticks == sorted(ticks)
+
+
+def test_run_agent_points_tmpdir_at_the_scratch_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_agent_tmp: Path
+) -> None:
+    """Agents' tooling caches under $TMPDIR; it must land on disk, not in /tmp."""
+    seen = tmp_path / "seen"
+    monkeypatch.setattr(
+        "dev_agents.runtime.agent.provider_command",
+        lambda *_args, **_kwargs: ["sh", "-c", f'printf %s "$TMPDIR" > {seen}'],
+    )
+
+    result = run_agent(
+        "codex", "irrelevant", cwd=tmp_path, log_path=tmp_path / "agent.log", timeout_seconds=5
+    )
+
+    assert result.returncode == 0
+    assert seen.read_text() == str(isolated_agent_tmp)
+    assert isolated_agent_tmp.is_dir()
+
+
+def test_run_agent_sweeps_stale_scratch_but_keeps_recent_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_agent_tmp: Path
+) -> None:
+    stale_dir = isolated_agent_tmp / "fallow-audit-base-cache-old"
+    stale_file = isolated_agent_tmp / ".hidden-old"
+    fresh_dir = isolated_agent_tmp / "fallow-audit-base-cache-new"
+    for directory in (stale_dir, fresh_dir):
+        directory.mkdir(parents=True)
+        (directory / "cache.bin").write_text("x", encoding="utf-8")
+    stale_file.write_text("x", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 86400
+    for path in (stale_dir, stale_file):
+        os.utime(path, (two_days_ago, two_days_ago))
+    monkeypatch.setattr(
+        "dev_agents.runtime.agent.provider_command", lambda *_args, **_kwargs: ["true"]
+    )
+
+    run_agent(
+        "codex", "irrelevant", cwd=tmp_path, log_path=tmp_path / "agent.log", timeout_seconds=5
+    )
+
+    assert not stale_dir.exists()
+    assert not stale_file.exists()
+    assert fresh_dir.exists()
+
+
+def test_agent_environment_survives_an_unwritable_scratch_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr("dev_agents.runtime.agent.agent_tmp_root", lambda: blocker / "tmp")
+    monkeypatch.setenv("TMPDIR", "/original")
+
+    assert _agent_environment()["TMPDIR"] == "/original"
