@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -177,6 +179,8 @@ def stage_reddit_candidate(
     github: str | None = None,
     branch: str = "release-manifests",
     timeout: float = 120,
+    devvit_app_dir: Path | None = None,
+    devvit_subreddit: str | None = None,
 ) -> PublicationReceipt:
     """Upload or update the Reddit candidate manifest on GitHub (or Cloudflare R2)."""
     page_url = str(candidate.get("url", ""))
@@ -222,6 +226,14 @@ def stage_reddit_candidate(
             manifest=manifest,
             timeout=timeout,
         )
+
+        if devvit_app_dir is not None:
+            _deploy_devvit_bundle(
+                app_dir=devvit_app_dir,
+                candidates=merged,
+                subreddit=devvit_subreddit,
+                timeout=timeout,
+            )
 
         return PublicationReceipt(
             channel="reddit",
@@ -277,6 +289,14 @@ def stage_reddit_candidate(
     finally:
         temp_path.unlink(missing_ok=True)
 
+    if devvit_app_dir is not None:
+        _deploy_devvit_bundle(
+            app_dir=devvit_app_dir,
+            candidates=merged,
+            subreddit=devvit_subreddit,
+            timeout=timeout,
+        )
+
     return PublicationReceipt(
         channel="reddit",
         destination=destination,
@@ -285,6 +305,75 @@ def stage_reddit_candidate(
         external_id=external_id,
         metadata={"status": "staged_to_r2", "candidate_id": candidate_id, "source_id": source_id},
     )
+
+
+def _deploy_devvit_bundle(
+    *,
+    app_dir: Path,
+    candidates: list[dict[str, Any]],
+    subreddit: str | None,
+    timeout: float,
+) -> None:
+    """Bundle staged candidates and install the new app version on a subreddit."""
+    app_dir = app_dir.expanduser().resolve()
+    if not (app_dir / "devvit.json").is_file():
+        raise RuntimeError(f"Devvit app config not found in {app_dir}")
+    if not subreddit:
+        raise RuntimeError(
+            "release_comms.devvit_subreddit is required when devvit_app_dir is configured"
+        )
+
+    if shutil.which("devvit"):
+        cli = ["devvit"]
+    elif shutil.which("bunx"):
+        cli = ["bunx", "devvit"]
+    elif shutil.which("npx"):
+        cli = ["npx", "--yes", "devvit"]
+    else:
+        raise RuntimeError("Devvit CLI is unavailable (install devvit, bunx, or npx)")
+
+    source_dir = app_dir / "src"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = source_dir / "candidates.json"
+    original_bundle = bundle_path.read_bytes() if bundle_path.exists() else None
+    bundle = {
+        "updated_at": int(time.time()),
+        "candidates": [candidate for candidate in candidates if candidate.get("status") == "approved"],
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", dir=source_dir, delete=False, encoding="utf-8"
+    ) as temp:
+        temp_path = Path(temp.name)
+        json.dump(bundle, temp, ensure_ascii=False, indent=2)
+        temp.write("\n")
+    temp_path.replace(bundle_path)
+
+    try:
+        for args in (
+            [*cli, "upload"],
+            [*cli, "install", subreddit, "dev-agent-publisher@latest"],
+        ):
+            try:
+                completed = subprocess.run(
+                    args,
+                    cwd=app_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError(f"Devvit command failed: {' '.join(args)}: {error}") from error
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()[-2000:]
+                raise RuntimeError(
+                    f"Devvit command failed ({completed.returncode}): {' '.join(args)}\n{detail}"
+                )
+    finally:
+        if original_bundle is None:
+            bundle_path.unlink(missing_ok=True)
+        else:
+            bundle_path.write_bytes(original_bundle)
 
 
 def prune_published_reddit_candidates(
@@ -616,4 +705,3 @@ def sync_reddit_status(
                 pass
 
     return reconciled
-

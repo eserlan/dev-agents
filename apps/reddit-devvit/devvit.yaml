@@ -6,7 +6,3 @@ capabilities:
   redis: true
   scheduler: true
   media: true
-  http:
-    enable: true
-    domains:
-      - raw.githubusercontent.com

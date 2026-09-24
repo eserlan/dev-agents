@@ -1,5 +1,5 @@
 import type { RedisClient } from '@devvit/public-api';
-import type { CandidateManifest, CandidatePost, QueueStatus } from './types.js';
+import type { CandidatePost, QueueStatus } from './types.js';
 
 export const REDIS_POST_PREFIX = 'reddit:post:';
 export const REDIS_QUEUE_APPROVED = 'reddit:queue:approved';
@@ -114,27 +114,18 @@ export async function togglePause(redis: RedisClient): Promise<boolean> {
   return next;
 }
 
-export async function syncCandidatesFromCdn(
+export async function syncCandidatesFromBundle(
   redis: RedisClient,
-  manifestUrl: string
+  candidates: CandidatePost[]
 ): Promise<{ added: number; skipped: number; total: number }> {
-  const response = await fetch(manifestUrl, {
-    headers: {
-      'User-Agent': 'dev-agents-devvit-publisher/0.1.0',
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch manifest from ${manifestUrl}: ${response.status} ${response.statusText}`);
-  }
-
-  const manifest = (await response.json()) as CandidateManifest;
-  const candidates = manifest.candidates || [];
-
   let added = 0;
   let skipped = 0;
 
   for (const candidate of candidates) {
+    if (candidate.status !== 'approved') {
+      skipped++;
+      continue;
+    }
     const wasAdded = await enqueueCandidate(redis, candidate);
     if (wasAdded) {
       added++;

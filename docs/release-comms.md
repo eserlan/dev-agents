@@ -61,13 +61,22 @@ Live publishing is owned by `dev-agents`. Bluesky, Instagram, X, Discord, and
 GitHub Discussions are delivered by the daemon's direct adapters. Feed-oriented
 channels use the square, compressed Cloudflare R2 image variant; long-form
 Discussion bodies retain the canonical asset URL. Reddit is delivered via the
-`dev-agent-publisher` Devvit companion app (`apps/reddit-devvit`): `dev-agents`
-stages candidate JSON manifests to `raw.githubusercontent.com` on the target
-repository's `release-manifests` branch, and the companion app pulls them to
-manage cadence gates and native Reddit submission. Live status is reconciled
-automatically or via `dev-agents release-comms sync-reddit <project>`. External
+`dev-agent-publisher` Devvit companion app (`apps/reddit-devvit`): release-comms
+stages the approved candidate manifest, bundles it into the app, uploads the
+app, and installs the latest version on the configured subreddit. The Reddit
+app makes no external HTTP requests. A moderator can publish the next candidate
+with one menu action; the app does not publish in the background. Live status is reconciled automatically or via
+`dev-agents release-comms sync-reddit <project>`. External
 subreddits can be exported for manual posting with `dev-agents release-comms
 export-reddit <project> <run-id>`.
+
+To enable this deploy, configure `release_comms.devvit_app_dir` in the target
+project's config. The install target defaults to `release_comms.subreddit`;
+`release_comms.devvit_subreddit` can override it. The daemon
+account must have an authenticated Devvit CLI session and moderator access to
+that subreddit. `auto_publish: false` requires an explicit release-comms publish
+approval; that approval packages and installs the candidate but does not itself
+click the Reddit post action.
 
 The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.

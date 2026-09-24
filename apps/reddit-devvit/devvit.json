@@ -4,12 +4,5 @@
   "blocks": {
     "entry": "src/main.ts"
   },
-  "permissions": {
-    "http": {
-      "enable": true,
-      "domains": [
-        "raw.githubusercontent.com"
-      ]
-    }
-  }
+  "permissions": {}
 }

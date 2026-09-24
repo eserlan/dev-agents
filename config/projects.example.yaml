@@ -60,6 +60,11 @@ projects:
       # Omit to use <target-repository>/.dev-agents/release-comms-state.db.
       state_path: ~/.local/state/dev-agents/codex-cryptica/release-comms-state.db
       auto_publish: false
+      # Optional domain-free Reddit delivery. After staging, release-comms bundles
+      # candidates into this Devvit app and installs the latest version on the subreddit.
+      # The daemon account needs a Devvit CLI login and subreddit moderator access.
+      # devvit_app_dir: /path/to/dev-agents/apps/reddit-devvit
+      # devvit_subreddit: dev_agent_publish_dev
       # Pick a random 15–30 minute delay between distinct live messages.
       publication_delay_min_seconds: 900
       publication_delay_max_seconds: 1800

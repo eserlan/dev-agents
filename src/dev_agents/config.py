@@ -97,6 +97,10 @@ class ReleaseCommsConfig(BaseModel):
         "reddit",
     ]
     subreddit: str = "codexcryptica"
+    # Optional Devvit companion app checkout. When set, approved Reddit candidates
+    # are bundled into the app and uploaded/installed after staging.
+    devvit_app_dir: Path | None = None
+    devvit_subreddit: str | None = None
     image_generation: bool = False
     image_providers: list[str] = ["agy", "codex", "muse"]
     publication_delay_min_seconds: float = 900.0

@@ -565,6 +565,8 @@ def publish_release_drafts(
     max_publications: int | None = None,
     on_receipt: Callable[[PublicationReceipt], None],
     source_id: str = "",
+    devvit_app_dir: Path | None = None,
+    devvit_subreddit: str | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     """Publish channel variants in message batches, checkpointing each receipt.
 
@@ -759,6 +761,8 @@ def publish_release_drafts(
                     env=env,
                     dry_run=dry_run,
                     github=project.github,
+                    devvit_app_dir=devvit_app_dir,
+                    devvit_subreddit=devvit_subreddit,
                 )
                 record_receipt(receipt)
                 result["reddit"].append(receipt.__dict__)

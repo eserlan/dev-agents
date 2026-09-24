@@ -587,6 +587,8 @@ def build_release_comms_workflow() -> Any:
             max_publications=1,
             on_receipt=state["publication_sink"],
             source_id=str(state["promote_run_id"]),
+            devvit_app_dir=(state["config"].devvit_app_dir),
+            devvit_subreddit=(state["config"].devvit_subreddit or state["config"].subreddit),
         )
         publications.update(published)
         completed = not errors

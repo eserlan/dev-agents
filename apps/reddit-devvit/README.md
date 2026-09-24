@@ -4,21 +4,20 @@ First-party Reddit companion app for the [`dev-agents`](https://github.com/eserl
 
 ## Overview
 
-`dev-agent-publisher` automates community announcements and release discussions on moderator-controlled subreddits. It operates as a pull-based companion to the `dev-agents` release pipeline:
+`dev-agent-publisher` publishes approved release announcements to moderator-controlled subreddits. The `dev-agents` release-comms workflow packages approved Reddit candidates into each app build, so the running app makes no external HTTP requests or background posts:
 
-1. **Pull Ingestion**: Fetches approved post candidates from the release staging CDN (`announcements/reddit-candidates.json`).
-2. **Spam & Flooding Protection**: Enforces a strict minimum 24-hour cadence spacing between consecutive submissions.
-3. **Deduplication**: Tracks seen candidates by unique source ID (`seen:<source_id>`) in Redis to prevent duplicate submissions.
-4. **Authentic Engagement**: Formats discussion posts with clear release details, authentic prompts, and standard automated disclosure.
+1. **Release packaging**: After release-comms stages an approved candidate, it writes the candidate manifest into `src/candidates.json`, uploads the Devvit app, and installs the new version on the configured subreddit.
+2. **One-click posting**: A moderator chooses **Release: Post Next Approved Candidate**. The app syncs bundled candidates into Redis and publishes the next unposted candidate; no separate enqueue action is needed.
+3. **Moderator control**: Reddit submissions happen only after a moderator clicks the post action.
+4. **Deduplication**: Tracks seen candidates by unique source ID (`seen:<source_id>`) in Redis to prevent duplicate submissions.
+5. **Authentic Engagement**: Formats discussion posts with clear release details, authentic prompts, and standard automated disclosure.
 
 ## Moderator Controls
 
 When installed on a subreddit, moderators have access to menu actions directly in the subreddit's moderation tools:
 
-* **Publisher: Queue Status** — Displays pending, approved, and posted counts, time since last post, and pause status.
-* **Publisher: Sync from CDN Now** — Immediately triggers an ingestion sync from the candidate manifest without waiting for the hourly cron.
-* **Publisher: Publish Next Post Now** — Publishes the next approved candidate immediately (bypassing the 24-hour spacing guard).
-* **Publisher: Toggle Pause** — Emergency pause switch that halts all automated publishing.
+* **Release Queue: Status** — Displays pending, approved, and posted counts, time since last post, and pause status.
+* **Release: Post Next Approved Candidate** — Publishes the next bundled candidate immediately (bypassing the 24-hour spacing guard).
 
 ## Automated Disclosure
 
@@ -44,9 +43,17 @@ Candidates with no `url` fall back to a text post, with the image (if any) as a 
 Because the `<!-- id:... -->` tag now lives in the comment rather than the post, dev-agents
 reconciles link posts by the URL they were submitted with.
 
-## Fetch Domains
+## Release-comms integration
 
-* `raw.githubusercontent.com`: Used by the companion app to pull approved announcement candidate JSON manifests (`announcements/reddit-candidates.json`) staged by the release pipeline for automated community publication.
+Configure the release-comms workflow with the local Devvit app checkout and subreddit:
+
+```yaml
+release_comms:
+  devvit_app_dir: /path/to/dev-agents/apps/reddit-devvit
+  devvit_subreddit: dev_agent_publish_dev
+```
+
+The daemon account must be logged in with the Devvit CLI and have moderator permission on the subreddit. Release-comms creates the candidate from its approved GitHub Discussion draft, stages the manifest for audit/history, bundles the candidates, uploads the app, and installs the latest version. The Devvit app itself needs no external-domain permission.
 
 ## Architecture
 
