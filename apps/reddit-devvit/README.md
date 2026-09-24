@@ -55,6 +55,8 @@ release_comms:
 
 The daemon account must be logged in with the Devvit CLI and have moderator permission on the subreddit. Release-comms creates the candidate from its approved GitHub Discussion draft, stages the manifest for audit/history, bundles the candidates, uploads the app, and installs the latest version. The Devvit app itself needs no external-domain permission.
 
+See [`docs/reddit-publisher-operations.md`](../../docs/reddit-publisher-operations.md) for the complete daemon setup, release flow, and recovery steps.
+
 ## Architecture
 
 * Built using Reddit's official **Devvit** platform (`@devvit/public-api`).

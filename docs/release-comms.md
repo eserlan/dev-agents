@@ -76,7 +76,8 @@ project's config. The install target defaults to `release_comms.subreddit`;
 account must have an authenticated Devvit CLI session and moderator access to
 that subreddit. `auto_publish: false` requires an explicit release-comms publish
 approval; that approval packages and installs the candidate but does not itself
-click the Reddit post action.
+click the Reddit post action. See the [Reddit Publisher Operations runbook](reddit-publisher-operations.md)
+for setup, deploy, and troubleshooting steps.
 
 The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.
