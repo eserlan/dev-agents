@@ -361,6 +361,8 @@ def test_fetch_subreddit_posts(monkeypatch: pytest.MonkeyPatch) -> None:
     assert p["title"] == "Dynamic Superhero Alignments"
     assert p["source_id"] == "pr-3093"
     assert p["url"] == "https://www.reddit.com/r/codexcryptica/comments/post123/dynamic_superhero_alignments/"
+    # A text post's own link is its permalink.
+    assert p["link_url"] == p["url"]
 
 
 def test_sync_reddit_status_reconciles_staged_publication(tmp_path: Path) -> None:
@@ -430,6 +432,59 @@ def test_sync_reddit_status_reconciles_staged_publication(tmp_path: Path) -> Non
     reconcile_events = [e for e in events if e.event == "reddit_reconciled"]
     assert len(reconcile_events) == 1
     assert reconcile_events[0].metadata["reddit_id"] == "t3_dragon_post"
+
+
+def test_sync_reddit_status_reconciles_a_link_post_by_its_submitted_url(tmp_path: Path) -> None:
+    """A link post has no id tag in its body (the write-up is a comment), so it is matched by
+    the page it links to."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/demo")
+    repository = StateRepository(tmp_path / "state.db", project_name="demo")
+    repository.claim_run("release-comms", "run-600")
+    repository.record_publication(
+        workflow="release-comms",
+        run_id="run-600",
+        channel="reddit",
+        destination="reddit",
+        page_url="https://codexcryptica.com/answers/chases",
+        public_url="dry-run://github/owner/demo/release-manifests/x.json",
+        external_id="staged:pr-600",
+        status="staged",
+        metadata={"status": "staged_to_github", "source_id": "pr-600"},
+    )
+    unrelated = {
+        "id": "t3_other",
+        "title": "Something else",
+        "selftext": "",
+        "source_id": "",
+        "permalink": "/r/codexcryptica/comments/other/x/",
+        "url": "https://www.reddit.com/r/codexcryptica/comments/other/x/",
+        "link_url": "https://codexcryptica.com/answers/other",
+    }
+    link_post = {
+        "id": "t3_chase",
+        "title": "How do you run a chase?",
+        "selftext": "",
+        "source_id": "",
+        "permalink": "/r/codexcryptica/comments/chase/how_do_you_run_a_chase/",
+        "url": "https://www.reddit.com/r/codexcryptica/comments/chase/how_do_you_run_a_chase/",
+        # Reddit may add or drop a trailing slash.
+        "link_url": "https://codexcryptica.com/answers/chases/",
+    }
+
+    reconciled = sync_reddit_status(
+        project=project,
+        project_name="demo",
+        run_id="run-600",
+        repository=repository,
+        fetched_posts=[unrelated, link_post],
+        notify_tracking_issue=False,
+        prune_manifest=False,
+    )
+
+    assert [item.external_id for item in reconciled] == ["t3_chase"]
+    assert reconciled[0].status == "published"
 
 
 def test_cli_sync_reddit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
