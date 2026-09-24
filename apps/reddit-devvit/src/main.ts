@@ -1,5 +1,5 @@
 import { Devvit } from '@devvit/public-api';
-import bundledManifest from './candidates.json';
+import bundledManifest from './candidates.json' with { type: 'json' };
 import {
   getQueueStatus,
   markPostPublished,
