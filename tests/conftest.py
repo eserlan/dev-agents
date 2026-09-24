@@ -6,6 +6,14 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_shared_reports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep combined-report registrations out of the real ~/.local/state."""
+    root = tmp_path / "shared-reports"
+    monkeypatch.setattr("dev_agents.visualize._shared_report_root", lambda: root)
+    return root
+
+
 @pytest.fixture
 def git_repository(tmp_path: Path) -> Path:
     repository = tmp_path / "repository"

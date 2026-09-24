@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,7 +10,9 @@ from dev_agents.runtime import StateRepository
 from dev_agents.visualize import (
     default_report_path,
     deploy_report_to_vercel,
+    refresh_project_report,
     refresh_report_run_url,
+    render_projects_report,
     render_report,
     report_run_url,
     schedule_report_refresh,
@@ -338,7 +341,7 @@ def test_refresh_report_run_url_deploys_a_fresh_snapshot_before_linking(
     )
 
     assert refresh_report_run_url("demo", project, "pr-review", "run/1") == (
-        "https://dev-agents-reports.vercel.app?workflow=pr-review&run=run%2F1"
+        "https://dev-agents-reports.vercel.app?workflow=pr-review&run=run%2F1&project=demo"
     )
 
 
@@ -360,8 +363,74 @@ def test_refresh_report_run_url_uses_stable_url_when_public_upload_is_batched(
     monkeypatch.setattr("dev_agents.visualize.deploy_report_to_vercel", lambda *_args: None)
 
     assert refresh_report_run_url("demo", project, "pr-review", "run/1") == (
-        "https://dev-agents-reports.vercel.app?workflow=pr-review&run=run%2F1"
+        "https://dev-agents-reports.vercel.app?workflow=pr-review&run=run%2F1&project=demo"
     )
+
+
+def _project_with_run(tmp_path: Path, name: str, run_id: str, **report: str) -> ProjectConfig:
+    repo = tmp_path / name
+    repo.mkdir()
+    database = tmp_path / f"{name}.db"
+    state = StateRepository(database, name, repo)
+    state.claim_run("pr-reconcile", run_id, metadata={"source": "daemon"})
+    state.complete_run("pr-reconcile", run_id)
+    return ProjectConfig(repo=repo, pr_fixer=PrFixerConfig(state_path=database), **report)
+
+
+def test_combined_report_includes_every_project(tmp_path: Path) -> None:
+    report = render_projects_report(
+        {
+            "alpha": _project_with_run(tmp_path, "alpha", "alpha-run"),
+            "beta": _project_with_run(tmp_path, "beta", "beta-run"),
+        }
+    )
+
+    assert '"run_id": "alpha-run"' in report
+    assert '"run_id": "beta-run"' in report
+    assert '"projects": ["alpha", "beta"]' in report
+    assert 'id="index-project"' in report
+    assert "<b>projects</b>" in report
+
+
+def test_projects_sharing_a_destination_refresh_one_combined_report(tmp_path: Path) -> None:
+    shared = {
+        "report_vercel_project": "dev-agents-reports",
+        "report_vercel_alias": "dev-agents-reports.vercel.app",
+    }
+    alpha = _project_with_run(tmp_path, "alpha", "alpha-run", **shared)
+    beta = _project_with_run(tmp_path, "beta", "beta-run", **shared)
+    other = _project_with_run(tmp_path, "other", "other-run", report_vercel_project="elsewhere")
+
+    refresh_project_report("other", other, output=tmp_path / "other.html")
+    refresh_project_report("beta", beta, output=tmp_path / "beta.html")
+    deployed = refresh_project_report("alpha", alpha, output=tmp_path / "alpha.html")
+
+    assert deployed.name == "dev-agents-flow.html"
+    assert deployed.parent.name == "dev-agents-reports.vercel.app"
+    combined = deployed.read_text(encoding="utf-8")
+    assert '"run_id": "alpha-run"' in combined
+    assert '"run_id": "beta-run"' in combined
+    assert "other-run" not in combined
+    # The project's local snapshot shows the same combined data.
+    assert (tmp_path / "alpha.html").read_text(encoding="utf-8") == combined
+
+
+def test_stale_report_registrations_are_ignored(tmp_path: Path) -> None:
+    shared = {"report_vercel_project": "dev-agents-reports"}
+    alpha = _project_with_run(tmp_path, "alpha", "alpha-run", **shared)
+    beta = _project_with_run(tmp_path, "beta", "beta-run", **shared)
+    refresh_project_report("beta", beta, output=tmp_path / "beta.html")
+
+    registration = next(
+        path for path in (tmp_path / "shared-reports").rglob("beta.json")
+    )
+    entry = json.loads(registration.read_text(encoding="utf-8"))
+    entry["registered_at"] = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    registration.write_text(json.dumps(entry), encoding="utf-8")
+
+    combined = refresh_project_report("alpha", alpha, output=tmp_path / "alpha.html")
+
+    assert "beta-run" not in combined.read_text(encoding="utf-8")
 
 
 def test_index_includes_daemon_only_runs(tmp_path: Path) -> None:
