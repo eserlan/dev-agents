@@ -591,9 +591,13 @@ def run_evaluator_pass(
     log_dir: Path,
     run_id: str,
     timeout_seconds: float,
+    recent_posts: str = "(none)",
 ) -> EvaluatorResult:
     """Run the evaluator agent pass and return its validated result."""
-    prompt = render_template(load_skill_prompt("release-evaluate"), _delta_context(delta))
+    prompt = render_template(
+        load_skill_prompt("release-evaluate"),
+        {**_delta_context(delta), "recent_posts": recent_posts},
+    )
     output = _run_pass(
         repo=repo,
         prompt=prompt,
@@ -609,7 +613,9 @@ def run_evaluator_pass(
     return result
 
 
-def _writer_context(evaluator: EvaluatorResult, delta: ReleaseDelta) -> dict[str, str]:
+def _writer_context(
+    evaluator: EvaluatorResult, delta: ReleaseDelta, recent_posts: str = "(none)"
+) -> dict[str, str]:
     features = "\n".join(
         f"- {item.get('name', '')}: {item.get('why_users_care', '')}" for item in evaluator.features
     )
@@ -618,6 +624,7 @@ def _writer_context(evaluator: EvaluatorResult, delta: ReleaseDelta) -> dict[str
         "reason": evaluator.reason,
         "importance": evaluator.importance,
         "features": features or "(none listed)",
+        "recent_posts": recent_posts,
     }
 
 
@@ -630,9 +637,10 @@ def run_shortform_writer_pass(
     log_dir: Path,
     run_id: str,
     timeout_seconds: float,
+    recent_posts: str = "(none)",
 ) -> list[dict[str, str]]:
     """Run the shortform (Bluesky) writer skill pass."""
-    context = _writer_context(evaluator, delta)
+    context = _writer_context(evaluator, delta, recent_posts)
     known = load_asset_inventory(repo)
     context["known_assets"] = "\n".join(f"- {key}" for key in known) or "(none listed)"
     prompt = render_template(load_skill_prompt("release-shortform"), context)
@@ -660,10 +668,11 @@ def run_longform_writer_pass(
     log_dir: Path,
     run_id: str,
     timeout_seconds: float,
+    recent_posts: str = "(none)",
 ) -> list[dict[str, str]]:
     """Run the longform (discussion) writer skill pass."""
     prompt = render_template(
-        load_skill_prompt("release-longform"), _writer_context(evaluator, delta)
+        load_skill_prompt("release-longform"), _writer_context(evaluator, delta, recent_posts)
     )
     output = _run_pass(
         repo=repo,

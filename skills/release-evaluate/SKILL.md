@@ -25,7 +25,21 @@ Files changed:
 Diff stat:
 {diff_stat}
 
-House rules — err on the side of sharing:
+Already announced in the last two weeks (page, channels, what was said):
+{recent_posts}
+
+No repeats — this overrides every sharing rule below:
+- A feature, tool, or page listed above is NOT postworthy again. Follow-up
+  fixes, tweaks, copy changes, URL or route moves (for example `/tools/x` to
+  `/generators/x`), and content refreshes to something already announced do not
+  count as new. Only a substantial new capability on top of it does.
+- Judge by the feature, not the URL: the same generator or page under a new
+  path is still the same announcement.
+- Leave already-announced items out of `features` entirely. If every
+  user-facing item in this release was already announced, answer
+  `"postworthy": false` and name what was already covered in `reason`.
+
+House rules — err on the side of sharing (for things not announced above):
 - App capabilities first: new or improved campaign-management or worldbuilding
   tools (vault, adventure, canvas, map, timeline, oracle, dice, generators,
   sync/import) are ALWAYS postworthy, even small ones.

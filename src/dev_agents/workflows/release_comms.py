@@ -34,6 +34,12 @@ from dev_agents.workflows.release_content import (
     sync_asset_db,
     verify_draft_images,
 )
+from dev_agents.workflows.release_history import (
+    Announcement,
+    format_recent_posts,
+    recent_announcements,
+    repeated_publication_keys,
+)
 from dev_agents.workflows.release_publish import (
     PublicationReceipt,
     comment_tracking_issue,
@@ -90,6 +96,7 @@ class ReleaseCommsState(TypedDict, total=False):
     image_overrides: dict[str, str]
     publications: dict[str, Any]
     existing_publications: list[Any]
+    recent_announcements: list[Announcement]
     publication_sink: Callable[[PublicationReceipt], None]
     dry_run: bool
     publish_approved: bool
@@ -176,6 +183,7 @@ def evaluate_release(
     log_dir: Path,
     promote_run_id: str,
     timeout_seconds: float = 600,
+    recent_posts: str = "(none)",
 ) -> EvaluatorResult:
     """Run the daemon-owned evaluator, including when local generation is enabled."""
     delta = collect_release_delta(repo, new_sha, previous_sha, timeout_seconds)
@@ -186,6 +194,7 @@ def evaluate_release(
         log_dir=log_dir,
         run_id=promote_run_id,
         timeout_seconds=timeout_seconds,
+        recent_posts=recent_posts,
     )
 
 def _draft_counts(drafts: WriterResult) -> dict[str, Any]:
@@ -232,6 +241,9 @@ def build_release_comms_workflow() -> Any:
     def local_delta(state: ReleaseCommsState) -> ReleaseDelta:
         return collect_release_delta(state["repo"], state["new_sha"], state.get("previous_sha"))
 
+    def recent_posts(state: ReleaseCommsState) -> str:
+        return format_recent_posts(state.get("recent_announcements", []))
+
     def evaluate_changes(state: ReleaseCommsState) -> dict[str, Any]:
         evaluator_result = state.get("evaluator_result")
         if evaluator_result is None:
@@ -243,6 +255,7 @@ def build_release_comms_workflow() -> Any:
                     log_dir=local_log_dir(state),
                     run_id=state["promote_run_id"],
                     timeout_seconds=local_timeout(state),
+                    recent_posts=recent_posts(state),
                 )
             else:
                 evaluator_result = evaluate_release(
@@ -253,6 +266,7 @@ def build_release_comms_workflow() -> Any:
                     local_log_dir(state),
                     state["promote_run_id"],
                     timeout_seconds=local_timeout(state),
+                    recent_posts=recent_posts(state),
                 )
         _emit(
             state,
@@ -297,6 +311,7 @@ def build_release_comms_workflow() -> Any:
             log_dir=local_log_dir(state),
             run_id=state["promote_run_id"],
             timeout_seconds=local_timeout(state),
+            recent_posts=recent_posts(state),
         )
         return {"short_drafts": drafts}
 
@@ -311,6 +326,7 @@ def build_release_comms_workflow() -> Any:
             log_dir=local_log_dir(state),
             run_id=state["promote_run_id"],
             timeout_seconds=local_timeout(state),
+            recent_posts=recent_posts(state),
         )
         return {"long_drafts": drafts}
 
@@ -517,6 +533,25 @@ def build_release_comms_workflow() -> Any:
         writer_res = state.get("writer_result")
         drafts_dict = asdict(writer_res) if writer_res is not None else None
         postworthy = bool(state["evaluator_result"] and state["evaluator_result"].postworthy)
+        # Backstop for the evaluator's repeat rule: refuse channels that already carried a
+        # page with the same slug in an earlier run, even if the URL prefix has since changed.
+        draft_urls = [
+            str(draft.get("pageUrl", ""))
+            for field in ("bluesky", "github_discussions")
+            for draft in (drafts_dict or {}).get(field) or []
+        ]
+        repeated_keys, repeated_runs = repeated_publication_keys(
+            state.get("recent_announcements", []), draft_urls
+        )
+        if repeated_keys:
+            _emit(
+                state,
+                "repeat_suppressed",
+                {
+                    "channels": ",".join(sorted({channel for channel, _ in repeated_keys})),
+                    "earlier_runs": ",".join(sorted(repeated_runs)),
+                },
+            )
         if dry_run or not publish_approved:
             _emit(state, "published", {"completed": True, "postworthy": postworthy})
             return {
@@ -538,7 +573,7 @@ def build_release_comms_workflow() -> Any:
             publication_key(record.channel, record.destination, record.page_url)
             for record in state.get("existing_publications", [])
             if record.status in ("published", "staged")
-        }
+        } | repeated_keys
         published, errors = publish_release_drafts(
             project=state["project"],
             drafts=drafts_dict or {},
@@ -769,6 +804,9 @@ def run_release_comms(
             "on_event": observe,
             "existing_publications": repository.list_run_publications(
                 "release-comms", str(promote_run_id)
+            ),
+            "recent_announcements": recent_announcements(
+                repository, exclude_run_id=str(promote_run_id), days=config.recent_posts_days
             ),
             "publication_sink": persist_publication,
             **({"new_sha": pinned_new_sha, "previous_sha": pinned_previous_sha} if pinned_new_sha else {}),
