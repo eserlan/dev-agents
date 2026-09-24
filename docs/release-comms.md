@@ -122,12 +122,18 @@ same way as Instagram: it rides on the Bluesky draft's image + text, so it only 
 messages that already resolved an image. Nothing below is required unless a project adds
 `pinterest` to its `destinations` list.
 
+> **Blocked on Pinterest Trial access.** Apps on Trial access cannot create pins in production
+> (`403`, code 29). Until the app is upgraded to Standard, do not add `pinterest` to `destinations`.
+> See [pinterest-standard-access.md](pinterest-standard-access.md) for the status, the upgrade
+> requirements and the demo video plan.
+
 1. **Create a Pinterest business account** for the target product (a personal account cannot
    create an app). Business accounts are free to convert at pinterest.com/business/create.
 2. **Register an app** at [developers.pinterest.com/apps](https://developers.pinterest.com/apps).
    Note the app's client ID/secret — only needed once, to mint the access token below.
 3. **Generate an access token** via Pinterest's OAuth flow, granting at minimum the
-   `pins:write` and `boards:read` scopes. Pinterest access tokens expire (the standard OAuth
+   `boards:read`, `boards:write`, `pins:read`, `pins:write` and `user_accounts:read` scopes
+   (Pinterest names the missing scopes in a 401 if `pins:write`/`boards:write` are absent). Pinterest access tokens expire (the standard OAuth
    token lifetime); the daemon does **not** refresh them, so plan to re-mint the token
    periodically (or run Pinterest's refresh-token flow externally and update the secret) —
    treat this the same as rotating any other credential, not a one-time setup step.
