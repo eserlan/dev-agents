@@ -1,3 +1,4 @@
+import sqlite3
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -682,33 +683,145 @@ def test_clean_review_auto_pushes_unpushed_base_merge(monkeypatch, tmp_path: Pat
     assert origin_feature_head != pr_head
 
 
-def test_internal_review_stops_after_targeted_follow_up_fix(monkeypatch, tmp_path: Path) -> None:
+def _service_with_reviews(tmp_path: Path) -> tuple[PrFixerService, StateRepository]:
     repo = tmp_path / "repo"
     repo.mkdir()
     database = tmp_path / "state.db"
-    project = ProjectConfig(repo=repo, github="owner/repo")
-    config = PrFixerConfig(state_path=database)
-    follow_up_run = "pr-review-42-follow-up-sha"
     state = StateRepository(database, "demo", repo)
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(state_path=database)
+    )
+    return service, state
+
+
+def _record_review(
+    state: StateRepository,
+    run_id: str,
+    *,
+    review_round: int,
+    reviewed_head: str,
+    fix_pushed: bool,
+    verdict: str | None,
+    exhausted_head: str | None = None,
+) -> None:
     state.claim_run(
         "pr-review",
-        follow_up_run,
-        metadata={
-            "pull_request": 42,
-            "head_sha": "follow-up-sha",
-            "review_round": 1,
-            "review_scope": "targeted-post-fix",
-            "review_chain_id": "pr-review-42-old-sha",
-        },
+        run_id,
+        metadata={"pull_request": 42, "head_sha": reviewed_head, "review_round": review_round},
     )
     state.complete_run(
         "pr-review",
-        follow_up_run,
+        run_id,
         metadata={
-            "reviewed_head_sha": "follow-up-sha",
-            "review_fix_pushed": True,
-            "review_exhausted_head_sha": "final-sha",
+            "reviewed_head_sha": reviewed_head,
+            "review_round": review_round,
+            "review_fix_pushed": fix_pushed,
+            "review_exhausted_head_sha": exhausted_head,
+            "review_report_valid": verdict is not None,
+            "review_report": {"verdict": verdict} if verdict else None,
         },
+    )
+
+
+def test_targeted_round_that_pushed_a_non_clean_fix_earns_one_more_round(tmp_path: Path) -> None:
+    """PR #339 sat forever: its only targeted round found and fixed a defect (verdict
+    "findings"), which the chain treated as exhausted, so the fixed head was never verified
+    and auto-merge could never accept it."""
+    service, state = _service_with_reviews(tmp_path)
+    _record_review(
+        state, "pr-review-42-a", review_round=1, reviewed_head="pre-fix", fix_pushed=True,
+        verdict="findings", exhausted_head="final-sha",
+    )
+
+    plan = service._review_plan(42, "final-sha")
+
+    assert plan is not None
+    assert plan["round"] == 2
+    assert plan["scope"] == "targeted-post-fix"
+    assert plan["parent_run_id"] == "pr-review-42-a"
+    assert plan["prior_report"] == {"verdict": "findings"}
+
+
+def test_a_targeted_round_with_no_valid_report_that_pushed_a_fix_is_also_verified(
+    tmp_path: Path,
+) -> None:
+    service, state = _service_with_reviews(tmp_path)
+    _record_review(
+        state, "pr-review-42-a", review_round=1, reviewed_head="pre-fix", fix_pushed=True,
+        verdict=None, exhausted_head="final-sha",
+    )
+
+    plan = service._review_plan(42, "final-sha")
+
+    assert plan is not None and plan["round"] == 2
+
+
+def test_the_last_allowed_round_always_ends_the_chain(tmp_path: Path) -> None:
+    service, state = _service_with_reviews(tmp_path)
+    _record_review(
+        state, "pr-review-42-a", review_round=2, reviewed_head="round-two-head", fix_pushed=True,
+        verdict="findings", exhausted_head="last-sha",
+    )
+
+    assert service._review_plan(42, "last-sha") is None
+
+
+@pytest.mark.parametrize(
+    ("fix_pushed", "verdict"),
+    [(False, "findings"), (False, "clean"), (True, "clean"), (False, None)],
+)
+def test_a_targeted_round_that_pushed_nothing_or_came_back_clean_ends_the_chain(
+    tmp_path: Path, fix_pushed: bool, verdict: str | None
+) -> None:
+    service, state = _service_with_reviews(tmp_path)
+    _record_review(
+        state, "pr-review-42-a", review_round=1, reviewed_head="reviewed", fix_pushed=fix_pushed,
+        verdict=verdict, exhausted_head="final-sha",
+    )
+
+    assert service._review_plan(42, "final-sha") is None
+
+
+def test_review_chain_terminates_even_if_every_round_pushes_a_non_clean_fix(
+    tmp_path: Path,
+) -> None:
+    """Worst case: every round finds something and pushes a fix. The chain must still stop
+    after MAX_INTERNAL_REVIEW_ROUNDS reviews, not loop the way the issue fixer did."""
+    from dev_agents.pr_fixer import MAX_INTERNAL_REVIEW_ROUNDS
+
+    service, state = _service_with_reviews(tmp_path)
+    head = "head-0"
+    rounds: list[int] = []
+    for index in range(20):  # far more than could ever be legitimate
+        plan = service._review_plan(42, head)
+        if plan is None:
+            break
+        rounds.append(plan["round"])
+        new_head = f"head-{index + 1}"
+        ended = plan["round"] >= MAX_INTERNAL_REVIEW_ROUNDS - 1
+        _record_review(
+            state, f"pr-review-42-{index}", review_round=plan["round"], reviewed_head=head,
+            fix_pushed=True, verdict="findings", exhausted_head=new_head if ended else None,
+        )
+        head = new_head
+        # Start times have one-second resolution; space the runs out so "latest" is unambiguous.
+        with sqlite3.connect(tmp_path / "state.db") as connection:
+            connection.execute(
+                "UPDATE runs SET started_at = ? WHERE run_id = ?",
+                (f"2026-09-24T12:{index:02d}:00+00:00", f"pr-review-42-{index}"),
+            )
+
+    assert rounds == [0, 1, 2]
+    assert service._review_plan(42, head) is None
+
+
+def test_internal_review_stops_after_the_final_targeted_round_and_a_user_push_restarts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service, state = _service_with_reviews(tmp_path)
+    _record_review(
+        state, "pr-review-42-last", review_round=2, reviewed_head="round-two-head",
+        fix_pushed=True, verdict="findings", exhausted_head="final-sha",
     )
     metadata: dict[str, Any] = {
         "baseRefName": "staging",
@@ -724,9 +837,7 @@ def test_internal_review_stops_after_targeted_follow_up_fix(monkeypatch, tmp_pat
     }
     monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
 
-    service = PrFixerService("demo", project, config)
     capped = service._collect_feedback({"number": 42})
-
     assert capped["review_only"] is False
     assert capped["workflow"] == "pr-fixer"
 
@@ -734,6 +845,35 @@ def test_internal_review_stops_after_targeted_follow_up_fix(monkeypatch, tmp_pat
     next_review = service._collect_feedback({"number": 42})
     assert next_review["review_only"] is True
     assert next_review["review_round"] == 0
+
+
+def test_the_second_targeted_round_is_scheduled_for_a_fixed_unverified_head(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service, state = _service_with_reviews(tmp_path)
+    _record_review(
+        state, "pr-review-42-a", review_round=1, reviewed_head="pre-fix", fix_pushed=True,
+        verdict="findings", exhausted_head="final-sha",
+    )
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "headRefName": "feature/review-me",
+        "headRefOid": "final-sha",
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "labels": [],
+        "reviews": [],
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+    }
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+
+    scheduled = service._collect_feedback({"number": 42})
+
+    assert scheduled["review_only"] is True
+    assert scheduled["review_round"] == 2
+    assert scheduled["review_scope"] == "targeted-post-fix"
 
 
 def test_internal_review_stops_after_clean_targeted_follow_up(tmp_path: Path) -> None:
