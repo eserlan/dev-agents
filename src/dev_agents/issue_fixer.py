@@ -159,6 +159,17 @@ def _issue_result_body(number: int, run_id: str, pr_url: str | None, summary: st
 """
 
 
+def _issue_auto_pause_body(number: int, run_id: str, attempt: int, reason: str) -> str:
+    return f"""<!-- dev-agents:issue-fix issue={number} run={run_id} -->
+### 🤖 Dev-agents issue fixer auto-paused
+
+Issue #{number} failed {attempt} consecutive automation attempts ({reason}), so dev-agents applied
+the `paused` label to stop retrying and posting duplicate comments here.
+
+Remove the `paused` label once the underlying problem is resolved to resume automation.
+"""
+
+
 def _pr_result_body(number: int, run_id: str, summary: str) -> str:
     marker = f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->"
     return f"""{marker}
@@ -259,6 +270,21 @@ ISSUE_FIX_REPORT_END
 """
 
 
+def _drop_empty_local_branch(repo: Path, branch: str, base_branch: str) -> None:
+    """Delete a local branch that has no commits of its own and was never pushed."""
+    if not _run(
+        repo, "git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+    ):
+        return
+    if _run(repo, "git", "ls-remote", "--heads", "origin", branch, check=False):
+        return
+    ahead = _run(
+        repo, "git", "rev-list", "--count", f"origin/{base_branch}..refs/heads/{branch}", check=False
+    )
+    if ahead == "0":
+        _run(repo, "git", "branch", "-D", branch, check=False)
+
+
 @contextmanager
 def _isolated_issue_worktree(
     repo: Path, root: Path, branch: str, base_branch: str, *, max_concurrent: int = 2
@@ -307,6 +333,17 @@ def _isolated_issue_worktree(
                         repo, "git", "worktree", "add", "--detach", str(worktree), f"origin/{branch}"
                     )
                 else:
+                    # A previous attempt that failed before pushing leaves its empty local
+                    # branch behind (worktree removal keeps the ref), and `switch -c` would then
+                    # fail with "already exists" on every retry. Drop it if it holds no work;
+                    # if it does hold unpushed commits, continue from them instead.
+                    _drop_empty_local_branch(repo, branch, base_branch)
+                    has_local_branch = bool(
+                        _run(
+                            repo, "git", "rev-parse", "--verify", "--quiet",
+                            f"refs/heads/{branch}", check=False,
+                        )
+                    )
                     _run(
                         repo,
                         "git",
@@ -316,7 +353,10 @@ def _isolated_issue_worktree(
                         str(worktree),
                         f"origin/{base_branch}",
                     )
-                    _run(worktree, "git", "switch", "-c", branch)
+                    if has_local_branch:
+                        _run(worktree, "git", "switch", branch)
+                    else:
+                        _run(worktree, "git", "switch", "-c", branch)
             # rerere has no business in a one-shot automated worktree merge -- see
             # the matching note in runtime/worktree.py's isolated_worktree.
             merge = subprocess.run(
@@ -335,6 +375,7 @@ def _isolated_issue_worktree(
         finally:
             with lock:
                 _run(repo, "git", "worktree", "remove", "--force", str(worktree), check=False)
+                _drop_empty_local_branch(repo, branch, base_branch)
     finally:
         semaphore.release()
 
@@ -343,6 +384,7 @@ class IssueFixerRunState(TypedDict, total=False):
     issue: dict[str, Any]
     number: int
     run_id: str
+    attempt: int
     branch: str
     claimed: bool
     skip: bool
@@ -433,6 +475,7 @@ class IssueFixerService:
             "run_id": run_id,
             "branch": f"{self.config.branch_prefix}{number}",
             "claimed": True,
+            "attempt": claim.record.attempt,
         }
 
     def _remediate(self, state: IssueFixerRunState) -> dict[str, Any]:
@@ -441,11 +484,13 @@ class IssueFixerService:
         number = state["number"]
         run_id = state["run_id"]
         issue = state["issue"]
-        _publish_issue_comment(
-            self.project.repo,
-            number,
-            _issue_start_body(number, run_id, issue),
-        )
+        # Retries of a failed run must not re-announce themselves on every reconcile pass.
+        if int(state.get("attempt", 1)) <= 1:
+            _publish_issue_comment(
+                self.project.repo,
+                number,
+                _issue_start_body(number, run_id, issue),
+            )
         log_dir = (
             self.pr_config.log_dir
             or Path.home() / ".local/state/dev-agents" / self.project_name / "logs"
@@ -546,6 +591,36 @@ class IssueFixerService:
             "validation": f"Agent log: {log_path}",
         }
 
+    def _auto_pause_if_exhausted(
+        self, number: int, run_id: str, attempt: int, reason: str
+    ) -> bool:
+        """Apply the `paused` label after too many consecutive failures on one run_id.
+
+        A failed run stays reclaimable, so a persistent failure would otherwise retry and
+        re-comment on every reconcile pass forever (as the PR fixer's guard prevents).
+        """
+        if attempt < self.pr_config.max_consecutive_failures:
+            return False
+        repo = self.project.repo
+        try:
+            try:
+                _run(repo, "gh", "issue", "edit", str(number), "--add-label", "paused")
+            except RuntimeError:
+                # The label may not exist in this repository yet.
+                _run(
+                    repo, "gh", "label", "create", "paused", "--color", "fbca04",
+                    "--description", "Automation paused; remove to resume", check=False,
+                )
+                _run(repo, "gh", "issue", "edit", str(number), "--add-label", "paused")
+        except RuntimeError as error:
+            _log(f"issue-fixer auto-pause-label-failed issue={number} run_id={run_id} error={error}")
+            return False
+        _publish_issue_comment(
+            repo, number, _issue_auto_pause_body(number, run_id, attempt, reason)
+        )
+        _log(f"issue-fixer auto-paused issue={number} run_id={run_id} attempt={attempt}")
+        return True
+
     def _finalize(self, state: IssueFixerRunState) -> dict[str, Any]:
         if state.get("skip") or not state.get("claimed"):
             return {"fixed": False}
@@ -569,6 +644,9 @@ class IssueFixerService:
             metadata={"issue": number, "pr_url": pr_url, "summary": summary},
         )
         validation = state.get("validation", "Validation was not reported.")
+        attempt = int(state.get("attempt", 1))
+        if not state.get("fixed"):
+            self._auto_pause_if_exhausted(number, run_id, attempt, summary)
         pr_number = _pr_number_from_url(pr_url) if pr_url else None
         if pr_number is not None:
             _publish_issue_comment(
@@ -576,7 +654,9 @@ class IssueFixerService:
                 pr_number,
                 _pr_result_body(number, run_id, f"{summary}\n\n{validation}"),
             )
-        else:
+        elif state.get("fixed") or attempt <= 1:
+            # A repeated failure is not re-posted: the first one explained it, and the
+            # auto-pause comment covers the last.
             _publish_issue_comment(
                 self.project.repo,
                 number,
