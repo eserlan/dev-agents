@@ -42,7 +42,19 @@ No repeats — this overrides every sharing rule below:
 House rules — err on the side of sharing (for things not announced above):
 - App capabilities first: new or improved campaign-management or worldbuilding
   tools (vault, adventure, canvas, map, timeline, oracle, dice, generators,
-  sync/import) are ALWAYS postworthy, even small ones.
+  import) are postworthy, even small ones, when a GM can see or do something new
+  or different in them. Behind-the-scenes changes to those tools do not count
+  (see the next rule).
+- Technical changes are NOT announcements, and this overrides the "err on the
+  side of sharing" rule: performance, speed, battery or CPU improvements;
+  storage formats, sharding, schemas, migrations and caching; how sync or
+  Cloud Backup works internally; reliability, security hardening and other
+  fixes; refactors, dependencies, build and tooling. Delta sync, "sharded v2
+  storage" and "only uploads changed entities" are examples. Leave them out of
+  `features` entirely, even when the release also has real user-facing items,
+  and answer `"postworthy": false` when nothing else qualifies. A change belongs
+  in an announcement only if you can describe what a GM can now do that they
+  could not before, without using technical vocabulary. When in doubt, leave it out.
 - New content is worth sharing: answer clusters, system references, blog posts,
   articles, long-form guides, new generator content or worlds. Even a single
   new page counts; 2–4 new pages is a normal announcement, not "too small".

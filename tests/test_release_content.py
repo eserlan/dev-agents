@@ -106,6 +106,18 @@ def test_evaluator_prompt_routes_answer_pages_to_longform() -> None:
     assert "`reddit`" in body
 
 
+def test_evaluator_prompt_keeps_technical_changes_out_of_public_announcements() -> None:
+    """A Cloud Backup delta-sync/sharded-storage change was announced publicly because the
+    prompt said sync work was ALWAYS postworthy."""
+    body = load_skill_prompt("release-evaluate")
+
+    assert "sync/import" not in body
+    assert "Technical changes are NOT announcements" in body
+    for technical in ("Delta sync", "sharding", "battery or CPU", "Cloud Backup"):
+        assert technical in body
+    assert "leave it out" in body.lower()
+
+
 def test_render_template_leaves_unknown_braces() -> None:
     rendered = render_template("a {known} b {unknown} c", {"known": "X"})
     assert rendered == "a X b {unknown} c"
