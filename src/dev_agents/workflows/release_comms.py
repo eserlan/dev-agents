@@ -43,10 +43,12 @@ from dev_agents.workflows.release_history import (
     repeated_publication_keys,
 )
 from dev_agents.workflows.release_publish import (
+    PublicationError,
     PublicationReceipt,
     comment_tracking_issue,
     pending_publication_count,
     publication_key,
+    publish_internal_note,
     publish_release_drafts,
     upload_release_image,
 )
@@ -403,6 +405,7 @@ def build_release_comms_workflow() -> Any:
             importance=evaluation.importance,
             features=evaluation.features,
             recommended_channels=channels,
+            internal_note=evaluation.internal_note,
         )
 
     def merge_drafts(state: ReleaseCommsState) -> dict[str, Any]:
@@ -435,6 +438,7 @@ def build_release_comms_workflow() -> Any:
             importance=eval_res.importance,
             features=eval_res.features,
             recommended_channels=recommended_channels,
+            internal_note=eval_res.internal_note,
         )
         _emit(state, "drafted", _draft_counts(writer_res))
         image_drafts = [*writer_res.bluesky, *writer_res.github_discussions]
@@ -564,6 +568,14 @@ def build_release_comms_workflow() -> Any:
                     "earlier_runs": ",".join(sorted(repeated_runs)),
                 },
             )
+        evaluated = state.get("evaluator_result")
+        internal_note = evaluated.internal_note if evaluated is not None else ""
+        if internal_note:
+            _emit(
+                state,
+                "internal_note",
+                {"text": internal_note, "sent": not (dry_run or not publish_approved)},
+            )
         if dry_run or not publish_approved:
             _emit(state, "published", {"completed": True, "postworthy": postworthy})
             return {
@@ -586,6 +598,24 @@ def build_release_comms_workflow() -> Any:
             for record in state.get("existing_publications", [])
             if record.status in ("published", "staged")
         } | repeated_keys
+        if internal_note:
+            # Technical notes go to the project's own Discord only. A Discord failure must not
+            # block the public announcements below, so it is recorded rather than raised.
+            try:
+                for receipt in publish_internal_note(
+                    repo=state["project"].repo,
+                    note=internal_note,
+                    source_id=str(state["promote_run_id"]),
+                    env=os.environ,
+                    dry_run=False,
+                    already_published=already_published,
+                ):
+                    state["publication_sink"](receipt)
+                    already_published.add(
+                        publication_key(receipt.channel, receipt.destination, receipt.page_url)
+                    )
+            except PublicationError as error:
+                _emit(state, "internal_note_failed", {"error": str(error)[:200]})
         published, errors = publish_release_drafts(
             project=state["project"],
             drafts=drafts_dict or {},

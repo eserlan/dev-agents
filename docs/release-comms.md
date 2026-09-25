@@ -125,6 +125,22 @@ earlier runs:
    compared, two different pages that share a slug (say `/blog/tips` and `/answers/tips`) are
    treated as one; that fails toward not posting.
 
+## Internal technical notes
+
+Technical changes (performance, storage format, sync or backup internals, notable reliability or
+security work) are not public announcements. The evaluator keeps them out of `features` and
+instead returns an optional `internal_note`: one to three plain sentences in a dev-log voice. That
+note is posted **only to the Discord destinations** (currently `main-community`, the project's own
+community server) as `**Dev note:** ...`, never to Bluesky, Instagram, GitHub Discussions or
+Reddit. It is recorded as a Discord publication with the synthetic page URL `internal-note:<run>`,
+so it appears in the run report and is never sent twice for a run.
+
+`postworthy` still refers to public announcements only, so a release with only technical changes is
+recorded as "rejected" even though its note was posted. A failing Discord webhook is logged as an
+`internal_note_failed` event and does not block the public posts. Routine chores (dependency
+bumps, CI tweaks, formatting) get no note. A dry run reports the note in an `internal_note` event
+without sending it.
+
 ## Pinterest setup
 
 Pinterest is an opt-in destination (`publish_pinterest` in `release_publish.py`), wired the
