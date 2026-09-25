@@ -35,6 +35,10 @@ class EvaluatorResult:
     importance: str = "medium"
     features: list[dict[str, Any]] = field(default_factory=list)
     recommended_channels: list[str] = field(default_factory=list)
+    # A short note about notable technical changes (performance, storage, sync internals, ...).
+    # It is sent only to the project's own Discord, never to a public channel, and it is
+    # independent of ``postworthy``, which concerns public announcements.
+    internal_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -204,6 +208,9 @@ def collect_release_delta(
     )
 
 
+INTERNAL_NOTE_LIMIT = 600
+
+
 def parse_evaluator_result(data: dict[str, Any] | None) -> EvaluatorResult | None:
     """Validate an evaluator JSON payload; None when unusable."""
     if not isinstance(data, dict) or not isinstance(data.get("postworthy"), bool):
@@ -220,7 +227,17 @@ def parse_evaluator_result(data: dict[str, Any] | None) -> EvaluatorResult | Non
         recommended_channels=[item for item in channels if isinstance(item, str)]
         if isinstance(channels, list)
         else [],
+        internal_note=_clean_internal_note(data.get("internal_note")),
     )
+
+
+def _clean_internal_note(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    note = value.strip()
+    if len(note) > INTERNAL_NOTE_LIMIT:
+        note = note[: INTERNAL_NOTE_LIMIT - 1].rstrip() + "…"
+    return note
 
 
 def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:

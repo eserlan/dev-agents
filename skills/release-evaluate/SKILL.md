@@ -53,8 +53,15 @@ House rules — err on the side of sharing (for things not announced above):
   storage" and "only uploads changed entities" are examples. Leave them out of
   `features` entirely, even when the release also has real user-facing items,
   and answer `"postworthy": false` when nothing else qualifies. A change belongs
-  in an announcement only if you can describe what a GM can now do that they
+  in a public announcement only if you can describe what a GM can now do that they
   could not before, without using technical vocabulary. When in doubt, leave it out.
+- Notable technical changes still get a short `internal_note`, which goes only to
+  the developer's own community Discord and never to a public channel. Write one
+  to three plain sentences in a casual dev-log voice (technical vocabulary is fine
+  there): what changed and why it matters, for example that a large vault now
+  syncs only its changed entities. No hashtags, no links, no emojis, at most about
+  400 characters. Use `""` when there is nothing notable. Routine chores do not
+  qualify: dependency bumps, CI or config tweaks, lint, formatting and small refactors.
 - New content is worth sharing: answer clusters, system references, blog posts,
   articles, long-form guides, new generator content or worlds. Even a single
   new page counts; 2–4 new pages is a normal announcement, not "too small".
@@ -75,5 +82,6 @@ House rules — err on the side of sharing (for things not announced above):
 Respond with ONLY a fenced ```json block shaped like:
 {"postworthy": true, "reason": "<one sentence>", "importance": "low|medium|high",
 "features": [{"name": "<feature>", "why_users_care": "<benefit>", "bluesky_worthy": true}],
-"recommended_channels": ["bluesky", "discord", "github_discussions"]}
+"recommended_channels": ["bluesky", "discord", "github_discussions"],
+"internal_note": "<technical note for the developer's own Discord, or empty>"}
 No other prose.

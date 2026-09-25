@@ -475,6 +475,36 @@ def _form_json(url: str, body: bytes | None, *, method: str = "POST") -> dict[st
     return value
 
 
+INTERNAL_NOTE_PREFIX = "internal-note:"
+
+
+def publish_internal_note(
+    *,
+    repo: Path,
+    note: str,
+    source_id: str,
+    env: Mapping[str, str],
+    dry_run: bool,
+    already_published: set[tuple[str, str]],
+) -> list[PublicationReceipt]:
+    """Post a short technical note to the Discord destinations only, never to a public channel.
+
+    The receipts carry a synthetic ``internal-note:<run>`` page URL, so the note is recorded,
+    shown in the run report, and never posted twice for the same run.
+    """
+    text = note.strip()
+    if not text:
+        return []
+    page_url = f"{INTERNAL_NOTE_PREFIX}{source_id}"
+    if any(
+        channel == "discord" and key.endswith(f"\n{page_url}") for channel, key in already_published
+    ):
+        return []
+    return publish_discord(
+        repo=repo, message=f"**Dev note:** {text}", env=env, dry_run=dry_run, page_url=page_url
+    )
+
+
 def publish_pinterest(
     *,
     title: str,

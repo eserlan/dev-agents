@@ -118,6 +118,26 @@ def test_evaluator_prompt_keeps_technical_changes_out_of_public_announcements() 
     assert "leave it out" in body.lower()
 
 
+def test_evaluator_prompt_routes_technical_changes_to_an_internal_note() -> None:
+    body = load_skill_prompt("release-evaluate")
+
+    assert '"internal_note"' in body
+    assert "developer's own community Discord" in body
+    assert "never to a public channel" in body
+    assert "Routine chores do not" in body
+
+
+def test_parse_evaluator_result_reads_and_bounds_the_internal_note() -> None:
+    base = {"postworthy": False, "reason": "technical only"}
+
+    assert parse_evaluator_result(base).internal_note == ""  # type: ignore[union-attr]
+    assert parse_evaluator_result({**base, "internal_note": 7}).internal_note == ""  # type: ignore[union-attr]
+    noted = parse_evaluator_result({**base, "internal_note": "  Delta sync for big vaults.  "})
+    assert noted is not None and noted.internal_note == "Delta sync for big vaults."
+    long = parse_evaluator_result({**base, "internal_note": "x" * 5000})
+    assert long is not None and len(long.internal_note) == 600 and long.internal_note.endswith("…")
+
+
 def test_render_template_leaves_unknown_braces() -> None:
     rendered = render_template("a {known} b {unknown} c", {"known": "X"})
     assert rendered == "a X b {unknown} c"
