@@ -36,8 +36,13 @@ def format_reddit_post(
     page_url: str,
     source_id: str = "",
     image_url: str | None = None,
+    post_type: str | None = None,
 ) -> dict[str, Any]:
-    """Format a Reddit candidate payload for Devvit ingestion."""
+    """Format a Reddit candidate payload for Devvit ingestion.
+
+    ``post_type`` is "link" (the Devvit app's default: the page as a link post with the write-up
+    as its first comment) or "text" (the write-up as the post body); omitted, the app decides.
+    """
     clean_body = body.strip()
 
     # Convert any markdown image embeds ![alt](url) to clean clickable links
@@ -51,17 +56,10 @@ def format_reddit_post(
     if image_url and image_url not in clean_body:
         clean_body = f"{clean_body}\n\n[🖼️ View Illustration / Reference Guide]({image_url})"
 
-    id_tag = f"<!-- id:{source_id} -->" if source_id else ""
-    standard_footer = "*Posted automatically via release pipeline. Feedback and discussion welcome!*"
-    if standard_footer not in clean_body:
-        footer = f"\n\n---\n{standard_footer}"
-        if id_tag and id_tag not in clean_body:
-            footer += f"\n{id_tag}"
-        formatted_body = f"{clean_body}{footer}"
-    else:
-        formatted_body = clean_body
-        if id_tag and id_tag not in clean_body:
-            formatted_body += f"\n{id_tag}"
+    # No "posted automatically" footer and no hidden `<!-- id:... -->` tag: Reddit escapes raw HTML,
+    # so the tag would show up as text. Published posts are matched back to their staged entry by
+    # the page link in the post instead (see sync_reddit_status).
+    formatted_body = clean_body
 
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", title.lower()).strip("-")[:40]
     candidate_id = (
@@ -69,7 +67,7 @@ def format_reddit_post(
         if source_id and slug
         else (f"reddit-{source_id}" if source_id else f"reddit-{slug}")
     )
-    return {
+    candidate: dict[str, Any] = {
         "id": candidate_id or "reddit-candidate",
         "title": title,
         "body": formatted_body,
@@ -79,6 +77,9 @@ def format_reddit_post(
         "status": "approved",
         "created_at": int(time.time()),
     }
+    if post_type:
+        candidate["post_type"] = post_type
+    return candidate
 
 
 DEFAULT_MANIFEST_KEY = "announcements/reddit-candidates.json"

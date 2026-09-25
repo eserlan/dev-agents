@@ -1,12 +1,12 @@
 import { Devvit } from '@devvit/public-api';
-import bundledManifest from './candidates.json';
+import bundledManifest from './candidates.json' with { type: 'json' };
 import {
   getQueueStatus,
   markPostPublished,
   syncCandidatesFromBundle,
   REDIS_POST_PREFIX,
 } from './queue.js';
-import { publishCandidatePost } from './publisher.js';
+import { buttonCandidates, buttonLabels, publishBundledCandidate } from './release.js';
 import type { CandidatePost } from './types.js';
 
 const BUNDLED_CANDIDATES = bundledManifest.candidates as CandidatePost[];
@@ -99,23 +99,46 @@ Devvit.addMenuItem({
       context.ui.showToast('No unposted approved release candidate is available.');
       return;
     }
-
-    try {
-      const subreddit = await context.reddit.getCurrentSubreddit();
-      context.ui.showToast(`Publishing "${candidate.title}"...`);
-
-      const result = await publishCandidatePost(
-        context.reddit,
-        subreddit.name,
-        candidate
-      );
-      await markPostPublished(context.redis, candidate, result.redditPostId);
-
-      context.ui.showToast(`Published successfully to r/${subreddit.name}!`);
-    } catch (err) {
-      context.ui.showToast(`Publishing failed: ${err}`);
-    }
+    await postCandidate(context, candidate);
   },
+});
+
+async function postCandidate(
+  context: Devvit.Context,
+  candidate: CandidatePost
+): Promise<void> {
+  try {
+    const subreddit = await context.reddit.getCurrentSubreddit();
+    context.ui.showToast(`Publishing "${candidate.title}"...`);
+    const outcome = await publishBundledCandidate(
+      context.redis,
+      context.reddit,
+      subreddit.name,
+      candidate
+    );
+    context.ui.showToast(
+      outcome.kind === 'already-posted'
+        ? `"${candidate.title}" was already posted.`
+        : `Published successfully to r/${subreddit.name}!`
+    );
+  } catch (err) {
+    context.ui.showToast(`Publishing failed: ${err}`);
+  }
+}
+
+// One button per bundled release, so each can be posted on its own and in any order.
+// The bundle is baked into the app build, so these are registered when the app is built.
+const releaseButtons = buttonCandidates(BUNDLED_CANDIDATES);
+const releaseLabels = buttonLabels(releaseButtons);
+releaseButtons.forEach((candidate, index) => {
+  Devvit.addMenuItem({
+    location: 'subreddit',
+    label: releaseLabels[index],
+    forUserType: 'moderator',
+    onPress: async (_, context) => {
+      await postCandidate(context, candidate);
+    },
+  });
 });
 
 export default Devvit;

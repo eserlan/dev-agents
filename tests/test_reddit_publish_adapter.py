@@ -36,13 +36,23 @@ def test_format_reddit_post_creates_expected_payload() -> None:
     assert post["id"].startswith("reddit-pr-3093-superheroes-villains-dynamic-alignment")
     assert post["title"] == "Superheroes & Villains: Dynamic Alignment System"
     assert "I built an alignment tracker" in post["body"]
-    assert "*Posted automatically via release pipeline. Feedback and discussion welcome!*" in post["body"]
-    assert "<!-- id:pr-3093 -->" in post["body"]
+    assert "Posted automatically" not in post["body"]
+    assert "<!-- id:" not in post["body"]
     assert post["url"] == "https://codexcryptica.com/answers/superhero-alignments"
     assert post["image_url"] == "https://assets.codexcryptica.com/og/superheroes.jpg"
     assert post["source_id"] == "pr-3093"
     assert post["status"] == "approved"
     assert isinstance(post["created_at"], int)
+
+
+def test_format_reddit_post_only_sets_post_type_when_asked() -> None:
+    default = format_reddit_post(title="T", body="B", page_url="https://example.com/p")
+    text = format_reddit_post(
+        title="T", body="B", page_url="https://example.com/p", post_type="text"
+    )
+
+    assert "post_type" not in default
+    assert text["post_type"] == "text"
 
 
 def test_stage_reddit_candidate_dry_run(tmp_path: Path) -> None:
@@ -301,7 +311,7 @@ def test_cli_export_reddit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caps
     assert "## Image (Drag & drop into Reddit)" in content
     assert "https://codexcryptica.com/answers/magic" in content
     assert "Here are the new magic rules." in content
-    assert "<!-- id:run-42 -->" in content
+    assert "<!-- id:" not in content
 
 
 def test_export_reddit_markdown_formats_multiple_discussions() -> None:
@@ -313,7 +323,7 @@ def test_export_reddit_markdown_formats_multiple_discussions() -> None:
     assert "Post 1" in markdown
     assert "Post 2" in markdown
     assert "## Image (Drag & drop into Reddit)" in markdown
-    assert "<!-- id:pr-123 -->" in markdown
+    assert "<!-- id:" not in markdown
     assert "---" in markdown
 
 

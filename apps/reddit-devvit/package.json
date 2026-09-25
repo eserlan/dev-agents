@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc --noEmit",
     "playtest": "devvit playtest",
-    "upload": "devvit upload"
+    "upload": "devvit upload",
+    "test": "bun test"
   },
   "dependencies": {
     "@devvit/public-api": "0.14.4"

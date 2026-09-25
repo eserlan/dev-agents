@@ -10,6 +10,18 @@ export interface PublishResult {
   commentPosted: boolean;
 }
 
+/**
+ * Strip the "posted automatically" footer and the hidden id tag that earlier pipeline versions
+ * added to candidate bodies. Reddit escapes raw HTML, so the tag would appear as text.
+ */
+export function cleanBody(body: string): string {
+  return body
+    .replace(/<!--\s*id:[A-Za-z0-9_-]+\s*-->/g, '')
+    .replace(/\n*-{3,}[ \t]*\n\s*\*Posted automatically[^\n]*\*[ \t]*/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function isHttpUrl(value: string | undefined): value is string {
   return Boolean(value && /^https?:\/\//i.test(value.trim()));
 }
@@ -33,7 +45,7 @@ export async function publishCandidatePost(
 ): Promise<PublishResult> {
   // Convert any markdown image embeds ![alt](url) to clean clickable links
   // because Reddit selftext does not render external image embeds inline.
-  let text = candidate.body.replace(
+  let text = cleanBody(candidate.body).replace(
     /!\[([^\]]*)\]\((https?:\/\/[^)]+)\)/g,
     (_, alt, url) => `[🖼️ ${alt.trim() || 'View Illustration'}](${url})`
   );
@@ -41,7 +53,7 @@ export async function publishCandidatePost(
   // Preferred: submit the candidate's page as a link post. Reddit renders the page's own
   // preview image (its og:image), so no image has to be uploaded or linked, and the
   // write-up goes in as the first comment. This avoids image hosting restrictions.
-  if (isHttpUrl(candidate.url)) {
+  if (candidate.post_type !== 'text' && isHttpUrl(candidate.url)) {
     const post = await reddit.submitPost({
       subredditName,
       title: candidate.title,
@@ -66,14 +78,13 @@ export async function publishCandidatePost(
     };
   }
 
-  // No page to link to: fall back to a text post, with the image (if any) as a clean link.
+  // Text post (requested per candidate, or there is no page to link to). Make sure the page and
+  // the image (if any) are reachable as plain links in the body.
+  if (isHttpUrl(candidate.url) && !text.includes(candidate.url.trim())) {
+    text = `${text}\n\n${candidate.url.trim()}`;
+  }
   if (candidate.image_url && !text.includes(candidate.image_url)) {
-    const link = `\n\n[🖼️ View Illustration / Reference Guide](${candidate.image_url})`;
-    if (text.includes('\n\n---')) {
-      text = text.replace('\n\n---', `${link}\n\n---`);
-    } else {
-      text = `${text}${link}`;
-    }
+    text = `${text}\n\n[🖼️ View Illustration / Reference Guide](${candidate.image_url})`;
   }
 
   const post = await reddit.submitPost({

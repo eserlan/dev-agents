@@ -73,6 +73,14 @@ stages and installs the candidate; it does not submit the Reddit post. The
 moderator's menu action is the final publish step. The app's hourly job only
 refreshes queue state; it does not publish posts in the background.
 
+Posts carry no "posted automatically" footer and no hidden `<!-- id:... -->` tag (Reddit escapes
+raw HTML, so the tag showed up as text). The publisher also strips both from candidates staged by
+older versions. Published posts are matched back to their staged entry by the page link they
+contain (or, for link posts, the URL they were submitted with), so a text post's body must include
+the page link; the publisher appends it if missing.
+
+Per candidate, `post_type` selects the format. The default is:
+
 When the candidate has a page URL, Reddit receives a link post and the drafted
 copy as its first comment. The app tracks posted candidate IDs in Redis to
 avoid duplicate submissions.

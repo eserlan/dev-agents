@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from dev_agents.config import IssueFixerConfig, PrFixerConfig, ProjectConfig
 from dev_agents.issue_fixer import (
     IssueFixerService,
     _existing_issue_pr,
+    _isolated_issue_worktree,
     _issue_result_body,
     _open_bug_issues,
     _pr_number_from_url,
@@ -239,3 +241,166 @@ def test_collect_issue_skips_paused_bug(
 
     assert result["skip"] is True
     assert state.list_runs("issue-fixer") == []
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _clone_with_origin(tmp_path: Path) -> Path:
+    """A clone of a bare origin whose `main` has one commit."""
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", str(origin), str(clone))
+    for key, value in (("user.email", "t@example.com"), ("user.name", "Test")):
+        _git(clone, "config", key, value)
+    (clone / "README.md").write_text("base\n", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "base")
+    _git(clone, "push", "-u", "origin", "main")
+    return clone
+
+
+def test_worktree_replaces_a_stale_empty_branch_instead_of_failing(tmp_path: Path) -> None:
+    """An aborted attempt leaves its empty local branch; every retry used to die on
+    `fatal: a branch named ... already exists`, which is what looped issues 337/338."""
+    clone = _clone_with_origin(tmp_path)
+    _git(clone, "branch", "dev-agents/gui-1")
+
+    with _isolated_issue_worktree(clone, tmp_path / "wt", "dev-agents/gui-1", "main") as (
+        worktree,
+        conflicts,
+    ):
+        assert conflicts == []
+        assert _git(worktree, "branch", "--show-current") == "dev-agents/gui-1"
+
+    # Nothing was pushed and nothing committed, so no leftover branch is kept for the next try.
+    assert _git(clone, "branch", "--list", "dev-agents/gui-1") == ""
+
+
+def test_worktree_continues_from_a_local_branch_that_has_unpushed_work(tmp_path: Path) -> None:
+    clone = _clone_with_origin(tmp_path)
+    _git(clone, "switch", "-c", "dev-agents/gui-2")
+    (clone / "work.txt").write_text("unpushed\n", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "unpushed work")
+    _git(clone, "switch", "main")
+
+    with _isolated_issue_worktree(clone, tmp_path / "wt", "dev-agents/gui-2", "main") as (
+        worktree,
+        _conflicts,
+    ):
+        assert (worktree / "work.txt").read_text(encoding="utf-8") == "unpushed\n"
+
+    assert _git(clone, "branch", "--list", "dev-agents/gui-2") != ""
+
+
+def _service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[IssueFixerService, list[tuple[int, str]], list[tuple[str, ...]]]:
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    state = StateRepository(tmp_path / "state.db", "lear-bear", tmp_path)
+    service = IssueFixerService(
+        "lear-bear", project, IssueFixerConfig(), PrFixerConfig(max_consecutive_failures=3), state
+    )
+    state.claim_run("issue-fixer", "issue-fix-92-abc123", metadata={"issue": 92})
+    comments: list[tuple[int, str]] = []
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._publish_issue_comment",
+        lambda repo, number, body: comments.append((number, body)) or True,
+    )
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._run", lambda repo, *args, **kwargs: commands.append(args) or ""
+    )
+    return service, comments, commands
+
+
+def _failed_state(attempt: int) -> dict[str, object]:
+    return {
+        "number": 92,
+        "run_id": "issue-fix-92-abc123",
+        "claimed": True,
+        "skip": False,
+        "fixed": False,
+        "pr_url": None,
+        "summary": "Issue fixer blocked: boom",
+        "validation": "exit=1",
+        "attempt": attempt,
+    }
+
+
+def test_repeated_failures_pause_the_issue_after_the_configured_number(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service, comments, commands = _service(monkeypatch, tmp_path)
+
+    service._finalize(_failed_state(1))  # type: ignore[arg-type]
+    assert [n for n, _ in comments] == [92]
+    assert "auto-paused" not in comments[0][1]
+    assert not any("--add-label" in command for command in commands)
+
+    comments.clear()
+    service._finalize(_failed_state(2))  # type: ignore[arg-type]
+    assert comments == []  # a repeat failure is not re-posted
+    assert not any("--add-label" in command for command in commands)
+
+    service._finalize(_failed_state(3))  # type: ignore[arg-type]
+    assert ("gh", "issue", "edit", "92", "--add-label", "paused") in commands
+    assert len(comments) == 1
+    assert "auto-paused" in comments[0][1]
+    assert "failed 3 consecutive" in comments[0][1]
+
+
+def test_pause_creates_the_label_when_the_repository_lacks_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service, comments, _ = _service(monkeypatch, tmp_path)
+    commands: list[tuple[str, ...]] = []
+    added = 0
+
+    def fake_run(repo: Path, *args: str, **kwargs: object) -> str:
+        nonlocal added
+        commands.append(args)
+        if args[:3] == ("gh", "issue", "edit"):
+            added += 1
+            if added == 1:
+                raise RuntimeError("could not add label: 'paused' not found")
+        return ""
+
+    monkeypatch.setattr("dev_agents.issue_fixer._run", fake_run)
+
+    service._finalize(_failed_state(3))  # type: ignore[arg-type]
+
+    assert ("gh", "label", "create", "paused") == commands[1][:4]
+    assert added == 2
+    assert "auto-paused" in comments[0][1]
+
+
+def test_a_retry_does_not_repost_the_started_comment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service, comments, _ = _service(monkeypatch, tmp_path)
+
+    def blocked(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("fatal: a branch named 'x' already exists")
+
+    monkeypatch.setattr("dev_agents.issue_fixer._isolated_issue_worktree", blocked)
+    base = {
+        "number": 92,
+        "run_id": "issue-fix-92-abc123",
+        "claimed": True,
+        "skip": False,
+        "issue": {"title": "T"},
+        "branch": "dev-agents/gui-92",
+    }
+
+    service._remediate({**base, "attempt": 1})  # type: ignore[arg-type]
+    assert len(comments) == 1 and "started" in comments[0][1]
+
+    comments.clear()
+    service._remediate({**base, "attempt": 7})  # type: ignore[arg-type]
+    assert comments == []
