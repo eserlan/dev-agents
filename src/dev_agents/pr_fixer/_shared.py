@@ -23,7 +23,9 @@ REVIEW_SKILL_CANDIDATES = (
     ".claude/skills/codex-review/SKILL.md",
     ".agents/skills/codex-review/SKILL.md",
 )
-MAX_INTERNAL_REVIEW_ROUNDS = 2
+# One full review, then up to two targeted post-fix verifications. The second targeted round only
+# runs when the first one pushed a fix without a clean verdict (see _round_ended_chain).
+MAX_INTERNAL_REVIEW_ROUNDS = 3
 
 
 def _log(message: str) -> None:

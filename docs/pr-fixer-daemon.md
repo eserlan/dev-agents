@@ -88,9 +88,15 @@ the target repository's canonical `.agent/skills/codex-review/SKILL.md` pass (wi
 fallbacks for older repositories). Concrete findings are fixed,
 tested, committed, and pushed from an isolated worktree. Auto-merge remains stricter and requires
 at least one completed successful check. A review chain allows one full initial review and, only
-when that review pushes a fix, one targeted post-fix verification of the resulting diff and prior
-findings. The chain is persisted per PR head SHA, capped after that verification, and a later
-user push starts a new chain; duplicate webhook and reconciliation deliveries are deduplicated.
+when that review pushes a fix, a targeted post-fix verification of the resulting diff and prior
+findings. If that verification itself pushes a fix without a `clean` verdict, the new head has
+still not been reviewed, so one more targeted round runs (`MAX_INTERNAL_REVIEW_ROUNDS = 3` reviews
+in total: one full and up to two targeted). Auto-merge only accepts a `clean` verdict, so without
+that extra round such a PR would wait forever for a review that could never come. A round that pushes nothing or comes back
+`clean` ends the chain early. The chain is persisted per PR head SHA, capped after the final
+round, and a later user push starts a new chain; duplicate webhook and reconciliation deliveries
+are deduplicated. If the last round still is not clean, auto-merge stays deferred and a human
+should review and merge.
 
 To avoid concurrent-agent rewrite loops, `pause_on_external_agent_commits` is enabled by default.
 When the latest commit author matches `external_agent_logins` (Jules is included in the example

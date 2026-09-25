@@ -78,6 +78,34 @@ class PrFixerRunState(TypedDict, total=False):
     review_prior_report: dict[str, Any] | None
 
 
+def _review_verdict(metadata: dict[str, Any]) -> str | None:
+    """The verdict of a review run's structured report, or None if there is no valid report."""
+    report = metadata.get("review_report")
+    if metadata.get("review_report_valid") is True and isinstance(report, dict):
+        verdict = report.get("verdict")
+        return str(verdict) if verdict else None
+    return None
+
+
+def _round_ended_chain(metadata: dict[str, Any]) -> bool:
+    """Whether the review round recorded in ``metadata`` leaves nothing further to verify.
+
+    Round 0 (the full review) never ends the chain itself: a fix pushed there is verified by a
+    targeted round. A targeted round ends the chain when it is the last allowed round, or when it
+    pushed nothing or came back ``clean``. Otherwise it pushed a fix that no review has seen, so
+    one more targeted round follows, bounded by MAX_INTERNAL_REVIEW_ROUNDS.
+    """
+    try:
+        review_round = int(metadata.get("review_round", 0))
+    except (TypeError, ValueError):
+        review_round = 0
+    if review_round <= 0:
+        return False
+    if review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
+        return True
+    return not (metadata.get("review_fix_pushed") and _review_verdict(metadata) != "clean")
+
+
 class PrFixerService:
     def __init__(self, project_name: str, project: ProjectConfig, config: PrFixerConfig):
         self.project_name, self.project, self.config = project_name, project, config
@@ -145,7 +173,10 @@ class PrFixerService:
         latest_head = str(metadata.get("head_sha", ""))
         chain_id = str(metadata.get("review_chain_id") or latest.run_id)
 
-        if metadata.get("review_exhausted_head_sha") == head_sha:
+        # The recorded exhausted head only counts when that round really ended the chain: a
+        # targeted round that pushed a non-clean fix leaves that head unverified (this is what
+        # left PR #339 waiting forever for a review that could never come).
+        if metadata.get("review_exhausted_head_sha") == head_sha and _round_ended_chain(metadata):
             return None
 
         # Older completed targeted reviews did not persist an exhausted head when
@@ -153,14 +184,15 @@ class PrFixerService:
         # so reconciliation cannot restart the same review indefinitely.
         if (
             latest.status == "completed"
-            and review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1
+            and review_round >= 1
             and latest_head == head_sha
+            and _round_ended_chain(metadata)
         ):
             return None
 
-        if review_round == 0 and metadata.get("review_fix_pushed"):
+        if metadata.get("review_fix_pushed") and not _round_ended_chain(metadata):
             return {
-                "round": 1,
+                "round": review_round + 1,
                 "scope": "targeted-post-fix",
                 "chain_id": chain_id,
                 "parent_run_id": latest.run_id,
@@ -578,7 +610,14 @@ class PrFixerService:
                 if review_round == 0
                 else ["targeted-post-fix"]
             )
-            exhausted_head_sha = (new_sha or old_sha) if review_round >= 1 else None
+            round_outcome = {
+                "review_round": review_round,
+                "review_fix_pushed": fix_pushed,
+                "review_report": state.get("report", {}).get("review_report"),
+                "review_report_valid": state.get("report", {}).get("report_valid", False),
+            }
+            exhausted_head_sha = (new_sha or old_sha) if _round_ended_chain(round_outcome) else None
+            follow_up_pending = fix_pushed and exhausted_head_sha is None
             changed_files = [
                 path
                 for path in _pkg._run(
@@ -622,8 +661,8 @@ class PrFixerService:
                     "passes": review_passes,
                     "review_round": review_round,
                     "review_fix_pushed": fix_pushed,
-                    "review_follow_up_pending": review_round == 0 and fix_pushed,
-                    "review_follow_up_head_sha": new_sha if review_round == 0 and fix_pushed else None,
+                    "review_follow_up_pending": follow_up_pending,
+                    "review_follow_up_head_sha": new_sha if follow_up_pending else None,
                     "review_exhausted_head_sha": exhausted_head_sha,
                     "summary_comment_posted": comment_posted,
                     "review_report": state.get("report", {}).get("review_report"),
@@ -642,8 +681,8 @@ class PrFixerService:
                     "review_parent_sha": state.get("review_parent_sha"),
                     "review_prior_report": state.get("review_prior_report"),
                     "review_fix_pushed": fix_pushed,
-                    "review_follow_up_pending": review_round == 0 and fix_pushed,
-                    "review_follow_up_head_sha": new_sha if review_round == 0 and fix_pushed else None,
+                    "review_follow_up_pending": follow_up_pending,
+                    "review_follow_up_head_sha": new_sha if follow_up_pending else None,
                     "review_exhausted_head_sha": exhausted_head_sha,
                     "review_report": state.get("report", {}).get("review_report"),
                     "review_report_valid": state.get("report", {}).get("report_valid", False),
