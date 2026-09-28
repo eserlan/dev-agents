@@ -96,6 +96,9 @@ class ReleaseCommsConfig(BaseModel):
         "x",
         "reddit",
     ]
+    # Per-provider options stay data-driven so new publishers do not require
+    # another provider-specific config model.
+    destination_options: dict[str, dict[str, str]] = Field(default_factory=dict)
     subreddit: str = "codexcryptica"
     # Optional Devvit companion app checkout. When set, approved Reddit candidates
     # are bundled into the app and uploaded/installed after staging.

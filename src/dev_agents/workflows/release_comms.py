@@ -30,6 +30,7 @@ from dev_agents.workflows.release_content import (
     run_evaluator_pass,
     run_longform_writer_pass,
     run_shortform_writer_pass,
+    run_threads_adaptation_pass,
     select_forms,
     sync_asset_db,
     verify_draft_images,
@@ -43,13 +44,16 @@ from dev_agents.workflows.release_history import (
     repeated_publication_keys,
 )
 from dev_agents.workflows.release_publish import (
+    SOCIAL_PUBLISHERS,
     PublicationError,
     PublicationReceipt,
+    SocialPost,
     comment_tracking_issue,
     pending_publication_count,
     publication_key,
     publish_internal_note,
     publish_release_drafts,
+    resolve_image,
     upload_release_image,
 )
 
@@ -206,6 +210,7 @@ def _draft_counts(drafts: WriterResult) -> dict[str, Any]:
     """Summarize generated copy without dumping full text into logs."""
     return {
         "bluesky": len(drafts.bluesky),
+        "threads": len(drafts.threads),
         "github_discussions": len(drafts.github_discussions),
         "discord": bool(drafts.bluesky) or bool(drafts.discord and drafts.discord.strip()),
     }
@@ -381,7 +386,21 @@ def build_release_comms_workflow() -> Any:
     def align_discussion_images(writer_res: WriterResult) -> WriterResult:
         """Give Discussions the same page/image source as their short drafts."""
         bluesky = [dict(item) for item in writer_res.bluesky]
+        threads = [dict(item) for item in writer_res.threads]
         discussions = [dict(item) for item in writer_res.github_discussions]
+        for index, thread in enumerate(threads):
+            source = next(
+                (
+                    item
+                    for item in bluesky
+                    if item.get("pageUrl") == thread.get("pageUrl") and item.get("pageUrl")
+                ),
+                bluesky[index] if index < len(bluesky) else {},
+            )
+            if not thread.get("pageUrl") and source.get("pageUrl"):
+                thread["pageUrl"] = source["pageUrl"]
+            if not thread.get("image") and source.get("image"):
+                thread["image"] = source["image"]
         for index, discussion in enumerate(discussions):
             source = bluesky[index] if index < len(bluesky) else {}
             if not discussion.get("pageUrl") and source.get("pageUrl"):
@@ -390,15 +409,21 @@ def build_release_comms_workflow() -> Any:
                 discussion["image"] = source["image"]
         return WriterResult(
             bluesky=bluesky,
+            threads=threads,
             github_discussions=discussions,
+            discord=writer_res.discord,
         )
 
     def with_derived_channels(
-        evaluation: EvaluatorResult, writer_res: WriterResult
+        evaluation: EvaluatorResult,
+        writer_res: WriterResult,
+        enabled_destinations: list[str],
     ) -> EvaluatorResult:
         channels = list(evaluation.recommended_channels)
         if writer_res.bluesky and "discord" not in channels:
             channels.append("discord")
+        if writer_res.threads and "threads" in enabled_destinations and "threads" not in channels:
+            channels.append("threads")
         return EvaluatorResult(
             postworthy=evaluation.postworthy,
             reason=evaluation.reason,
@@ -416,7 +441,7 @@ def build_release_comms_workflow() -> Any:
         injected = state.get("writer_result")
         if injected is not None:
             injected = align_discussion_images(injected)
-            eval_res = with_derived_channels(eval_res, injected)
+            eval_res = with_derived_channels(eval_res, injected, state["config"].destinations)
             _emit(state, "drafted", _draft_counts(injected))
             return {"writer_result": injected, "evaluator_result": eval_res}
         bluesky = state.get("short_drafts") or []
@@ -428,6 +453,8 @@ def build_release_comms_workflow() -> Any:
         writer_res = align_discussion_images(writer_res)
         enabled_destinations = state["config"].destinations
         recommended_channels = recommend_channels(writer_res, enabled=enabled_destinations)
+        if "threads" in enabled_destinations and "threads" in eval_res.recommended_channels:
+            recommended_channels.append("threads")
         if writer_res.bluesky:
             for extra in ("instagram", "x", "pinterest"):
                 if extra in enabled_destinations and extra not in recommended_channels:
@@ -461,6 +488,50 @@ def build_release_comms_workflow() -> Any:
             "evaluator_result": updated,
             "image_statuses": statuses,
         }
+
+    def adapt_threads(state: ReleaseCommsState) -> dict[str, Any]:
+        """Run the provider-specific copy pass only when Threads is selected."""
+        evaluator = state.get("evaluator_result")
+        writer_res = state.get("writer_result")
+        if (
+            evaluator is None
+            or not evaluator.postworthy
+            or "threads" not in evaluator.recommended_channels
+            or "threads" not in state["config"].destinations
+            or writer_res is None
+            or not writer_res.bluesky
+            or writer_res.threads
+        ):
+            return {}
+        adapted = run_threads_adaptation_pass(
+            repo=state["repo"],
+            evaluator=evaluator,
+            base_drafts=writer_res.bluesky,
+            providers=state["config"].providers,
+            log_dir=local_log_dir(state),
+            run_id=state["promote_run_id"],
+            timeout_seconds=local_timeout(state),
+            recent_posts=recent_posts(state),
+        )
+        updated_writer = WriterResult(
+            bluesky=writer_res.bluesky,
+            threads=adapted,
+            github_discussions=writer_res.github_discussions,
+            discord=writer_res.discord,
+        )
+        channels = list(evaluator.recommended_channels)
+        if "threads" not in channels:
+            channels.append("threads")
+        updated_evaluator = EvaluatorResult(
+            postworthy=evaluator.postworthy,
+            reason=evaluator.reason,
+            importance=evaluator.importance,
+            features=evaluator.features,
+            recommended_channels=channels,
+            internal_note=evaluator.internal_note,
+        )
+        _emit(state, "threads_adapted", {"posts": len(adapted)})
+        return {"writer_result": updated_writer, "evaluator_result": updated_evaluator}
 
     def pick_art(state: ReleaseCommsState) -> str:
         if not state["config"].image_generation:
@@ -513,6 +584,7 @@ def build_release_comms_workflow() -> Any:
             raise RuntimeError("generated art could not be published: " + "; ".join(failures))
         updated_bluesky = [dict(item) for item in writer_res.bluesky]
         updated_discussions = [dict(item) for item in writer_res.github_discussions]
+        updated_threads = [dict(item) for item in writer_res.threads]
         for draft in updated_bluesky:
             image_url = overrides.get(draft.get("pageUrl", ""))
             if image_url:
@@ -526,10 +598,16 @@ def build_release_comms_workflow() -> Any:
             image_url = overrides.get(page_url, "")
             if image_url:
                 discussion["image"] = image_url
+        for thread in updated_threads:
+            image_url = overrides.get(thread.get("pageUrl", ""))
+            if image_url:
+                thread["image"] = image_url
         return {
             "writer_result": WriterResult(
                 bluesky=updated_bluesky,
+                threads=updated_threads,
                 github_discussions=updated_discussions,
+                discord=writer_res.discord,
             ),
             "image_overrides": overrides,
         }
@@ -539,6 +617,7 @@ def build_release_comms_workflow() -> Any:
         publish_approved = state.get("publish_approved", False)
         publications: dict[str, Any] = state.get("publications") or {
             "bluesky": [],
+            "threads": [],
             "discord": [],
             "instagram": [],
             "x": [],
@@ -553,7 +632,7 @@ def build_release_comms_workflow() -> Any:
         # page with the same slug in an earlier run, even if the URL prefix has since changed.
         draft_urls = [
             str(draft.get("pageUrl", ""))
-            for field in ("bluesky", "github_discussions")
+            for field in ("bluesky", "threads", "github_discussions")
             for draft in (drafts_dict or {}).get(field) or []
         ]
         repeated_keys, repeated_runs = repeated_publication_keys(
@@ -577,6 +656,35 @@ def build_release_comms_workflow() -> Any:
                 {"text": internal_note, "sent": not (dry_run or not publish_approved)},
             )
         if dry_run or not publish_approved:
+            # Threads previews use the same adapter shaping logic as live posts
+            # but do not require credentials or make network calls.
+            if dry_run and drafts_dict is not None:
+                options = state["config"].destination_options.get("threads", {})
+                for draft in drafts_dict.get("threads") or []:
+                    if not isinstance(draft, dict):
+                        continue
+                    image_url = image_alt = ""
+                    if str(draft.get("image", "")).strip():
+                        try:
+                            image_url, image_alt = resolve_image(
+                                draft, state.get("image_overrides")
+                            )
+                        except PublicationError:
+                            pass
+                    receipt = SOCIAL_PUBLISHERS["threads"].publish(
+                        SocialPost(
+                            text=str(draft.get("text", "")),
+                            canonical_url=str(draft.get("pageUrl", "")),
+                            source_id=str(state["promote_run_id"]),
+                            image_url=image_url,
+                            image_alt=image_alt,
+                            topic_tag=str(draft.get("topic_tag", "")),
+                        ),
+                        options=options,
+                        env={},
+                        dry_run=True,
+                    )
+                    publications.setdefault("threads", []).append(receipt.__dict__)
             _emit(state, "published", {"completed": True, "postworthy": postworthy})
             return {
                 "publications": publications,
@@ -598,6 +706,11 @@ def build_release_comms_workflow() -> Any:
             for record in state.get("existing_publications", [])
             if record.status in ("published", "staged")
         } | repeated_keys
+        pending_provider_ids = {
+            (record.channel, record.page_url): record.external_id
+            for record in state.get("existing_publications", [])
+            if record.status == "pending" and record.channel == "threads" and record.external_id
+        }
         if internal_note:
             # Technical notes go to the project's own Discord only. A Discord failure must not
             # block the public announcements below, so it is recorded rather than raised.
@@ -628,6 +741,7 @@ def build_release_comms_workflow() -> Any:
             publication_delay_max_seconds=0,
             max_publications=1,
             on_receipt=state["publication_sink"],
+            pending_provider_ids=pending_provider_ids,
             source_id=str(state["promote_run_id"]),
             devvit_app_dir=(state["config"].devvit_app_dir),
             devvit_subreddit=(state["config"].devvit_subreddit or state["config"].subreddit),
@@ -712,6 +826,7 @@ def build_release_comms_workflow() -> Any:
     graph.add_node("write_short", write_short)
     graph.add_node("write_long", write_long)
     graph.add_node("merge_drafts", merge_drafts)
+    graph.add_node("adapt_threads", adapt_threads)
     graph.add_node("generate_art", generate_art)
     graph.add_node("publish_destinations", publish_destinations)
     graph.add_node("schedule_publication", schedule_publication)
@@ -722,7 +837,8 @@ def build_release_comms_workflow() -> Any:
     graph.add_conditional_edges("route_forms", pick_forms)
     graph.add_edge("write_short", "merge_drafts")
     graph.add_edge("write_long", "merge_drafts")
-    graph.add_conditional_edges("merge_drafts", pick_art)
+    graph.add_edge("merge_drafts", "adapt_threads")
+    graph.add_conditional_edges("adapt_threads", pick_art)
     graph.add_edge("generate_art", "publish_destinations")
     graph.add_conditional_edges("publish_destinations", route_after_publish)
     graph.add_edge("schedule_publication", END)
@@ -799,9 +915,12 @@ def run_release_comms(
             on_event(event, payload)
 
     def persist_publication(receipt: PublicationReceipt) -> None:
+        receipt_status = receipt.metadata.get("status") if receipt.metadata else None
         status = (
-            "staged"
-            if receipt.metadata and receipt.metadata.get("status") == "staged_to_r2"
+            "pending"
+            if receipt_status == "pending"
+            else "staged"
+            if receipt_status == "staged_to_r2"
             else "published"
         )
         repository.record_publication(

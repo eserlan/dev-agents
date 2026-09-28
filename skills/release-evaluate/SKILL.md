@@ -72,16 +72,20 @@ House rules — err on the side of sharing (for things not announced above):
 - importance: "high" for new tools, generators, or major features; "medium"
   for typical content batches and meaningful tool improvements; "low" for
   single small tweaks that still clear the bar.
-- Channels: any release featuring new or substantially updated answer, blog,
+- Channels: include `threads` when recommending a short-form post. When that
+  destination is enabled, release-comms generates a separate Threads-native
+  adaptation from the source copy. Disabled destinations are filtered later.
+  Any release featuring new or substantially updated answer, blog,
   article, or guide pages MUST list `github_discussions` in `recommended_channels`.
   That drives the long-form discussion post — one new page is enough, no minimum
   batch. Add `reddit` too when the topic has broad GM/player interest (system
   advice, campaign techniques, genre guides); skip `reddit` for narrow or
-  site-specific pages. Short-form coverage (bluesky/discord) is unchanged.
+  site-specific pages. Short-form coverage includes bluesky, threads, and
+  discord when those destinations make sense.
 
 Respond with ONLY a fenced ```json block shaped like:
 {"postworthy": true, "reason": "<one sentence>", "importance": "low|medium|high",
 "features": [{"name": "<feature>", "why_users_care": "<benefit>", "bluesky_worthy": true}],
-"recommended_channels": ["bluesky", "discord", "github_discussions"],
+"recommended_channels": ["bluesky", "threads", "discord", "github_discussions"],
 "internal_note": "<technical note for the developer's own Discord, or empty>"}
 No other prose.

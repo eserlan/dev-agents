@@ -46,6 +46,9 @@ class WriterResult:
     # Kept for state-file compatibility. Discord is derived from Bluesky copy
     # at publication time and this field is intentionally ignored.
     bluesky: list[dict[str, str]] = field(default_factory=list)
+    # Threads copy is adapted separately from Bluesky so the provider can keep
+    # the same release facts and canonical page link without cross-posting text.
+    threads: list[dict[str, str]] = field(default_factory=list)
     github_discussions: list[dict[str, str]] = field(default_factory=list)
     discord: str | None = None
 
@@ -245,7 +248,24 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
     if not isinstance(data, dict):
         return None
     bluesky = data.get("bluesky")
+    threads = data.get("threads")
     discussions = data.get("github_discussions")
+    thread_drafts: list[dict[str, str]] = []
+    if isinstance(threads, list):
+        for item in threads:
+            if not isinstance(item, dict) or not str(item.get("text", "")).strip():
+                continue
+            draft = {
+                "pageUrl": str(item.get("pageUrl", "")).strip(),
+                "text": str(item.get("text", "")).strip(),
+            }
+            image = str(item.get("image", "")).strip()
+            topic_tag = str(item.get("topic_tag", "")).strip()
+            if image:
+                draft["image"] = image
+            if topic_tag:
+                draft["topic_tag"] = topic_tag
+            thread_drafts.append(draft)
     discussion_drafts: list[dict[str, str]] = []
     if isinstance(discussions, list):
         for item in discussions:
@@ -275,6 +295,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
         ]
         if isinstance(bluesky, list)
         else [],
+        threads=thread_drafts,
         github_discussions=discussion_drafts,
     )
 
@@ -520,6 +541,7 @@ def recommend_channels(
     """Recommend channels that have generated copy and are enabled."""
     content = {
         "bluesky": bool(drafts.bluesky),
+        "threads": bool(drafts.threads),
         # Discord uses the corresponding Bluesky message with hashtags
         # removed; it does not need a separate writer draft.
         "discord": bool(drafts.bluesky) or bool(drafts.discord and drafts.discord.strip()),
@@ -548,7 +570,10 @@ def select_forms(
     signaled = [
         form
         for form, wanted in (
-            ("short", "bluesky" in channels or "discord" in channels or worthy),
+            (
+                "short",
+                "bluesky" in channels or "threads" in channels or "discord" in channels or worthy,
+            ),
             ("long", "github_discussions" in channels or "reddit" in channels),
         )
         if wanted
@@ -674,6 +699,72 @@ def run_shortform_writer_pass(
     if result is None:
         raise RuntimeError(f"shortform writer produced no usable drafts for run {run_id}")
     return result.bluesky
+
+
+def run_threads_adaptation_pass(
+    *,
+    repo: Path,
+    evaluator: EvaluatorResult,
+    base_drafts: list[dict[str, str]],
+    providers: list[str],
+    log_dir: Path,
+    run_id: str,
+    timeout_seconds: float,
+    recent_posts: str = "(none)",
+) -> list[dict[str, str]]:
+    """Adapt release copy into Threads-native posts while retaining source URLs."""
+    base = [
+        {"pageUrl": item.get("pageUrl", ""), "text": item.get("text", "")}
+        for item in base_drafts
+        if item.get("text", "").strip()
+    ]
+    prompt = render_template(
+        load_skill_prompt("release-threads"),
+        {
+            "reason": evaluator.reason,
+            "importance": evaluator.importance,
+            "features": "\n".join(
+                f"- {item.get('name', '')}: {item.get('why_users_care', '')}"
+                for item in evaluator.features
+            )
+            or "(none listed)",
+            "base_drafts": json.dumps(base, ensure_ascii=False, indent=2),
+            "recent_posts": recent_posts,
+        },
+    )
+    output = _run_pass(
+        repo=repo,
+        prompt=prompt,
+        providers=providers,
+        log_dir=log_dir,
+        run_id=run_id,
+        kind="writer-threads",
+        timeout_seconds=timeout_seconds,
+    )
+    result = parse_writer_result(extract_json_block(output))
+    if result is None or not result.threads:
+        raise RuntimeError(f"Threads adaptation produced no usable drafts for run {run_id}")
+
+    # The adaptation may change wording, but it cannot invent, drop, or retarget
+    # release links and artwork. Match every returned post to the source draft.
+    by_url = {item.get("pageUrl", ""): item for item in base_drafts}
+    adapted: list[dict[str, str]] = []
+    for index, item in enumerate(result.threads):
+        source = by_url.get(item.get("pageUrl", ""))
+        if source is None and index < len(base_drafts):
+            source = base_drafts[index]
+        if source is None:
+            continue
+        post = dict(item)
+        post["pageUrl"] = source.get("pageUrl", "")
+        if source.get("image"):
+            post["image"] = source["image"]
+        adapted.append(post)
+    if not adapted:
+        raise RuntimeError(
+            f"Threads adaptation returned no drafts linked to source pages for run {run_id}"
+        )
+    return adapted
 
 
 def run_longform_writer_pass(

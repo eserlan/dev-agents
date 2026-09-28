@@ -57,8 +57,8 @@ the built-in skills as a fallback:
   open to every enabled form; `forms: [short]` (or `[long]`) in config forces
   one side. The journal `routed` phase shows which branch ran.
 
-Live publishing is owned by `dev-agents`. Bluesky, Instagram, X, Discord, and
-GitHub Discussions are delivered by the daemon's direct adapters. Feed-oriented
+Live publishing is owned by `dev-agents`. Bluesky, Threads, Instagram, X,
+Discord, and GitHub Discussions are delivered by the daemon's provider adapters. Feed-oriented
 channels use the square, compressed Cloudflare R2 image variant; long-form
 Discussion bodies retain the canonical asset URL. Reddit is delivered via the
 `dev-agent-publisher` Devvit companion app (`apps/reddit-devvit`): release-comms
@@ -82,6 +82,56 @@ for setup, deploy, and troubleshooting steps.
 The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.
 It no longer needs a listener, publisher script, or daemon systemd unit.
+
+## Threads publishing
+
+Threads is an opt-in release-comms destination. The workflow adapts the short
+release copy into a separate Threads draft, then sends a provider-neutral post
+record to the Threads adapter. That adapter owns Meta authentication, text/link
+formatting, optional image upload by public URL, topic tags, UTM attribution,
+and the Threads API calls. Other destinations keep the shared release batching,
+deduplication, persistence, retry, and reporting behavior.
+
+1. Create a Meta app with the Threads use case and authorize the publishing
+   account with `threads_basic` and `threads_content_publish`.
+2. Supply a Threads User Access Token to the daemon as `THREADS_ACCESS_TOKEN`.
+   Use a long-lived token and rotate it before expiry through Meta's OAuth token
+   refresh flow; token contents stay outside the repository and are never logged.
+3. Add `threads` to the project's `release_comms.destinations` list. Optional
+   provider settings live under `release_comms.destination_options.threads`:
+
+   ```yaml
+   release_comms:
+     destinations: [bluesky, threads, discord]
+     destination_options:
+       threads:
+         topic_tag: TTRPG
+         utm_source: threads
+         utm_medium: social
+         utm_campaign: codex-cryptica-release
+   ```
+
+   Attribution defaults to `utm_source=threads`, `utm_medium=social`, and
+   `utm_campaign=release`. Existing UTM values in the canonical URL are kept.
+   Text-only posts attach the tracked URL as a Threads link preview; image posts
+   include that same tracked URL in the post text.
+4. Dry-run with
+   `dev-agents release-comms evaluate <project> <promote_run_id>` before enabling
+   `auto_publish`. Dry runs generate adapted copy and a Threads receipt without
+   making an API call. A live approved run supports text/link posts and
+   text/image posts, and stores the returned Threads post ID, container ID,
+   tracked URL, and permalink when Meta returns one.
+
+The adapter checkpoints Meta's media-container ID before attempting publish.
+Retries reuse that same container rather than creating a second one, so a
+network timeout after Meta accepted the publish cannot cause release-comms to
+silently create a duplicate. If Meta rejects a reused/expired container, the
+run remains failed for operator review instead of making a fresh post. The
+standard Threads API is used at `https://graph.threads.net/v1.0`; set
+`THREADS_GRAPH_API_URL` only for a compatible test endpoint. See Meta's
+[Threads publishing guide](https://developers.facebook.com/docs/threads/) and
+[Meta's API request collection](https://www.postman.com/meta/threads/documentation/dht3nzz/threads-api)
+for current OAuth, permission, container, and publish requirements.
 
 The daemon environment should include `CLOUDFLARE_API_TOKEN` with permission to
 write the `codex-cryptica-statics` R2 bucket. As a migration fallback, the

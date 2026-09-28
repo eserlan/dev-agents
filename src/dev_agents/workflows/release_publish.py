@@ -20,7 +20,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import yaml
 
@@ -49,6 +49,35 @@ class PublicationReceipt:
 
 class PublicationError(RuntimeError):
     """A channel could not accept a publication."""
+
+
+@dataclass(frozen=True)
+class SocialPost:
+    """Provider-neutral facts needed to publish one social post."""
+
+    text: str
+    canonical_url: str
+    source_id: str = ""
+    image_url: str = ""
+    image_alt: str = ""
+    topic_tag: str = ""
+
+
+class SocialPublishingProvider(Protocol):
+    """Adapter contract for social destinations with provider-specific APIs."""
+
+    name: str
+
+    def publish(
+        self,
+        post: SocialPost,
+        *,
+        options: Mapping[str, str],
+        env: Mapping[str, str],
+        dry_run: bool,
+        pending_external_id: str | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> PublicationReceipt: ...
 
 
 def publication_key(channel: str, destination: str, page_url: str) -> tuple[str, str]:
@@ -560,6 +589,196 @@ def publish_x(*, text: str, page_url: str, env: Mapping[str, str], dry_run: bool
     return PublicationReceipt("x", "x", page_url, f"https://x.com/i/web/status/{post_id}", post_id)
 
 
+THREADS_TEXT_LIMIT = 500
+
+
+def _threads_tracked_url(page_url: str, options: Mapping[str, str]) -> str:
+    """Add configured campaign attribution without changing the canonical URL."""
+    if not page_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(page_url)
+    except ValueError:
+        return page_url
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return page_url
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    existing = {key.lower() for key, _ in query}
+    attribution = {
+        "utm_source": options.get("utm_source", "threads"),
+        "utm_medium": options.get("utm_medium", "social"),
+        "utm_campaign": options.get("utm_campaign", "release"),
+    }
+    query.extend(
+        (key, value) for key, value in attribution.items() if key not in existing and value
+    )
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+
+
+def _threads_text(text: str, tracked_url: str, *, include_url: bool) -> str:
+    body = " ".join(text.strip().split())
+    if not include_url or not tracked_url:
+        return body[:THREADS_TEXT_LIMIT].rstrip()
+    if tracked_url in body:
+        if len(body) <= THREADS_TEXT_LIMIT:
+            return body
+        before, _ = body.split(tracked_url, 1)
+        budget = max(0, THREADS_TEXT_LIMIT - len(tracked_url) - 2)
+        before = before[:budget].rstrip()
+        return f"{before}… {tracked_url}" if before else tracked_url[:THREADS_TEXT_LIMIT]
+    suffix = f" {tracked_url}"
+    if len(suffix) >= THREADS_TEXT_LIMIT:
+        return tracked_url[:THREADS_TEXT_LIMIT]
+    budget = THREADS_TEXT_LIMIT - len(suffix)
+    if len(body) > budget:
+        body = body[: max(0, budget - 1)].rstrip() + "…"
+    return (body + suffix).strip()
+
+
+def _threads_request(
+    api: str,
+    endpoint: str,
+    *,
+    token: str,
+    params: Mapping[str, str] | None = None,
+    method: str = "POST",
+) -> dict[str, Any]:
+    url = f"{api.rstrip('/')}/{endpoint.lstrip('/')}"
+    body = None
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "dev-agents/release-comms"}
+    if params is not None and method == "POST":
+        body = urllib.parse.urlencode(params).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as error:
+        status = getattr(error, "code", None)
+        suffix = f" (HTTP {status})" if status else ""
+        raise PublicationError(f"Threads {method} {endpoint} failed{suffix}") from error
+    try:
+        value = json.loads(raw.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublicationError(f"Threads {method} {endpoint} returned invalid JSON") from error
+    if not isinstance(value, dict):
+        raise PublicationError(f"Threads {method} {endpoint} returned invalid JSON")
+    return value
+
+
+class ThreadsPublishingProvider:
+    """Meta Threads adapter; release orchestration stays in release-comms."""
+
+    name = "threads"
+
+    def publish(
+        self,
+        post: SocialPost,
+        *,
+        options: Mapping[str, str],
+        env: Mapping[str, str],
+        dry_run: bool,
+        pending_external_id: str | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> PublicationReceipt:
+        canonical_url = post.canonical_url
+        tracked_url = _threads_tracked_url(canonical_url, options)
+        image_url = social_delivery_image_url(post.image_url) if post.image_url else ""
+        text = _threads_text(post.text, tracked_url, include_url=bool(image_url))
+        if dry_run:
+            return PublicationReceipt(
+                "threads",
+                "threads",
+                canonical_url,
+                f"dry-run://threads/{urllib.parse.quote(canonical_url, safe='')}",
+                metadata={"tracked_url": tracked_url, "has_image": bool(image_url)},
+            )
+
+        token_env = options.get("access_token_env", "THREADS_ACCESS_TOKEN")
+        token = env.get(token_env, "").strip()
+        if not token:
+            raise PublicationError(f"{token_env} is required")
+        api = env.get("THREADS_GRAPH_API_URL", "https://graph.threads.net/v1.0").rstrip("/")
+        topic = post.topic_tag.strip() or options.get("topic_tag", "").strip()
+
+        # A saved container ID is reused on retry. We never create a second
+        # container after a publish attempt may have reached Meta.
+        container_id = (pending_external_id or "").strip()
+        if not container_id:
+            params = {
+                "media_type": "IMAGE" if image_url else "TEXT",
+                "text": text,
+            }
+            if image_url:
+                params["image_url"] = image_url
+                if post.image_alt:
+                    params["alt_text"] = post.image_alt
+            elif tracked_url:
+                params["link_attachment"] = tracked_url
+            if topic:
+                params["topic_tag"] = topic
+            created = _threads_request(api, "/me/threads", token=token, params=params)
+            container_id = str(created.get("id", ""))
+            if not container_id:
+                raise PublicationError("Threads container creation returned no ID")
+            if on_checkpoint is not None:
+                on_checkpoint(
+                    container_id,
+                    {
+                        "provider": "threads",
+                        "phase": "container_created",
+                        "tracked_url": tracked_url,
+                    },
+                )
+
+        published = _threads_request(
+            api,
+            "/me/threads_publish",
+            token=token,
+            params={"creation_id": container_id},
+        )
+        post_id = str(published.get("id", ""))
+        if not post_id:
+            raise PublicationError("Threads publish returned no post ID")
+        public_url: str | None = None
+        try:
+            details = _threads_request(
+                api,
+                f"/{post_id}",
+                token=token,
+                params={"fields": "permalink"},
+                method="GET",
+            )
+            if details.get("permalink"):
+                public_url = str(details["permalink"])
+        except PublicationError:
+            # Publishing already succeeded; permalink lookup must not make the
+            # workflow retry a post that is live.
+            pass
+        return PublicationReceipt(
+            "threads",
+            "threads",
+            canonical_url,
+            public_url,
+            post_id,
+            {
+                "provider": "threads",
+                "container_id": container_id,
+                "source_id": post.source_id,
+                "tracked_url": tracked_url,
+                "topic_tag": topic,
+                "has_image": bool(image_url),
+            },
+        )
+
+
+SOCIAL_PUBLISHERS: dict[str, SocialPublishingProvider] = {
+    "threads": ThreadsPublishingProvider(),
+}
+
+
 def resolve_image(
     draft: Mapping[str, str], image_overrides: Mapping[str, str] | None = None
 ) -> tuple[str, str]:
@@ -594,6 +813,7 @@ def publish_release_drafts(
     publication_delay_max_seconds: float = 1800.0,
     max_publications: int | None = None,
     on_receipt: Callable[[PublicationReceipt], None],
+    pending_provider_ids: Mapping[tuple[str, str], str] | None = None,
     source_id: str = "",
     devvit_app_dir: Path | None = None,
     devvit_subreddit: str | None = None,
@@ -608,6 +828,7 @@ def publish_release_drafts(
         name: []
         for name in (
             "bluesky",
+            "threads",
             "github_discussions",
             "instagram",
             "x",
@@ -643,8 +864,12 @@ def publish_release_drafts(
     discussion_drafts = [
         draft for draft in (drafts.get("github_discussions") or []) if isinstance(draft, dict)
     ]
+    threads_drafts = [draft for draft in (drafts.get("threads") or []) if isinstance(draft, dict)]
     used_discussions: set[int] = set()
-    batches: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
+    used_threads: set[int] = set()
+    batches: list[
+        tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]
+    ] = []
 
     for index, draft in enumerate(bluesky_drafts):
         if not isinstance(draft, dict):
@@ -664,19 +889,52 @@ def publish_release_drafts(
         if discussion_index is not None and discussion_index < len(discussion_drafts):
             discussion = discussion_drafts[discussion_index]
             used_discussions.add(discussion_index)
-        batches.append((draft, discussion))
+        thread_index = next(
+            (
+                candidate
+                for candidate, thread in enumerate(threads_drafts)
+                if candidate not in used_threads
+                and str(thread.get("pageUrl", "")) == page_url
+                and page_url
+            ),
+            index if index < len(threads_drafts) and index not in used_threads else None,
+        )
+        thread = None
+        if thread_index is not None and thread_index < len(threads_drafts):
+            thread = threads_drafts[thread_index]
+            used_threads.add(thread_index)
+        batches.append((draft, discussion, thread))
 
     for index, discussion in enumerate(discussion_drafts):
         if index not in used_discussions:
-            batches.append((None, discussion))
+            page_url = str(discussion.get("pageUrl", ""))
+            thread_index = next(
+                (
+                    candidate
+                    for candidate, thread in enumerate(threads_drafts)
+                    if candidate not in used_threads
+                    and str(thread.get("pageUrl", "")) == page_url
+                    and page_url
+                ),
+                None,
+            )
+            thread = None
+            if thread_index is not None:
+                thread = threads_drafts[thread_index]
+                used_threads.add(thread_index)
+            batches.append((None, discussion, thread))
+
+    for index, thread in enumerate(threads_drafts):
+        if index not in used_threads:
+            batches.append((None, None, thread))
 
     # Backwards-compatible fallback for manually injected legacy state that
     # has only a combined Discord draft and no Bluesky drafts.
     if not batches and drafts.get("discord"):
-        batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}))
+        batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None))
 
-    for draft, discussion in batches:
-        page_url = str((draft or discussion or {}).get("pageUrl", ""))
+    for draft, discussion, thread in batches:
+        page_url = str((draft or thread or discussion or {}).get("pageUrl", ""))
         draft_text = str((draft or {}).get("text", ""))
         pending = False
         if draft is not None:
@@ -693,13 +951,17 @@ def publish_release_drafts(
             pending = pending or publication_key(
                 "reddit", "reddit", page_url
             ) not in already_published
+        if thread is not None and "threads" in recommended_channels:
+            pending = (
+                pending or publication_key("threads", "threads", page_url) not in already_published
+            )
         if "discord" in recommended_channels and draft is not None:
             pending = pending or any(
                 publication_key("discord", str(destination.get("id", "main-community")), page_url)
                 not in already_published
                 for destination in _discord_config(project.repo)
             )
-        if draft is None and discussion is None:
+        if draft is None and discussion is None and thread is None:
             pending = "discord" in recommended_channels and bool(drafts.get("discord"))
         if not pending:
             continue
@@ -712,6 +974,55 @@ def publish_release_drafts(
                 image_url, image_alt = resolve_image(draft, image_overrides)
             except Exception as error:  # noqa: BLE001
                 errors.append(f"image {page_url}: {error}")
+
+        if (
+            thread is not None
+            and "threads" in recommended_channels
+            and publication_key("threads", "threads", page_url) not in already_published
+        ):
+            try:
+                thread_image_url = ""
+                thread_image_alt = ""
+                if str(thread.get("image", "")).strip():
+                    thread_image_url, thread_image_alt = resolve_image(thread, image_overrides)
+                provider = SOCIAL_PUBLISHERS["threads"]
+
+                def checkpoint_external_id(
+                    container_id: str, metadata: dict[str, Any], *, source_url: str = page_url
+                ) -> None:
+                    on_receipt(
+                        PublicationReceipt(
+                            "threads",
+                            "threads",
+                            source_url,
+                            external_id=container_id,
+                            metadata={**metadata, "source_id": source_id, "status": "pending"},
+                        )
+                    )
+
+                receipt = provider.publish(
+                    SocialPost(
+                        text=str(thread.get("text", "")),
+                        canonical_url=page_url,
+                        source_id=source_id,
+                        image_url=thread_image_url,
+                        image_alt=thread_image_alt,
+                        topic_tag=str(thread.get("topic_tag", "")),
+                    ),
+                    options=(
+                        project.release_comms.destination_options.get("threads", {})
+                        if project.release_comms is not None
+                        else {}
+                    ),
+                    env=env,
+                    dry_run=dry_run,
+                    pending_external_id=(pending_provider_ids or {}).get(("threads", page_url)),
+                    on_checkpoint=checkpoint_external_id,
+                )
+                record_receipt(receipt)
+                result["threads"].append(receipt.__dict__)
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"threads {page_url}: {error}")
 
         if draft is not None and image_url:
             if "bluesky" in recommended_channels and publication_key("bluesky", "bluesky", page_url) not in already_published:
@@ -832,6 +1143,11 @@ def pending_publication_count(
                 )
                 not in already_published
             )
+    for draft in drafts.get("threads") or []:
+        if isinstance(draft, dict) and "threads" in recommended_channels:
+            page_url = str(draft.get("pageUrl", ""))
+            if publication_key("threads", "threads", page_url) not in already_published:
+                count += 1
     if "github_discussions" in recommended_channels:
         for draft in drafts.get("github_discussions") or []:
             if isinstance(draft, dict):

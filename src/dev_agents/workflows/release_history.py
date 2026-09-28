@@ -75,7 +75,7 @@ def _draft_summary(drafts: Any, page_url: str) -> str:
     """Return the text of the draft that announced ``page_url`` in an earlier run."""
     if not isinstance(drafts, dict):
         return ""
-    for key, field in (("bluesky", "text"), ("github_discussions", "title")):
+    for key, field in (("threads", "text"), ("bluesky", "text"), ("github_discussions", "title")):
         items = drafts.get(key)
         if not isinstance(items, list):
             continue

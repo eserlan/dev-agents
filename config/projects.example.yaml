@@ -71,3 +71,11 @@ projects:
       scheduler_poll_seconds: 30
       webhook_path: /release-comms
       webhook_secret_env: RELEASE_COMMS_SECRET
+      # Threads is opt-in; add it to destinations after Meta access is ready.
+      # destinations: [bluesky, threads, discord, github_discussions]
+      # destination_options:
+      #   threads:
+      #     topic_tag: TTRPG
+      #     utm_source: threads
+      #     utm_medium: social
+      #     utm_campaign: codex-cryptica-release
