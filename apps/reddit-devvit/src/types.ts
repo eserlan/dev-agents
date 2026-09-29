@@ -7,7 +7,7 @@ export interface CandidatePost {
   /** "link" (default) submits the page as a link post with the write-up as a comment; "text" posts the write-up as the post body. */
   post_type?: 'link' | 'text';
   source_id: string;
-  status: 'pending' | 'approved' | 'posted' | 'rejected';
+  status: 'pending' | 'approved' | 'posted' | 'rejected' | 'expired';
   created_at: number;
   reddit_post_id?: string;
   posted_at?: number;

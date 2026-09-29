@@ -9,6 +9,39 @@ export const REDIS_CONFIG_PAUSED = 'reddit:config:paused';
 export const REDIS_LAST_PUBLISHED = 'reddit:last_published_at';
 
 export const MIN_SPACING_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const MAX_CANDIDATE_AGE_MS = 4 * 24 * 60 * 60 * 1000;
+
+export function candidateExpired(candidate: CandidatePost, nowMs: number = Date.now()): boolean {
+  return candidate.created_at > 0 && nowMs - candidate.created_at * 1000 > MAX_CANDIDATE_AGE_MS;
+}
+
+export async function pruneExpiredApprovedCandidates(
+  redis: RedisClient,
+  nowMs: number = Date.now()
+): Promise<number> {
+  const queued = await redis.zRange(REDIS_QUEUE_APPROVED, 0, -1);
+  let removed = 0;
+  for (const item of queued) {
+    const key = `${REDIS_POST_PREFIX}${item.member}`;
+    const raw = await redis.get(key);
+    if (!raw) {
+      await redis.zRem(REDIS_QUEUE_APPROVED, [item.member]);
+      removed++;
+      continue;
+    }
+    try {
+      const candidate = JSON.parse(raw) as CandidatePost;
+      if (candidate.status === 'approved' && candidateExpired(candidate, nowMs)) {
+        await redis.zRem(REDIS_QUEUE_APPROVED, [item.member]);
+        await redis.set(key, JSON.stringify({ ...candidate, status: 'expired' }));
+        removed++;
+      }
+    } catch {
+      // Leave malformed entries visible for diagnosis rather than deleting data.
+    }
+  }
+  return removed;
+}
 
 export async function enqueueCandidate(
   redis: RedisClient,
@@ -36,6 +69,7 @@ export async function enqueueCandidate(
 export async function getNextApprovedCandidate(
   redis: RedisClient
 ): Promise<CandidatePost | null> {
+  await pruneExpiredApprovedCandidates(redis);
   const items = await redis.zRange(REDIS_QUEUE_APPROVED, 0, 0);
   if (!items || items.length === 0) {
     return null;
@@ -80,6 +114,7 @@ export async function markPostPublished(
 }
 
 export async function getQueueStatus(redis: RedisClient): Promise<QueueStatus> {
+  await pruneExpiredApprovedCandidates(redis);
   const approvedCount = await redis.zCard(REDIS_QUEUE_APPROVED);
   const postedCount = await redis.zCard(REDIS_QUEUE_POSTED);
   const isPaused = (await redis.get(REDIS_CONFIG_PAUSED)) === 'true';
@@ -118,11 +153,12 @@ export async function syncCandidatesFromBundle(
   redis: RedisClient,
   candidates: CandidatePost[]
 ): Promise<{ added: number; skipped: number; total: number }> {
+  await pruneExpiredApprovedCandidates(redis);
   let added = 0;
   let skipped = 0;
 
   for (const candidate of candidates) {
-    if (candidate.status !== 'approved') {
+    if (candidate.status !== 'approved' || candidateExpired(candidate)) {
       skipped++;
       continue;
     }

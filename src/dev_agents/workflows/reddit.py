@@ -83,6 +83,15 @@ def format_reddit_post(
 
 
 DEFAULT_MANIFEST_KEY = "announcements/reddit-candidates.json"
+MAX_CANDIDATE_AGE_SECONDS = 4 * 24 * 60 * 60
+
+
+def _candidate_is_expired(candidate: Mapping[str, Any], *, now: float | None = None) -> bool:
+    try:
+        created_at = float(candidate.get("created_at", 0))
+    except (TypeError, ValueError):
+        return False
+    return created_at > 0 and (time.time() if now is None else now) - created_at > MAX_CANDIDATE_AGE_SECONDS
 
 
 def _fetch_manifest_from_url(url: str, timeout: float = 15.0) -> list[dict[str, Any]]:
@@ -211,7 +220,9 @@ def stage_reddit_candidate(
         merged = [
             c
             for c in existing_candidates
-            if c.get("id") != candidate_id and (not source_id or c.get("source_id") != source_id)
+            if not _candidate_is_expired(c)
+            and c.get("id") != candidate_id
+            and (not source_id or c.get("source_id") != source_id)
         ]
         merged.append(dict(candidate))
         manifest = {
@@ -266,7 +277,9 @@ def stage_reddit_candidate(
     merged = [
         c
         for c in existing_candidates
-        if c.get("id") != candidate_id and (not source_id or c.get("source_id") != source_id)
+        if not _candidate_is_expired(c)
+        and c.get("id") != candidate_id
+        and (not source_id or c.get("source_id") != source_id)
     ]
     merged.append(dict(candidate))
     manifest = {
@@ -306,6 +319,68 @@ def stage_reddit_candidate(
         external_id=external_id,
         metadata={"status": "staged_to_r2", "candidate_id": candidate_id, "source_id": source_id},
     )
+
+
+def prune_expired_reddit_candidates(
+    *,
+    repo: Path,
+    key: str = DEFAULT_MANIFEST_KEY,
+    github: str | None = None,
+    branch: str = "release-manifests",
+    env: Mapping[str, str] | None = None,
+    timeout: float = 30.0,
+    dry_run: bool = False,
+    devvit_app_dir: Path | None = None,
+    devvit_subreddit: str | None = None,
+) -> int:
+    """Remove approved Reddit candidates older than four days from the manifest."""
+    if dry_run:
+        return 0
+    if github:
+        manifest_url = f"https://raw.githubusercontent.com/{github}/{branch}/{key}"
+        existing = _fetch_manifest_from_url(manifest_url, timeout=15)
+    else:
+        existing = _fetch_manifest_from_url(f"https://{ASSET_HOST}/{key}", timeout=15)
+    now = time.time()
+    remaining = [candidate for candidate in existing if not _candidate_is_expired(candidate, now=now)]
+    removed = len(existing) - len(remaining)
+    if not removed:
+        return 0
+    manifest = {"updated_at": int(now), "candidates": remaining}
+    if devvit_app_dir is not None:
+        _deploy_devvit_bundle(
+            app_dir=devvit_app_dir,
+            candidates=remaining,
+            subreddit=devvit_subreddit,
+            timeout=timeout,
+        )
+    if github:
+        _upload_github_manifest(
+            repo=repo,
+            github=github,
+            branch=branch,
+            path=key,
+            manifest=manifest,
+            timeout=timeout,
+        )
+    else:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as temp:
+            temp_path = Path(temp.name)
+            json.dump(manifest, temp, indent=2)
+        try:
+            _upload_r2_file(
+                repo=repo,
+                path=temp_path,
+                key=key,
+                content_type="application/json",
+                env=env or {},
+                timeout=timeout,
+            )
+        finally:
+            temp_path.unlink(missing_ok=True)
+    return removed
 
 
 def _deploy_devvit_bundle(
@@ -565,8 +640,8 @@ def sync_reddit_status(
     from dev_agents.config import ReleaseCommsConfig
     from dev_agents.runtime import StateRepository, state_database_path
 
+    comms_config = project.release_comms or ReleaseCommsConfig()
     if repository is None:
-        comms_config = project.release_comms or ReleaseCommsConfig()
         db_path = state_database_path(
             comms_config.state_path, project.repo / ".dev-agents/release-comms-state.db"
         )
@@ -579,6 +654,15 @@ def sync_reddit_status(
             subreddit = "codexcryptica"
 
     clean_sub = clean_subreddit(subreddit)
+
+    if prune_manifest and not dry_run:
+        prune_expired_reddit_candidates(
+            repo=project.repo,
+            env=env,
+            github=getattr(project, "github", None),
+            devvit_app_dir=comms_config.devvit_app_dir,
+            devvit_subreddit=(comms_config.devvit_subreddit or comms_config.subreddit),
+        )
 
     if run_id:
         pubs = repository.list_run_publications("release-comms", str(run_id))

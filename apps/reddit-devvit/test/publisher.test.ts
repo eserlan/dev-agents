@@ -24,7 +24,7 @@ function candidate(overrides: Partial<CandidatePost> = {}): CandidatePost {
     image_url: IMAGE,
     source_id: 'pr-1',
     status: 'approved',
-    created_at: 1000,
+    created_at: Math.floor(Date.now() / 1000),
     ...overrides,
   };
 }
