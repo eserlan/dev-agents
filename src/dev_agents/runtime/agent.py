@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -98,7 +99,7 @@ def provider_command(
             CODEX_MODEL,
             "-c",
             f'model_reasoning_effort="{reasoning_effort}"',
-            prompt,
+            "-",
         ]
     if provider == "claude":
         return [
@@ -159,14 +160,24 @@ def run_agent(
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\n=== agent started provider={provider} ===\n")
         stream.flush()
-        process = subprocess.Popen(
-            provider_command(provider, prompt, timeout_seconds, reasoning_effort),
-            cwd=cwd,
-            env=_agent_environment(),
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        prompt_stream = None
+        if provider == "codex":
+            prompt_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+            prompt_stream.write(prompt)
+            prompt_stream.seek(0)
+        try:
+            process = subprocess.Popen(
+                provider_command(provider, prompt, timeout_seconds, reasoning_effort),
+                cwd=cwd,
+                env=_agent_environment(),
+                stdin=prompt_stream,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        finally:
+            if prompt_stream is not None:
+                prompt_stream.close()
         start = time.monotonic()
         deadline = start + timeout_seconds
         last_progress_at = start

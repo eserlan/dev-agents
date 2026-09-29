@@ -50,6 +50,9 @@ class WriterResult:
     # the same release facts and canonical page link without cross-posting text.
     threads: list[dict[str, str]] = field(default_factory=list)
     github_discussions: list[dict[str, str]] = field(default_factory=list)
+    # Content-image posts are Instagram-only and are discovered from deployed
+    # article/answer metadata, independently of release announcement copy.
+    instagram: list[dict[str, str]] = field(default_factory=list)
     discord: str | None = None
 
 
@@ -211,6 +214,105 @@ def collect_release_delta(
     )
 
 
+def collect_content_image_posts(
+    repo: Path,
+    new_sha: str,
+    previous_sha: str | None,
+    *,
+    include_all: bool = False,
+) -> list[dict[str, str]]:
+    """Build Instagram drafts for new pages or pages with changed cover images.
+
+    This intentionally requires a previous SHA so an initial/manual run cannot
+    backfill every historic article. Blog markdown uses frontmatter; answer
+    pages expose their question and SEO image in TypeScript.
+    """
+    if not previous_sha and not include_all:
+        return []
+    try:
+        if include_all:
+            files = _git_text(repo, ["ls-tree", "-r", "--name-only", new_sha], 60).splitlines()
+            changed = [f"A\t{path}" for path in files]
+        else:
+            assert previous_sha is not None
+            changed = _git_text(
+                repo,
+                ["diff", "--name-status", f"{previous_sha}..{new_sha}", "--"],
+                60,
+            ).splitlines()
+    except RuntimeError:
+        return []
+
+    posts: list[dict[str, str]] = []
+    for line in changed:
+        parts = line.split("\t")
+        if len(parts) < 2 or parts[0] not in {"A", "M"}:
+            continue
+        path = parts[-1]
+        if path.startswith("apps/web/src/lib/content/blog/") and path.endswith(".md"):
+            kind = "blog"
+        elif path.startswith("apps/web/src/lib/content/answers/pages/") and path.endswith(".ts"):
+            kind = "answer"
+        elif path.startswith("apps/web/src/lib/content/for/packs/") and path.endswith(".ts"):
+            kind = "for"
+        else:
+            continue
+        try:
+            current = _git_text(repo, ["show", f"{new_sha}:{path}"], 30)
+        except RuntimeError:
+            continue
+        previous = ""
+        if parts[0] == "M":
+            try:
+                previous = _git_text(repo, ["show", f"{previous_sha}:{path}"], 30)
+            except RuntimeError:
+                continue
+
+        if kind == "blog":
+            title_match = re.search(r"(?m)^title:\s*[\"']?(.*?)[\"']?\s*$", current)
+            slug_match = re.search(r"(?m)^slug:\s*[\"']?([\w-]+)", current)
+            image_match = re.search(r"(?m)^image:\s*[\"']?(https?://[^\"'\s]+|[^\"'\s]+)", current)
+            old_image_match = re.search(r"(?m)^image:\s*[\"']?(https?://[^\"'\s]+|[^\"'\s]+)", previous)
+            title = title_match.group(1).strip() if title_match else ""
+            slug = slug_match.group(1) if slug_match else Path(path).stem
+            image = image_match.group(1).strip() if image_match else f"og/{slug}.jpg"
+            old_image = old_image_match.group(1).strip() if old_image_match else f"og/{slug}.jpg"
+            page_path = f"/blog/{slug}"
+        elif kind == "answer":
+            slug_match = re.search(r"(?m)^\s*slug:\s*[\"']([^\"']+)", current)
+            title_match = re.search(r"(?m)^\s*question:\s*[\"']([^\"']+)[\"']", current)
+            image_match = re.search(r"(?m)^\s+image:\s*[\"']([^\"']+)[\"']", current)
+            old_image_match = re.search(r"(?m)^\s+image:\s*[\"']([^\"']+)[\"']", previous)
+            slug = slug_match.group(1) if slug_match else Path(path).stem
+            title = title_match.group(1).strip() if title_match else ""
+            image = image_match.group(1).strip() if image_match else f"og/{slug}.jpg"
+            old_image = old_image_match.group(1).strip() if old_image_match else f"og/{slug}.jpg"
+            page_path = f"/answers/{slug}"
+        else:
+            slug_match = re.search(r"(?m)^\s*slug:\s*[\"']([^\"']+)", current)
+            title_match = re.search(r"(?m)^\s*title:\s*[\"']([^\"']+)[\"']", current)
+            image_match = re.search(r"(?m)^\s*image:\s*[\"']([^\"']+)[\"']", current)
+            old_image_match = re.search(r"(?m)^\s*image:\s*[\"']([^\"']+)[\"']", previous)
+            slug = slug_match.group(1) if slug_match else Path(path).stem
+            title = title_match.group(1).strip() if title_match else ""
+            image = image_match.group(1).strip() if image_match else f"og/{slug}.jpg"
+            old_image = old_image_match.group(1).strip() if old_image_match else f"og/{slug}.jpg"
+            page_path = f"/for/{slug}"
+
+        if parts[0] == "M" and image == old_image:
+            continue
+        if not title:
+            continue
+        image_url = image if image.startswith(("http://", "https://")) else f"https://assets.codexcryptica.com/{image.lstrip('/')}"
+        page_url = f"https://codexcryptica.com{page_path}"
+        posts.append({
+            "text": f"New from Codex Cryptica: {title}. Read the guide: {page_url}",
+            "pageUrl": page_url,
+            "image": image_url,
+        })
+    return posts
+
+
 INTERNAL_NOTE_LIMIT = 600
 
 
@@ -250,6 +352,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
     bluesky = data.get("bluesky")
     threads = data.get("threads")
     discussions = data.get("github_discussions")
+    instagram = data.get("instagram")
     thread_drafts: list[dict[str, str]] = []
     if isinstance(threads, list):
         for item in threads:
@@ -297,6 +400,17 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
         else [],
         threads=thread_drafts,
         github_discussions=discussion_drafts,
+        instagram=[
+            {
+                "pageUrl": str(item.get("pageUrl", "")).strip(),
+                "text": str(item.get("text", "")).strip(),
+                "image": str(item.get("image", "")).strip(),
+            }
+            for item in instagram
+            if isinstance(item, dict)
+            and str(item.get("pageUrl", "")).strip()
+            and str(item.get("text", "")).strip()
+        ] if isinstance(instagram, list) else [],
     )
 
 
@@ -547,6 +661,7 @@ def recommend_channels(
         "discord": bool(drafts.bluesky) or bool(drafts.discord and drafts.discord.strip()),
         "github_discussions": bool(drafts.github_discussions),
         "reddit": bool(drafts.github_discussions),
+        "instagram": bool(drafts.instagram),
     }
     return [name for name in content if name in enabled and content[name]]
 

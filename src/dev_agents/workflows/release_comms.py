@@ -21,6 +21,7 @@ from dev_agents.workflows.release_content import (
     ImageStatus,
     ReleaseDelta,
     WriterResult,
+    collect_content_image_posts,
     collect_release_delta,
     extract_json_block,
     generate_announcement_image,
@@ -101,6 +102,7 @@ class ReleaseCommsState(TypedDict, total=False):
     short_drafts: list[dict[str, str]]
     long_drafts: list[dict[str, str]]
     image_statuses: list[ImageStatus]
+    content_image_drafts: list[dict[str, str]]
     image_overrides: dict[str, str]
     publications: dict[str, Any]
     existing_publications: list[Any]
@@ -109,6 +111,7 @@ class ReleaseCommsState(TypedDict, total=False):
     publication_sink: Callable[[PublicationReceipt], None]
     dry_run: bool
     publish_approved: bool
+    notify_tracking_issue: bool
     on_event: ProgressEvent | None
     result: ReleaseCommsRunResult
     scheduled: bool
@@ -212,6 +215,7 @@ def _draft_counts(drafts: WriterResult) -> dict[str, Any]:
         "bluesky": len(drafts.bluesky),
         "threads": len(drafts.threads),
         "github_discussions": len(drafts.github_discussions),
+        "instagram": len(drafts.instagram),
         "discord": bool(drafts.bluesky) or bool(drafts.discord and drafts.discord.strip()),
     }
 
@@ -264,6 +268,9 @@ def build_release_comms_workflow() -> Any:
         return format_recent_posts(state.get("recent_announcements", []))
 
     def evaluate_changes(state: ReleaseCommsState) -> dict[str, Any]:
+        content_image_drafts = collect_content_image_posts(
+            state["repo"], state["new_sha"], state.get("previous_sha")
+        )
         evaluator_result = state.get("evaluator_result")
         if evaluator_result is None:
             if state["config"].local_generation:
@@ -287,6 +294,14 @@ def build_release_comms_workflow() -> Any:
                     timeout_seconds=local_timeout(state),
                     recent_posts=recent_posts(state),
                 )
+        if content_image_drafts and not evaluator_result.postworthy:
+            evaluator_result = EvaluatorResult(
+                postworthy=True,
+                reason="new content image deployed",
+                importance="medium",
+                features=[{"name": "New article or answer image", "bluesky_worthy": False}],
+                recommended_channels=["instagram"],
+            )
         _emit(
             state,
             "evaluated",
@@ -298,7 +313,10 @@ def build_release_comms_workflow() -> Any:
                 "channels": ",".join(evaluator_result.recommended_channels),
             },
         )
-        return {"evaluator_result": evaluator_result}
+        return {
+            "evaluator_result": evaluator_result,
+            "content_image_drafts": content_image_drafts,
+        }
 
     def route_forms(state: ReleaseCommsState) -> dict[str, Any]:
         eval_res = state.get("evaluator_result")
@@ -306,6 +324,7 @@ def build_release_comms_workflow() -> Any:
             not eval_res
             or not eval_res.postworthy
             or state.get("writer_result") is not None
+            or eval_res.reason == "new content image deployed"
         ):
             forms: list[str] = []
         else:
@@ -411,6 +430,7 @@ def build_release_comms_workflow() -> Any:
             bluesky=bluesky,
             threads=threads,
             github_discussions=discussions,
+            instagram=writer_res.instagram,
             discord=writer_res.discord,
         )
 
@@ -424,6 +444,12 @@ def build_release_comms_workflow() -> Any:
             channels.append("discord")
         if writer_res.threads and "threads" in enabled_destinations and "threads" not in channels:
             channels.append("threads")
+        if (
+            writer_res.instagram
+            and "instagram" in enabled_destinations
+            and "instagram" not in channels
+        ):
+            channels.append("instagram")
         return EvaluatorResult(
             postworthy=evaluation.postworthy,
             reason=evaluation.reason,
@@ -435,11 +461,20 @@ def build_release_comms_workflow() -> Any:
 
     def merge_drafts(state: ReleaseCommsState) -> dict[str, Any]:
         eval_res = state.get("evaluator_result")
-        if not eval_res or not eval_res.postworthy:
+        content_drafts = state.get("content_image_drafts", [])
+        if not eval_res or (not eval_res.postworthy and not content_drafts):
             _emit(state, "drafts_skipped", {"reason": "not-postworthy"})
             return {"writer_result": None}
         injected = state.get("writer_result")
         if injected is not None:
+            if content_drafts:
+                injected = WriterResult(
+                    bluesky=injected.bluesky,
+                    threads=injected.threads,
+                    github_discussions=injected.github_discussions,
+                    instagram=[*injected.instagram, *content_drafts],
+                    discord=injected.discord,
+                )
             injected = align_discussion_images(injected)
             eval_res = with_derived_channels(eval_res, injected, state["config"].destinations)
             _emit(state, "drafted", _draft_counts(injected))
@@ -449,6 +484,7 @@ def build_release_comms_workflow() -> Any:
         writer_res = WriterResult(
             bluesky=bluesky,
             github_discussions=discussions,
+            instagram=content_drafts,
         )
         writer_res = align_discussion_images(writer_res)
         enabled_destinations = state["config"].destinations
@@ -459,6 +495,12 @@ def build_release_comms_workflow() -> Any:
             for extra in ("instagram", "x", "pinterest"):
                 if extra in enabled_destinations and extra not in recommended_channels:
                     recommended_channels.append(extra)
+        if (
+            writer_res.instagram
+            and "instagram" in enabled_destinations
+            and "instagram" not in recommended_channels
+        ):
+            recommended_channels.append("instagram")
         updated = EvaluatorResult(
             postworthy=eval_res.postworthy,
             reason=eval_res.reason,
@@ -517,6 +559,7 @@ def build_release_comms_workflow() -> Any:
             bluesky=writer_res.bluesky,
             threads=adapted,
             github_discussions=writer_res.github_discussions,
+            instagram=writer_res.instagram,
             discord=writer_res.discord,
         )
         channels = list(evaluator.recommended_channels)
@@ -607,6 +650,7 @@ def build_release_comms_workflow() -> Any:
                 bluesky=updated_bluesky,
                 threads=updated_threads,
                 github_discussions=updated_discussions,
+                instagram=writer_res.instagram,
                 discord=writer_res.discord,
             ),
             "image_overrides": overrides,
@@ -783,15 +827,16 @@ def build_release_comms_workflow() -> Any:
             "published",
             {"completed": completed, "postworthy": postworthy, "errors": errors},
         )
-        comment_tracking_issue(
-            project=state["project"],
-            issue_number=state["config"].tracking_issue,
-            promote_run_id=state["promote_run_id"],
-            evaluator=asdict(evaluation) if evaluation is not None else {},
-            drafts=drafts_dict,
-            publications=publications,
-            errors=errors,
-        )
+        if state.get("notify_tracking_issue", True):
+            comment_tracking_issue(
+                project=state["project"],
+                issue_number=state["config"].tracking_issue,
+                promote_run_id=state["promote_run_id"],
+                evaluator=asdict(evaluation) if evaluation is not None else {},
+                drafts=drafts_dict,
+                publications=publications,
+                errors=errors,
+            )
         return {
             "publications": publications,
             "result": ReleaseCommsRunResult(
@@ -855,6 +900,9 @@ def run_release_comms(
     publish_approved: bool = False,
     evaluator_result: EvaluatorResult | None = None,
     writer_result: WriterResult | None = None,
+    new_sha: str | None = None,
+    previous_sha: str | None = None,
+    notify_tracking_issue: bool = True,
     on_event: ProgressEvent | None = None,
     delivery_id: str | None = None,
 ) -> ReleaseCommsRunResult:
@@ -867,8 +915,8 @@ def run_release_comms(
     existing = repository.get_run("release-comms", str(promote_run_id))
     resume_metadata: dict[str, Any] = {}
     existing_metadata: dict[str, Any] = {}
-    pinned_new_sha: str | None = None
-    pinned_previous_sha: str | None = None
+    pinned_new_sha: str | None = new_sha
+    pinned_previous_sha: str | None = previous_sha
     # "running" is included so a stale/interrupted claim (e.g. the daemon restarted
     # mid-run) can reuse its carried-over drafts on retry; claim_run() below is the
     # actual safety gate (it refuses to reclaim a run that is genuinely still active).
@@ -892,8 +940,8 @@ def run_release_comms(
             evaluator_result = parse_evaluator_result(resume_metadata.get("evaluator_result"))
         if writer_result is None:
             writer_result = parse_writer_result(resume_metadata.get("writer_result"))
-        pinned_new_sha = resume_metadata.get("new_sha") or None
-        pinned_previous_sha = resume_metadata.get("previous_sha") or None
+        pinned_new_sha = resume_metadata.get("new_sha") or pinned_new_sha
+        pinned_previous_sha = resume_metadata.get("previous_sha") or pinned_previous_sha
     claim = repository.claim_run(
         "release-comms",
         str(promote_run_id),
@@ -957,6 +1005,7 @@ def run_release_comms(
             "config": config,
             "dry_run": dry_run,
             "publish_approved": publish_approved,
+            "notify_tracking_issue": notify_tracking_issue,
             "evaluator_result": evaluator_result,
             "writer_result": writer_result,
             "image_overrides": (

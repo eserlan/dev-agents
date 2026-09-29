@@ -23,7 +23,8 @@ class IssueFixerConfig(BaseModel):
     label: str = "bug"
     # The kind frames the work and determines its PR title prefix; all kinds
     # use the same isolated branch, validation, and review pipeline.
-    kind: Literal["fix", "enhancement", "copy"] = "fix"
+    kind: Literal["fix", "enhancement", "copy", "agent", "answer"] = "fix"
+    provider: Literal["codex", "muse"] = "codex"
     base_branch: str = "main"
     branch_prefix: str = "dev-agents/issue-"
     timeout_minutes: int = 30
@@ -53,6 +54,17 @@ class ProjectConfig(BaseModel):
     # e.g. a "bug" queue plus a "gui-fix" enhancement queue running together.
     issue_fixers: list[IssueFixerConfig] = []
     release_comms: ReleaseCommsConfig | None = None
+    discord_notifications: DiscordNotificationsConfig | None = None
+
+
+class DiscordNotificationsConfig(BaseModel):
+    """Optional GitHub-to-Discord notifications for one configured project."""
+
+    model_config = ConfigDict(frozen=True)
+
+    webhook_env: str = "DISCORD_WEBHOOK_URL"
+    port: int = 8791
+    webhook_path: str = "/discord"
 
 
 class ContentQueueConfig(BaseModel):
@@ -71,6 +83,17 @@ class ContentQueueConfig(BaseModel):
     # Whether the scheduler may also turn a bare backlog item into a new
     # Drafted entry (never auto-published) when nothing is ready to publish.
     auto_draft: bool = False
+
+
+class InstagramImageBackfillConfig(BaseModel):
+    """Paced publishing of existing article and answer cover images."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    # Enforce spacing across both backfill and live deploy posts.
+    interval_hours: int = Field(default=6, ge=4, le=6)
+    poll_seconds: int = 300
 
 
 class ReleaseCommsConfig(BaseModel):
@@ -113,6 +136,7 @@ class ReleaseCommsConfig(BaseModel):
     # to the evaluator and writers, and publishing skips repeats of the same page.
     recent_posts_days: int = 14
     content_queue: ContentQueueConfig | None = None
+    instagram_image_backfill: InstagramImageBackfillConfig | None = None
 
 
 class PrFixerConfig(BaseModel):

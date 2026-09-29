@@ -23,7 +23,7 @@ def test_codex_provider_command_uses_non_interactive_exec() -> None:
         CODEX_MODEL,
         "-c",
         'model_reasoning_effort="medium"',
-        "fix it",
+        "-",
     ]
 
 

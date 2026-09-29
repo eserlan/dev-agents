@@ -39,6 +39,7 @@ from dev_agents.pr_fixer import (
     _state_path,
 )
 from dev_agents.runtime import StateRepository, state_database_path
+from dev_agents.runtime.github import gh
 from dev_agents.workflows.content_queue import (
     draft_backlog_item,
     next_backlog_item,
@@ -49,6 +50,12 @@ from dev_agents.workflows.content_queue import (
 )
 from dev_agents.workflows.degodify import DegodifyFile, run_degodify
 from dev_agents.workflows.release_comms import run_release_comms
+from dev_agents.workflows.release_content import (
+    EvaluatorResult,
+    WriterResult,
+    collect_content_image_posts,
+    ensure_shas_present,
+)
 
 
 def _signature_valid(body: bytes, received: str | None, secret: str) -> bool:
@@ -633,6 +640,151 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
             Thread(target=run, daemon=True).start()
 
+    def instagram_image_backfill_scheduler() -> None:
+        """Post one previously unannounced image when the Instagram interval is due."""
+        comms_config = project.release_comms
+        backfill_config = (
+            comms_config.instagram_image_backfill if comms_config is not None else None
+        )
+        if (
+            comms_config is None
+            or backfill_config is None
+            or not backfill_config.enabled
+            or not comms_config.auto_publish
+            or "instagram" not in comms_config.destinations
+        ):
+            return
+        state_path = state_database_path(
+            comms_config.state_path, project.repo / ".dev-agents/release-comms-state.db"
+        )
+        claims = StateRepository(state_path, project_name, project.repo)
+        interval = max(60, backfill_config.poll_seconds)
+        minimum_spacing = timedelta(hours=backfill_config.interval_hours)
+        last_attempt_slot: int | None = None
+
+        def latest_instagram_post(records: list[Any]) -> datetime | None:
+            times: list[datetime] = []
+            for record in records:
+                if record.status not in ("published", "staged"):
+                    continue
+                try:
+                    posted_at = datetime.fromisoformat(record.published_at)
+                except ValueError:
+                    continue
+                if posted_at.tzinfo is None:
+                    posted_at = posted_at.replace(tzinfo=UTC)
+                times.append(posted_at.astimezone(UTC))
+            return max(times, default=None)
+
+        while True:
+            time.sleep(interval)
+            now = datetime.now(UTC)
+            slot = int(now.timestamp() // minimum_spacing.total_seconds())
+            if last_attempt_slot == slot:
+                continue
+            instagram_history = claims.list_publications(
+                channel="instagram", limit=10000
+            )
+            latest_post = latest_instagram_post(instagram_history)
+            if latest_post is not None and now - latest_post < minimum_spacing:
+                continue
+            run_id = f"instagram-image-backfill-{slot}"
+            claim = claims.claim_run("instagram-image-backfill", run_id, metadata={})
+            if not claim.claimed:
+                last_attempt_slot = slot
+                continue
+            last_attempt_slot = slot
+
+            def run_backfill(run_id: str = run_id) -> None:
+                try:
+                    # Recheck just before publishing in case a live deploy post
+                    # arrived while the backfill worker was fetching production.
+                    current_history = claims.list_publications(
+                        channel="instagram", limit=10000
+                    )
+                    latest_post = latest_instagram_post(current_history)
+                    if latest_post is not None and datetime.now(UTC) - latest_post < minimum_spacing:
+                        claims.complete_run(
+                            "instagram-image-backfill",
+                            run_id,
+                            metadata={"skipped": "instagram-spacing-interval-not-elapsed"},
+                        )
+                        return
+
+                    if project.github is None:
+                        raise RuntimeError("Instagram image backfill requires a GitHub repository")
+                    production_sha = gh(
+                        project.repo,
+                        "api",
+                        f"repos/{project.github}/commits/main",
+                        "--jq",
+                        ".sha",
+                    )
+                    ensure_shas_present(project.repo, production_sha)
+                    candidates = collect_content_image_posts(
+                        project.repo, production_sha, None, include_all=True
+                    )
+                    posted_pages = {
+                        record.page_url
+                        for record in current_history
+                        if record.status in ("published", "staged")
+                    }
+                    candidate = next(
+                        (
+                            item
+                            for item in candidates
+                            if item["pageUrl"] not in posted_pages
+                        ),
+                        None,
+                    )
+                    if candidate is None:
+                        claims.complete_run(
+                            "instagram-image-backfill",
+                            run_id,
+                            metadata={"completed": "no-unpublished-content-images"},
+                        )
+                        return
+
+                    result = run_release_comms(
+                        project,
+                        project_name,
+                        run_id,
+                        dry_run=False,
+                        publish_approved=True,
+                        evaluator_result=EvaluatorResult(
+                            postworthy=True,
+                            reason="scheduled Instagram image backfill",
+                            importance="low",
+                            features=[{"name": "Existing article or answer image"}],
+                            recommended_channels=["instagram"],
+                        ),
+                        writer_result=WriterResult(instagram=[candidate]),
+                        new_sha=production_sha,
+                        previous_sha=production_sha,
+                        notify_tracking_issue=False,
+                    )
+                    claims.complete_run(
+                        "instagram-image-backfill",
+                        run_id,
+                        metadata={
+                            "page_url": candidate["pageUrl"],
+                            "completed": result.completed,
+                        },
+                    )
+                    _log(
+                        f"instagram-image-backfill page={candidate['pageUrl']} completed={result.completed}"
+                    )
+                except Exception as error:  # noqa: BLE001 - the scheduler must keep serving
+                    claims.complete_run(
+                        "instagram-image-backfill",
+                        run_id,
+                        status="failed",
+                        error=str(error),
+                    )
+                    _log(f"instagram-image-backfill error: {error}")
+
+            Thread(target=run_backfill, daemon=True).start()
+
     _log(f"listening on 127.0.0.1:{config.port}{config.webhook_path} for {project.github}")
     Thread(target=service.reconcile_loop, daemon=True).start()
     for issue_service in issue_services:
@@ -640,6 +792,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
         Thread(target=issue_service.reconcile_loop, daemon=True).start()
     Thread(target=release_comms_scheduler, daemon=True).start()
     Thread(target=content_queue_scheduler, daemon=True).start()
+    Thread(target=instagram_image_backfill_scheduler, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", config.port), Handler).serve_forever()
 
 

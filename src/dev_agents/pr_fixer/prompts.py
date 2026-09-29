@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import dev_agents.pr_fixer as _pkg
-from dev_agents.context.instructions import discover_instructions
 
 from ._shared import (
     REVIEW_REPORT_BEGIN,
@@ -59,10 +58,6 @@ may run in parallel after dependencies are installed."""
 def _prompt(
     repo: Path, number: int, keys: list[str], base_branch: str, conflicts: list[str]
 ) -> str:
-    instructions = discover_instructions(repo).documents
-    instruction_text = "\n\n".join(
-        f"## {item.path.relative_to(repo)}\n{item.content}" for item in instructions
-    )
     shared_skill = (
         SHARED_PR_FIX_SKILL.read_text(encoding="utf-8") if SHARED_PR_FIX_SKILL.is_file() else ""
     )
@@ -81,9 +76,6 @@ Shared dev-agents PR-fix workflow:
 
 Target-repository PR-fix workflow (if present):
 {target_skill_text}
-
-Read and obey these repository instructions:
-{instruction_text}
 
 Actionable feedback identities:
 {chr(10).join("- " + key for key in keys)}
@@ -127,10 +119,6 @@ def _review_prompt(
     prior_report: dict[str, Any] | None = None,
 ) -> str:
     """Build either the initial or bounded post-fix review prompt."""
-    instructions = discover_instructions(repo).documents
-    instruction_text = "\n\n".join(
-        f"## {item.path.relative_to(repo)}\n{item.content}" for item in instructions
-    )
     skill_relative_path, skill_text = _review_skill(repo)
     conflict_text = "\n".join(f"- {path}" for path in conflicts) or "None"
     validation_instructions = _target_validation_instructions(repo, base_branch)
@@ -173,9 +161,6 @@ PR URL: {meta.get("url", "")}
 {review_instructions}
 
 Review pass identifiers to use in the run report: {pass_names}
-
-Repository instructions:
-{instruction_text}
 
 Codex review skill:
 {skill_text}

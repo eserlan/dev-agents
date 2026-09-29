@@ -865,10 +865,16 @@ def publish_release_drafts(
         draft for draft in (drafts.get("github_discussions") or []) if isinstance(draft, dict)
     ]
     threads_drafts = [draft for draft in (drafts.get("threads") or []) if isinstance(draft, dict)]
+    instagram_drafts = [draft for draft in (drafts.get("instagram") or []) if isinstance(draft, dict)]
     used_discussions: set[int] = set()
     used_threads: set[int] = set()
     batches: list[
-        tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]
+        tuple[
+            dict[str, Any] | None,
+            dict[str, Any] | None,
+            dict[str, Any] | None,
+            dict[str, Any] | None,
+        ]
     ] = []
 
     for index, draft in enumerate(bluesky_drafts):
@@ -903,7 +909,7 @@ def publish_release_drafts(
         if thread_index is not None and thread_index < len(threads_drafts):
             thread = threads_drafts[thread_index]
             used_threads.add(thread_index)
-        batches.append((draft, discussion, thread))
+        batches.append((draft, discussion, thread, None))
 
     for index, discussion in enumerate(discussion_drafts):
         if index not in used_discussions:
@@ -922,19 +928,21 @@ def publish_release_drafts(
             if thread_index is not None:
                 thread = threads_drafts[thread_index]
                 used_threads.add(thread_index)
-            batches.append((None, discussion, thread))
+            batches.append((None, discussion, thread, None))
 
     for index, thread in enumerate(threads_drafts):
         if index not in used_threads:
-            batches.append((None, None, thread))
+            batches.append((None, None, thread, None))
+
+    batches.extend((None, None, None, draft) for draft in instagram_drafts)
 
     # Backwards-compatible fallback for manually injected legacy state that
     # has only a combined Discord draft and no Bluesky drafts.
     if not batches and drafts.get("discord"):
-        batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None))
+        batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None, None))
 
-    for draft, discussion, thread in batches:
-        page_url = str((draft or thread or discussion or {}).get("pageUrl", ""))
+    for draft, discussion, thread, instagram_draft in batches:
+        page_url = str((draft or instagram_draft or thread or discussion or {}).get("pageUrl", ""))
         draft_text = str((draft or {}).get("text", ""))
         pending = False
         if draft is not None:
@@ -943,6 +951,8 @@ def publish_release_drafts(
                 and publication_key(channel, channel, page_url) not in already_published
                 for channel in ("bluesky", "instagram", "x", "pinterest")
             )
+        if instagram_draft is not None and "instagram" in recommended_channels:
+            pending = pending or publication_key("instagram", "instagram", page_url) not in already_published
         if discussion is not None and "github_discussions" in recommended_channels:
             pending = pending or publication_key(
                 "github_discussions", "github_discussions", page_url
@@ -961,7 +971,7 @@ def publish_release_drafts(
                 not in already_published
                 for destination in _discord_config(project.repo)
             )
-        if draft is None and discussion is None and thread is None:
+        if draft is None and discussion is None and thread is None and instagram_draft is None:
             pending = "discord" in recommended_channels and bool(drafts.get("discord"))
         if not pending:
             continue
@@ -969,9 +979,10 @@ def publish_release_drafts(
         wait_before_message()
         errors_before_batch = len(errors)
         image_url = image_alt = ""
-        if draft is not None:
+        image_draft = draft or instagram_draft
+        if image_draft is not None:
             try:
-                image_url, image_alt = resolve_image(draft, image_overrides)
+                image_url, image_alt = resolve_image(image_draft, image_overrides)
             except Exception as error:  # noqa: BLE001
                 errors.append(f"image {page_url}: {error}")
 
@@ -1024,8 +1035,8 @@ def publish_release_drafts(
             except Exception as error:  # noqa: BLE001
                 errors.append(f"threads {page_url}: {error}")
 
-        if draft is not None and image_url:
-            if "bluesky" in recommended_channels and publication_key("bluesky", "bluesky", page_url) not in already_published:
+        if (draft is not None or instagram_draft is not None) and image_url:
+            if draft is not None and "bluesky" in recommended_channels and publication_key("bluesky", "bluesky", page_url) not in already_published:
                 try:
                     receipt = publish_bluesky(text=draft_text, page_url=page_url, image_url=image_url, image_alt=image_alt, env=env, dry_run=dry_run)
                     record_receipt(receipt)
@@ -1034,19 +1045,20 @@ def publish_release_drafts(
                     errors.append(f"bluesky {page_url}: {error}")
             if "instagram" in recommended_channels and publication_key("instagram", "instagram", page_url) not in already_published:
                 try:
-                    receipt = publish_instagram(caption=prepare_bluesky_text(draft_text, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
+                    caption_source = str((instagram_draft or draft or {}).get("text", ""))
+                    receipt = publish_instagram(caption=prepare_bluesky_text(caption_source, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
                     record_receipt(receipt)
                     result["instagram"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"instagram {page_url}: {error}")
-            if "x" in recommended_channels and publication_key("x", "x", page_url) not in already_published:
+            if draft is not None and "x" in recommended_channels and publication_key("x", "x", page_url) not in already_published:
                 try:
                     receipt = publish_x(text=prepare_bluesky_text(draft_text, page_url), page_url=page_url, env=env, dry_run=dry_run)
                     record_receipt(receipt)
                     result["x"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"x {page_url}: {error}")
-            if "pinterest" in recommended_channels and publication_key("pinterest", "pinterest", page_url) not in already_published:
+            if draft is not None and "pinterest" in recommended_channels and publication_key("pinterest", "pinterest", page_url) not in already_published:
                 try:
                     pin_title = str((discussion or {}).get("title", "")) or draft_text.strip().split(".")[0][:100]
                     receipt = publish_pinterest(title=pin_title, description=prepare_bluesky_text(draft_text, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
@@ -1054,7 +1066,7 @@ def publish_release_drafts(
                     result["pinterest"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"pinterest {page_url}: {error}")
-            if "discord" in recommended_channels:
+            if draft is not None and "discord" in recommended_channels:
                 try:
                     for receipt in publish_discord(
                         repo=project.repo,
@@ -1127,6 +1139,13 @@ def pending_publication_count(
 ) -> int:
     """Count external writes still needed for a release run."""
     count = 0
+    if "instagram" in recommended_channels:
+        for draft in drafts.get("instagram") or []:
+            if not isinstance(draft, dict):
+                continue
+            page_url = str(draft.get("pageUrl", ""))
+            if publication_key("instagram", "instagram", page_url) not in already_published:
+                count += 1
     for draft in drafts.get("bluesky") or []:
         if not isinstance(draft, dict):
             continue

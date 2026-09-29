@@ -1,0 +1,17 @@
+[Unit]
+Description=dev-agents Mythrasgen Discord notifications
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/dev-agents
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl
+EnvironmentFile=%h/.config/codex-pr-review/webhook.env
+EnvironmentFile=%h/.config/dev-agents/mythrasgen-discord.env
+ExecStart=%h/dev/dev-agents/.venv/bin/python -m dev_agents.discord_notifications mythrasgen --config %h/.config/dev-agents/projects.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

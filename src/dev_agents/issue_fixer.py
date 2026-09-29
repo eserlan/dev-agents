@@ -17,7 +17,6 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from dev_agents.config import IssueFixerConfig, PrFixerConfig, ProjectConfig
-from dev_agents.context.instructions import discover_instructions
 from dev_agents.pr_fixer import _log
 from dev_agents.runtime import (
     StateRepository,
@@ -29,7 +28,6 @@ from dev_agents.runtime import (
 from dev_agents.runtime.agent import AgentResult
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
-ISSUE_FIX_PROVIDER = "codex"
 
 
 def _run(repo: Path, *args: str, check: bool = True, timeout: float = 120) -> str:
@@ -209,10 +207,28 @@ _KIND_FRAMING = {
         "title_prefix": "docs",
         "guidance": """Treat this as a focused copyediting request. Locate the source passage in the
 target repository and use surrounding content for context. Make the requested editorial changes
-while preserving factual claims, game rules, character voice, terminology, Markdown structure,
-links, and formatting. Limit edits to the requested copy; do not make unrelated code or content
-changes. If the requested correction is ambiguous or cannot be verified from the repository,
-leave the copy unchanged and explain what needs clarification.""",
+        while preserving factual claims, game rules, character voice, terminology, Markdown structure,
+        links, and formatting. Limit edits to the requested copy; do not make unrelated code or content
+        changes. If the requested correction is ambiguous or cannot be verified from the repository,
+        leave the copy unchanged and explain what needs clarification.""",
+    },
+    "agent": {
+        "verb": "Address",
+        "goal": "implement the smallest complete solution requested by the issue",
+        "artifact": "implementation",
+        "report_field": "what was implemented, or the concrete blocker",
+        "title_prefix": "agent",
+    },
+    "answer": {
+        "verb": "Create the public Answer article requested in",
+        "goal": "write and integrate a complete Answer article in the existing site content system",
+        "artifact": "Answer article",
+        "report_field": "which article was created and how it was validated",
+        "title_prefix": "answer",
+        "guidance": """Treat the issue as an article brief, not a request to answer in an issue comment.
+Read and follow `.agents/skills/add-answer/SKILL.md` before editing; it governs the Answer schema,
+discovery intent, required R2 illustration, and validation steps. Keep changes scoped to the article
+and its required registry or index entries.""",
     },
 }
 
@@ -227,26 +243,31 @@ def _prompt(
     kind: str = "fix",
 ) -> str:
     framing = _KIND_FRAMING.get(kind, _KIND_FRAMING["fix"])
-    instructions = discover_instructions(repo).documents
-    instruction_text = "\n\n".join(
-        f"## {item.path.relative_to(repo)}\n{item.content}" for item in instructions
-    )
     shared_skill = SHARED_PR_FIX_SKILL.read_text(encoding="utf-8") if SHARED_PR_FIX_SKILL.is_file() else ""
     title = str(issue.get("title", "Untitled issue"))
     body = str(issue.get("body") or "(issue has no body)")[:30_000]
     conflict_text = "\n".join(f"- {path}" for path in conflicts) or "None"
+    discussion = ""
+    if kind == "answer" and isinstance(issue.get("comments"), list):
+        notes = []
+        for comment in issue["comments"][-6:]:
+            if not isinstance(comment, dict):
+                continue
+            text = str(comment.get("body") or "").strip()
+            if text:
+                notes.append(text[:2_500])
+        if notes:
+            discussion = "\n\nIssue discussion:\n" + "\n\n---\n\n".join(notes)
     return f"""{framing['verb']} GitHub issue #{issue.get('number')} in this isolated worktree.
 
 Issue title: {title}
 Issue URL: {issue.get('url', '')}
 Issue body:
 {body}
+{discussion}
 
 Shared dev-agents PR-fix workflow:
 {shared_skill}
-
-Read and obey these repository instructions:
-{instruction_text}
 
 Branch: {branch} (based on {base_branch})
 Merge-conflict paths: {conflict_text}
@@ -523,7 +544,7 @@ class IssueFixerService:
                     validation = "Existing remote branch is clean and ahead of the configured base."
                 else:
                     result: AgentResult = run_agent(
-                        ISSUE_FIX_PROVIDER,
+                        self.config.provider,
                         _prompt(
                             worktree,
                             issue,

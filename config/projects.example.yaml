@@ -53,6 +53,13 @@ projects:
         branch_prefix: dev-agents/copy-fix-
         timeout_minutes: 30
         max_open_issues: 5
+      - label: answer
+        kind: answer
+        provider: muse
+        base_branch: staging
+        branch_prefix: dev-agents/answer-
+        timeout_minutes: 60
+        max_open_issues: 1
     # Required for the promote workflow's "Trigger Release Communications Agent"
     # step: without this block, POSTs to /release-comms are rejected with 401.
     release_comms:
