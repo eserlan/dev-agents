@@ -104,14 +104,27 @@ def _review_completed_body(
     changed_files: list[str] | None = None,
     validation: str | None = None,
     failure: str | None = None,
+    fix_pushed: bool | None = None,
+    superseded_by: str | None = None,
 ) -> str:
     """Render the final state into the same comment used for review progress."""
     review_report = report.get("review_report")
     verdict = review_report.get("verdict") if isinstance(review_report, dict) else None
-    if failure:
+    pushed_fix = (
+        fix_pushed
+        if fix_pushed is not None
+        else bool(new_sha and new_sha != old_sha)
+    )
+    if superseded_by:
+        heading = "### 🤖 Luna review superseded"
+        outcome = (
+            f"The PR advanced to `{superseded_by[:12]}` during this review. "
+            "The new head will receive a full review."
+        )
+    elif failure:
         heading = "### 🤖 Luna review failed"
         outcome = failure
-    elif new_sha and new_sha != old_sha:
+    elif pushed_fix:
         heading = "### 🤖 Luna review completed — fixes pushed"
         outcome = "Concrete findings were identified and fixed."
     elif verdict == "clean":
@@ -127,7 +140,7 @@ def _review_completed_body(
     if len(shown_files) > 12:
         files_line += f" (+{len(shown_files) - 12} more)"
     commit_line = "The PR head was unchanged."
-    if new_sha and new_sha != old_sha:
+    if pushed_fix:
         commit_line = f"Pushed fix commit `{new_sha[:12]}`."
     validation_line = validation or "See the run report for validation details."
     return f"""<!-- dev-agents:pr-review run={run_id} -->

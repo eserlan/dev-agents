@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 from collections.abc import Iterator
@@ -79,6 +80,44 @@ class PublicationRecord:
     error: str | None
     published_at: str
     metadata: dict[str, Any]
+
+
+def _process_identity(pid: int) -> dict[str, int | str]:
+    """Return a PID plus OS start identity so PID reuse cannot revive a dead claim."""
+    identity: dict[str, int | str] = {"pid": pid}
+    try:
+        tail = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        identity["start_ticks"] = int(tail[19])
+        identity["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+    except (OSError, IndexError, ValueError):
+        pass
+    return identity
+
+
+def _worker_is_alive(metadata: dict[str, Any]) -> bool | None:
+    """Check a recorded worker identity; None means this is a legacy unowned run."""
+    worker = metadata.get("_worker_identity")
+    if not isinstance(worker, dict):
+        return None
+    try:
+        pid = int(worker["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    current = _process_identity(pid)
+    if "start_ticks" in worker and "start_ticks" in current:
+        return (
+            worker.get("start_ticks") == current.get("start_ticks")
+            and worker.get("boot_id") == current.get("boot_id")
+        )
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class JsonStateStore:
@@ -368,6 +407,16 @@ class StateRepository:
         )
 
     @staticmethod
+    def _run_is_stale(row: sqlite3.Row) -> bool:
+        record = StateRepository._run_record(row)
+        if _worker_is_alive(record.metadata) is False:
+            return True
+        return (
+            (datetime.now(UTC) - _parse_timestamp(record.started_at)).total_seconds()
+            >= StateRepository.STALE_RUN_SECONDS
+        )
+
+    @staticmethod
     def _run_event(row: sqlite3.Row) -> RunEvent:
         try:
             metadata = json.loads(row["metadata"])
@@ -448,6 +497,64 @@ class StateRepository:
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [self._run_record(row) for row in rows]
+
+    def recover_interrupted_runs(self) -> list[RunRecord]:
+        """Fail claims whose recorded worker process no longer exists.
+
+        This runs once at daemon startup. Legacy claims without worker identities are left to
+        the normal age-based stale-run policy because their owner cannot be verified safely.
+        """
+        now = _timestamp()
+        recovered: list[RunRecord] = []
+        with self._transaction(immediate=True) as connection:
+            rows = connection.execute(
+                "SELECT * FROM runs WHERE project_name = ? AND status = 'running'",
+                (self.project_name,),
+            ).fetchall()
+            for row in rows:
+                record = self._run_record(row)
+                if _worker_is_alive(record.metadata) is not False:
+                    continue
+                error = "worker process exited before the run completed"
+                metadata = dict(record.metadata)
+                metadata["interrupted"] = True
+                connection.execute(
+                    """UPDATE runs SET status = 'failed', error = ?, metadata = ?,
+                       completed_at = ?, updated_at = ?
+                       WHERE project_name = ? AND workflow = ? AND run_id = ? AND status = 'running'""",
+                    (
+                        error,
+                        json.dumps(metadata, sort_keys=True),
+                        now,
+                        now,
+                        self.project_name,
+                        record.workflow,
+                        record.run_id,
+                    ),
+                )
+                connection.execute(
+                    """UPDATE delivery_claims SET status = 'failed', completed_at = ?, error = ?
+                       WHERE project_name = ? AND workflow = ? AND run_id = ? AND status = 'running'""",
+                    (now, error, self.project_name, record.workflow, record.run_id),
+                )
+                self._insert_event(
+                    connection,
+                    self.project_name,
+                    record.workflow,
+                    record.run_id,
+                    "runtime",
+                    "worker_interrupted",
+                    "failed",
+                    {"worker_identity": record.metadata.get("_worker_identity")},
+                    now,
+                    now,
+                )
+                updated = self._select_run(
+                    connection, self.project_name, record.workflow, record.run_id
+                )
+                if updated is not None:
+                    recovered.append(self._run_record(updated))
+        return recovered
 
     def list_run_events(self, workflow: str, run_id: str) -> list[RunEvent]:
         """Load the ordered timeline for one run."""
@@ -683,7 +790,9 @@ class StateRepository:
     ) -> RunClaim:
         """Atomically claim a run; failed or stale runs may be retried."""
         now = _timestamp()
-        payload = json.dumps(metadata or {}, sort_keys=True)
+        claim_metadata = dict(metadata or {})
+        claim_metadata["_worker_identity"] = _process_identity(os.getpid())
+        payload = json.dumps(claim_metadata, sort_keys=True)
         with self._transaction(immediate=True) as connection:
             existing_delivery = None
             if delivery_id is not None:
@@ -703,11 +812,7 @@ class StateRepository:
                     )
                     if row is None:
                         raise StateError("delivery claim references a missing run")
-                    delivery_is_stale = (
-                        row["status"] == "running"
-                        and (datetime.now(UTC) - _parse_timestamp(str(row["started_at"]))).total_seconds()
-                        >= self.STALE_RUN_SECONDS
-                    )
+                    delivery_is_stale = row["status"] == "running" and self._run_is_stale(row)
                     if row["status"] in ("completed", "rejected") or (
                         existing_delivery["status"] == "running" and not delivery_is_stale
                     ):
@@ -716,10 +821,8 @@ class StateRepository:
             row = self._select_run(connection, self.project_name, workflow, run_id)
             if row is not None and row["status"] in ("completed", "rejected"):
                 return RunClaim(False, self._run_record(row))
-            if row is not None and row["status"] == "running":
-                started = _parse_timestamp(str(row["started_at"]))
-                if (datetime.now(UTC) - started).total_seconds() < self.STALE_RUN_SECONDS:
-                    return RunClaim(False, self._run_record(row))
+            if row is not None and row["status"] == "running" and not self._run_is_stale(row):
+                return RunClaim(False, self._run_record(row))
 
             if row is None:
                 connection.execute(

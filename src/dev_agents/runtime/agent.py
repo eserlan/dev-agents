@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -10,6 +11,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
+from threading import Event
 
 from dev_agents.runtime.retention import remove_older_than
 
@@ -88,6 +90,7 @@ def provider_command(
     prompt: str,
     timeout_seconds: float = 1200,
     reasoning_effort: str = "medium",
+    model: str | None = None,
 ) -> list[str]:
     """Build the command line for a configured provider."""
     if provider == "codex":
@@ -96,7 +99,7 @@ def provider_command(
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             "-m",
-            CODEX_MODEL,
+            model or CODEX_MODEL,
             "-c",
             f'model_reasoning_effort="{reasoning_effort}"',
             "-",
@@ -144,8 +147,11 @@ def run_agent(
     timeout_seconds: float,
     heartbeat_seconds: float = 30.0,
     reasoning_effort: str = "medium",
+    model: str | None = None,
+    last_message_path: Path | None = None,
     on_progress: Callable[[int], None] | None = None,
     progress_interval_seconds: float = 600.0,
+    cancel_event: Event | None = None,
 ) -> AgentResult:
     """Run a provider, forwarding output to a durable log and emitting heartbeats.
 
@@ -162,18 +168,25 @@ def run_agent(
         stream.flush()
         prompt_stream = None
         if provider == "codex":
-            prompt_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+            prompt_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")  # noqa: SIM115 - closed immediately after spawn in finally
             prompt_stream.write(prompt)
             prompt_stream.seek(0)
         try:
+            command = provider_command(provider, prompt, timeout_seconds, reasoning_effort, model)
+            if last_message_path is not None:
+                if provider != "codex":
+                    raise ValueError("last_message_path requires the Codex provider")
+                last_message_path.parent.mkdir(parents=True, exist_ok=True)
+                command.extend(["--output-last-message", str(last_message_path)])
             process = subprocess.Popen(
-                provider_command(provider, prompt, timeout_seconds, reasoning_effort),
+                command,
                 cwd=cwd,
                 env=_agent_environment(),
                 stdin=prompt_stream,
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 text=True,
+                start_new_session=True,
             )
         finally:
             if prompt_stream is not None:
@@ -183,6 +196,17 @@ def run_agent(
         last_progress_at = start
         timed_out = False
         while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stream.write("=== agent cancelled: PR head advanced ===\n")
+                stream.flush()
+                break
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0:

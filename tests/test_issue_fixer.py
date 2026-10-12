@@ -9,6 +9,7 @@ from dev_agents.issue_fixer import (
     IssueFixerService,
     _existing_issue_pr,
     _isolated_issue_worktree,
+    _issue,
     _issue_result_body,
     _open_bug_issues,
     _pr_number_from_url,
@@ -17,6 +18,45 @@ from dev_agents.issue_fixer import (
     _publish_issue_comment,
 )
 from dev_agents.runtime import StateRepository
+
+
+def test_issue_reads_latest_reopen_across_event_pages(monkeypatch, tmp_path):
+    responses = iter([
+        json.dumps({"number": 92, "state": "OPEN"}),
+        json.dumps([
+            [{"id": 10, "event": "reopened"}],
+            [{"id": 30, "event": "closed"}, {"id": 20, "event": "reopened"}],
+        ]),
+    ])
+    monkeypatch.setattr("dev_agents.issue_fixer._run", lambda *_args, **_kwargs: next(responses))
+    assert _issue(tmp_path, 92)["reopenEventId"] == "20"
+
+
+def test_reopened_issue_gets_new_run_and_branch_without_duplicate_runs(monkeypatch, tmp_path):
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    state = StateRepository(tmp_path / "state.db", "lear-bear", tmp_path)
+    service = IssueFixerService("lear-bear", project, IssueFixerConfig(), PrFixerConfig(), state)
+    issue = {"state": "OPEN", "title": "Same title", "body": "Same body", "labels": [{"name": "bug"}]}
+    monkeypatch.setattr("dev_agents.issue_fixer._issue", lambda *_args: issue)
+    monkeypatch.setattr("dev_agents.issue_fixer._existing_issue_pr", lambda *_args: None)
+    initial = service._collect_issue({"number": 92})
+    state.complete_run("issue-fixer", initial["run_id"])
+    assert service._collect_issue({"number": 92})["skip"] is True
+
+    for event in ("100", "200"):
+        issue["reopenEventId"] = event
+        reopened = service._collect_issue({"number": 92})
+        assert reopened["claimed"] is True
+        assert reopened["run_id"] != initial["run_id"]
+        assert reopened["branch"] == f"dev-agents/issue-92-reopen-{event}"
+        assert service._collect_issue({"number": 92})["skip"] is True
+        state.complete_run("issue-fixer", reopened["run_id"])
+        assert service._collect_issue({"number": 92})["skip"] is True
+
+    issue["reopenEventId"] = "300"
+    monkeypatch.setattr("dev_agents.issue_fixer._existing_issue_pr", lambda *_args: {"number": 123})
+    assert service._collect_issue({"number": 92})["skip"] is True
+    assert len(state.list_runs("issue-fixer")) == 3
 
 
 def test_open_bug_issues_keeps_only_open_exact_label(

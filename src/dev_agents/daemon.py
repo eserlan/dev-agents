@@ -29,6 +29,7 @@ from dev_agents.config import (
     load_projects_config,
     select_project,
 )
+from dev_agents.copy_review import is_answer_merge, review_merged_answer
 from dev_agents.issue_fixer import IssueFixerService
 from dev_agents.pr_fixer import (
     _ACTIONS,
@@ -92,6 +93,12 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
     _cleanup_artifacts(project_name, project, config)
     service = PrFixerService(project_name, project, config)
+    interrupted_runs = service.state.recover_interrupted_runs()
+    for run in interrupted_runs:
+        _log(
+            f"recovered-interrupted workflow={run.workflow} run_id={run.run_id} "
+            "status=failed; eligible for retry"
+        )
     # Every configured label queue (e.g. a "bug" fix queue and a separate
     # "gui-fix" enhancement queue) gets its own IssueFixerService, sharing the
     # PR fixer's state repository. Each service filters by its own label, so
@@ -386,9 +393,26 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                 or payload.get("pull_request", {}).get("number")
                 or check_pr_number
             )
+            pull = payload.get("pull_request")
+            synchronized_head = (
+                str(pull.get("head", {}).get("sha", ""))
+                if event == "pull_request"
+                and action == "synchronize"
+                and isinstance(pull, dict)
+                and isinstance(pull.get("head"), dict)
+                else None
+            )
+            answer_copy_merge = (
+                event == "pull_request"
+                and action == "closed"
+                and isinstance(pull, dict)
+                and pull.get("merged") is True
+                and project.copy_review is not None
+                and is_answer_merge(pull, project.copy_review)
+            )
             if (
                 payload.get("repository", {}).get("full_name") != project.github
-                or action not in _ACTIONS.get(event, set())
+                or (action not in _ACTIONS.get(event, set()) and not answer_copy_merge)
                 or not isinstance(number, int)
             ):
                 _log(
@@ -412,7 +436,13 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
             def run() -> None:
                 try:
-                    started = service.handle(number)
+                    if answer_copy_merge and isinstance(pull, dict) and project.copy_review:
+                        review_merged_answer(
+                            project_name, project, project.copy_review, service.state, pull
+                        )
+                        started = True
+                    else:
+                        started = service.handle(number, new_head_sha=synchronized_head)
                     service.state.complete_run(
                         "github-webhook",
                         f"delivery:{delivery}",

@@ -1,0 +1,49 @@
+[
+  {
+    "name": "dm-correction-4008",
+    "pr": 4008,
+    "issue": 4005,
+    "correction_issue": 4007,
+    "path": "apps/web/src/lib/content/answers/pages/what-are-the-pros-and-cons-of-becoming-a-dungeon-master.ts",
+    "required_blocking_scopes": [
+      "examples"
+    ],
+    "required_findings": {
+      "repetition": [
+        "blocking",
+        "suggestion"
+      ],
+      "example": [
+        "blocking"
+      ]
+    },
+    "expected_verdict": "needs_human_review"
+  },
+  {
+    "name": "dm-polish-4011",
+    "pr": 4014,
+    "issue": 4005,
+    "correction_issue": 4011,
+    "path": "apps/web/src/lib/content/answers/pages/what-are-the-pros-and-cons-of-becoming-a-dungeon-master.ts",
+    "expected_verdict": "clean"
+  },
+  {
+    "name": "dice-correction-3915",
+    "pr": 3915,
+    "issue": 3895,
+    "correction_issue": 3914,
+    "path": "apps/web/src/lib/content/answers/pages/which-dice-do-i-roll-in-dnd-and-when.ts"
+  },
+  {
+    "name": "concise-reference",
+    "fixture": "reference.md",
+    "brief": "Explain dice notation as a concise standalone reference. No worked scene, product connection or image is required.",
+    "expected_verdict": "clean"
+  },
+  {
+    "name": "unrelated-worldbuilding",
+    "fixture": "worldbuilding.md",
+    "brief": "Teach a compact cause-and-effect worldbuilding technique through one runnable example. This standalone exercise needs no product connection or image.",
+    "expected_verdict": "clean"
+  }
+]

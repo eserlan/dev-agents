@@ -1,9 +1,12 @@
 import json
 import sqlite3
+import subprocess
+import sys
 from threading import Barrier, Thread
 
 from dev_agents.pr_fixer import _load_state
 from dev_agents.runtime import JsonStateStore, SqliteStateStore, StateRepository
+from dev_agents.runtime.state import _process_identity
 
 
 def test_state_store_round_trips_atomically(tmp_path):
@@ -63,13 +66,50 @@ def test_state_repository_migrates_schema_and_enables_wal(tmp_path):
     assert claim.claimed is True
     assert record.status == "completed"
     assert record.attempt == 1
-    assert record.metadata == {"log": "x", "phase": "done"}
+    assert {key: value for key, value in record.metadata.items() if not key.startswith("_")} == {
+        "log": "x", "phase": "done",
+    }
+    assert record.metadata["_worker_identity"]["pid"] > 0
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
     assert connection.execute("SELECT status FROM delivery_claims").fetchone()[0] == "completed"
     events = store.list_run_events("workflow", "run-1")
     assert [event.event for event in events] == ["run_started", "run_completed"]
+
+
+def test_interrupted_worker_is_recovered_and_delivery_can_retry(tmp_path):
+    store = StateRepository(tmp_path / "state.db", "demo", tmp_path / "repo")
+    store.claim_run("issue-fixer", "run-1", delivery_id="delivery-1")
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        store.update_run("issue-fixer", "run-1", metadata={"_worker_identity": _process_identity(worker.pid)})
+        assert store.recover_interrupted_runs() == []
+        assert not store.claim_run("issue-fixer", "run-1", delivery_id="delivery-1").claimed
+        worker.terminate()
+        worker.wait(timeout=5)
+        recovered = store.recover_interrupted_runs()
+        assert len(recovered) == 1
+        assert recovered[0].status == "failed"
+        assert recovered[0].metadata["interrupted"] is True
+        assert "worker_interrupted" in [event.event for event in store.list_run_events("issue-fixer", "run-1")]
+        retry = store.claim_run("issue-fixer", "run-1", delivery_id="delivery-1")
+        assert retry.claimed and retry.record.attempt == 2
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=5)
+
+
+def test_pid_reuse_cannot_keep_an_abandoned_claim_running(tmp_path):
+    store = StateRepository(tmp_path / "state.db", "demo", tmp_path / "repo")
+    claim = store.claim_run("pr-review", "run-1")
+    identity = dict(claim.record.metadata["_worker_identity"])
+    identity["boot_id"] = "a-different-boot"
+    identity["start_ticks"] = -1
+    store.update_run("pr-review", "run-1", metadata={"_worker_identity": identity})
+    retry = store.claim_run("pr-review", "run-1")
+    assert retry.claimed and retry.record.attempt == 2
 
 
 def test_state_repository_records_publication_receipts(tmp_path):

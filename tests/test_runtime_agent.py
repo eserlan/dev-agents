@@ -171,3 +171,35 @@ def test_agent_environment_survives_an_unwritable_scratch_root(
     monkeypatch.setenv("TMPDIR", "/original")
 
     assert _agent_environment()["TMPDIR"] == "/original"
+
+
+def test_codex_final_message_is_separate_from_echoed_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    monkeypatch.setattr(
+        "dev_agents.runtime.agent.provider_command",
+        lambda *_args: [
+            sys.executable,
+            "-c",
+            (
+                'import pathlib,sys; print("Echoed prompt and intermediate text"); '
+                'pathlib.Path(sys.argv[-1]).write_text("Final assessment")'
+            ),
+        ],
+    )
+    output = tmp_path / "final.txt"
+    result = run_agent(
+        "codex",
+        "Review",
+        cwd=tmp_path,
+        log_path=tmp_path / "agent.log",
+        timeout_seconds=5,
+        heartbeat_seconds=0.01,
+        last_message_path=output,
+    )
+    assert result.returncode == 0
+    assert output.read_text() == "Final assessment"
+    assert "Echoed prompt" in (tmp_path / "agent.log").read_text()

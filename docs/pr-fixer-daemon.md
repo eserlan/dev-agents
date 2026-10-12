@@ -4,10 +4,11 @@ The daemon is designed to be a drop-in replacement for the existing `remotecc` P
 listener. It runs the Python listener under systemd and keeps Cloudflare Tunnel as a separate,
 dependent service. Secrets and tunnel credentials stay outside this repository.
 
-PR reviews, PR fixes, and issue-fixer queues (including `gui-fix`) are hard-pinned to Codex
-using the `gpt-6-luna` model. The PR-fixer
-`providers` setting is retained for configuration compatibility, but it cannot enable fallback
-to another agent; `reasoning_effort` controls the Codex reasoning level and defaults to `high`.
+PR reviews, PR fixes, and issue-fixer queues (including `gui-fix`) use Codex. The runtime's
+default model is `gpt-6-luna`; set `pr_fixer.model` to override it for a project.
+The PR-fixer `providers` setting is retained for configuration compatibility, but it cannot enable
+fallback to another agent. `reasoning_effort` controls the Codex reasoning level and defaults to
+`high`.
 
 ```bash
 mkdir -p ~/.config/dev-agents ~/.config/systemd/user
@@ -50,11 +51,22 @@ configuration, scripts, or dependency manifests follow the workflow's widened af
 workspace/full-validation path. Repositories without those helpers use focused changed-file
 validation as directed by their own instructions.
 
+If a `pull_request.synchronize` event advances a PR while its fixer or review is running, the
+daemon terminates that run's agent process, closes the old run as superseded, and immediately
+restarts feedback collection against the latest head. Other webhook events do not cancel active
+work; reconciliation still avoids starting duplicate work for a PR already being handled.
+
 ## State database
 
 Workflow state is stored in the configured `pr_fixer.state_path` SQLite database. If it is omitted,
 the default is `~/.local/state/dev-agents/<project>/pr-fixer-state.db`. SQLite WAL mode and a
 30-second busy timeout allow webhook and reconciliation workers to share the database safely.
+
+Run claims record the owning process identity. On daemon startup, claims whose owner exited are
+marked failed and become retryable; periodic issue and PR reconciliation then resumes the work.
+Issue retries reuse an interrupted attempt's registered worktree when it is still available, so
+uncommitted edits survive a service restart. Older claims without process identity retain the
+one-hour stale-run fallback.
 
 The first PR-fixer run imports the previous `pr-fixer-state.json` file when it exists. The legacy file is
 left in place as a rollback copy; new writes use SQLite. A configured path ending in `.json` is
@@ -131,11 +143,114 @@ surrounding repository content to make the requested copy edits, preserves meani
 then pushes a branch and opens a PR against `staging`. Ambiguous editorial requests are reported
 without guessing. The normal PR review workflow handles the resulting PR.
 
+The `cif` queue handles focused improvements to feature help content:
+
+```yaml
+issue_fixers:
+  - label: cif
+    kind: help
+    base_branch: staging
+    branch_prefix: dev-agents/cif-
+```
+
+Codex inspects the target repository's documentation instructions and existing help system, then
+updates the help for the feature named in the issue. It opens a PR for the usual review pipeline;
+unclear feature requests are reported without guessing.
+
+An optional reactive copy review runs after an Answer PR is merged to the configured branch:
+
+```yaml
+copy_review:
+  base_branch: staging
+  page_globs: ["apps/web/src/lib/content/answers/pages/*.ts"]
+  instructions_path: docs/answer-quality-review.md
+  model: gpt-6.1-sol
+  reasoning_effort: low
+  timeout_minutes: 10
+```
+
+The daemon recognizes Answer PRs by their `answer:` title or `dev-agents/answer-` branch prefix,
+identifies changed Answer pages using `page_globs`, and reviews the complete source and metadata at
+the merge commit. It checks the original issue and neighboring content, then records a structured
+`clean`, `changes_required`, or `needs_human_review` verdict with evidence, findings, limitations,
+Answer paths, PR number, and exact source revision in SQLite and the assessment log. Infrastructure
+or parse failures are recorded as failed runs. Blocking findings produce one focused issue labelled
+`copy-fix`; suggestions alone do not block. Newly added pages take priority over related pages that
+only received link updates. Starts, skips, failures and outcomes are logged to the daemon journal.
+
+The current trigger covers merged PRs targeting the configured branch whose title starts `answer:`
+or whose branch starts `dev-agents/answer-`. It does not automatically review an unrelated PR just
+because it edits an existing Answer page. Webhook delivery and run claims are deduplicated by
+delivery ID and merge SHA. Copy-fix PRs from `dev-agents/copy-fix-` receive a **single targeted
+verification** against their linked issue after merging. A clean result is commented on that PR and
+recorded against the correction merge commit. An unresolved or unverifiable correction is marked
+`needs_human_review` and commented on; the daemon does not open another automated correction issue,
+so this path cannot loop indefinitely. A correction that changes no configured Answer source is
+also escalated for human review. Remove `copy_review` to disable both review triggers.
+
+Whole-article review is part of both the initial review and correction verification. The reviewer
+maps repeated substantive guidance across sections, tests whether worked examples use credible
+beginner choices and demonstrate real consequences, and checks headings and overall reader flow.
+It groups overlapping edits and proposes a specific consolidation while preserving factual fixes.
+Brief recaps, optional wording preferences and concise reference Answers without worked examples
+can pass. These are semantic assessments, not punctuation bans or word-count targets.
+
+Every new assessment must report evidence and status for repetition, examples and flow. A missing
+check cannot silently qualify as clean. Material coherence defects after correction go to
+`needs_human_review` with actionable findings on the correction PR; they do not create another
+automated issue. Original briefs are recovered from the prior review or explicit issue references
+when available. Editorial clean is separate from technical lint compliance and presentation checks;
+inaccessible rendering is reported as a limitation.
+
+This implements the editorial-cohesion slice of [dev-agents #21](https://github.com/eserlan/dev-agents/issues/21)
+within [#19](https://github.com/eserlan/dev-agents/issues/19). Writer instruction ownership stays with
+[CC #3918](https://github.com/eserlan/Codex-Cryptica/issues/3918). It does not implement #19's production gate.
+Read-only AI replays are available through `evals/replay_answer_quality.py`; see
+[the replay notes](../evals/answer-quality/README.md).
+
+`instructions_path` loads the project's editorial policy from its checkout (an absolute path is
+also accepted). The Answer quality reviewer prioritises correctness, conceptual reasoning,
+practical use, player agency, consistency, content overlap, metadata and product accuracy over
+minor wording. It can inspect surrounding repository content and GitHub issues using read-only
+commands. Only material improvements warrant a consolidated issue with strengths to preserve,
+specific problems, proposed improvements and acceptance criteria. A matching open issue is reused
+and receives `copy-fix` if needed.
+
+Each completed review records a score out of ten, verdict, strengths, evidence-backed findings
+(severity, category, location, reader impact and proposed correction), checks and limitations. The
+score, verdict and summary are logged to the journal; the full assessment is stored beside the agent
+log as `.assessment.json` and in SQLite run metadata. The final assessment is read from Codex's
+final-message output file, so echoed prompts and intermediate commentary cannot be mistaken for the
+result. `clean` means no unresolved blocking editorial defect was identified at the reviewed merge
+commit; it does not assert that every subjective improvement has been made.
+
+This workflow ends at corrected staging content. Codex Cryptica promotes an explicitly selected
+staging deployment artifact through a separate workflow in the target repository. This daemon does
+not determine which artifact is promoted or enforce editorial readiness for production; a clean
+review or correction verification must not be presented as proof that production contains that
+content. The promotion workflow needs a separate artifact-specific readiness integration.
+
+Provider fallback is available per issue queue. The Answer queue can keep Muse as its primary
+writer and use Codex with `gpt-6-luna` when Muse exits unsuccessfully or times out:
+
+```yaml
+- label: answer
+  kind: answer
+  provider: muse
+  fallback_provider: codex
+  fallback_model: gpt-6-luna
+```
+
 On startup and during reconciliation, open issues carrying the configured label are claimed in
 SQLite. Luna works in an isolated branch, runs the target repository's validation, pushes the
 branch, and opens a PR containing an issue marker. The normal PR review/fix workflow then owns
 that PR; the issue fixer never merges or closes it. Existing marked PRs prevent duplicate issue
 branches, and failed claims may be retried safely.
+
+Reopening an issue starts a new remediation cycle even when its title and body are unchanged.
+The latest GitHub reopen event identifies the cycle, so repeated webhook deliveries and
+reconciliation passes are deduplicated, while reconciliation can recover a missed webhook.
+Each reopened cycle uses a fresh branch; an existing open fix PR still prevents another run.
 
 The PR workflow's `pause_on_external_agent_commits`, `external_agent_logins`, and
 `external_agent_resume_label` settings also protect issue-fixer PRs. If an external agent such as

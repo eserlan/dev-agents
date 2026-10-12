@@ -1300,3 +1300,63 @@ def test_publish_fix_summary_creates_comment_when_run_comment_is_missing(
         call[:4] == ("gh", "api", "repos/owner/repo/issues/42/comments", "-f")
         for call in calls
     )
+
+
+@pytest.mark.parametrize("skip,unseen,expected_comments", [
+    (False, ["check:failed"], 1),
+    (True, ["check:failed"], 0),
+    (False, [], 0),
+])
+def test_fix_announces_pickup_before_agent_only_for_actionable_claim(
+    monkeypatch, tmp_path: Path, skip: bool, unseen: list[str], expected_comments: int
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=repo), PrFixerConfig(state_path=tmp_path / "state.db")
+    )
+    published: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer._publish_pr_run_comment",
+        lambda *args: published.append(args) or True,
+    )
+
+    def fake_fix(*args: Any, **kwargs: Any) -> tuple[bool, dict[str, Any]]:
+        assert len(published) == 1
+        assert published[0][3] == "fix-started"
+        assert "picked up PR #42" in published[0][4]
+        assert "abc123" in published[0][4]
+        return True, {}
+
+    monkeypatch.setattr(service, "_fix", fake_fix)
+    monkeypatch.setattr(service.state, "record_event", lambda *args, **kwargs: None)
+    service._remediate({
+        "number": 42, "skip": skip, "unseen": unseen,
+        "run_id": "run-42", "meta": {"headRefName": "feature", "headRefOid": "abc123"},
+    })
+    assert len(published) == expected_comments
+
+
+def test_failed_fix_posts_outcome_and_preserves_feedback(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=repo), PrFixerConfig(state_path=tmp_path / "state.db")
+    )
+    service.state.claim_run("pr-fixer", "run-42")
+    published: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer._publish_pr_run_comment",
+        lambda *args: published.append(args) or True,
+    )
+    service._finalize({
+        "number": 42, "claimed": True, "fixed": False,
+        "run_id": "run-42", "unseen": ["check:failed"], "attempt": 1,
+    })
+    assert published[0][3] == "fix-failed"
+    assert "did not complete the fix for PR #42" in published[0][4]
+    record = service.state.load_run("pr-fixer", "run-42")
+    assert record is not None and record.status == "failed"
+    assert service.state.unprocessed_feedback("pr-fixer", "42", ["check:failed"]) == [
+        "check:failed"
+    ]

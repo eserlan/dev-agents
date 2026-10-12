@@ -24,6 +24,7 @@ from dev_agents.runtime import (
     repo_worktree_semaphore,
     repository_slug,
     run_agent,
+    run_with_fallback,
 )
 from dev_agents.runtime.agent import AgentResult
 
@@ -55,6 +56,21 @@ def _issue(repo: Path, number: int) -> dict[str, Any]:
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise TypeError("gh issue view returned an invalid payload")
+    # A reopen is a new remediation cycle even when the title/body is unchanged.
+    # Read durable GitHub history so reconciliation also recovers missed webhooks.
+    pages = json.loads(
+        _run(
+            repo,
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/issues/{number}/events",
+            "--paginate",
+            "--slurp",
+        )
+    )
+    reopened = [event for page in pages for event in page if event.get("event") == "reopened"]
+    if reopened:
+        value["reopenEventId"] = str(max(reopened, key=lambda event: int(event["id"]))["id"])
     return value
 
 
@@ -228,7 +244,54 @@ target repository and use surrounding content for context. Make the requested ed
         "guidance": """Treat the issue as an article brief, not a request to answer in an issue comment.
 Read and follow `.agents/skills/add-answer/SKILL.md` before editing; it governs the Answer schema,
 discovery intent, required R2 illustration, and validation steps. Keep changes scoped to the article
-and its required registry or index entries.""",
+and its required registry or index entries.
+
+Apply this additional dev-agents editorial standard while drafting:
+- Choose the teaching structure for the reader's task and level. A rules explainer should work
+  through a realistic roll and result; GM advice should show a situation and its table consequence;
+  comparisons should explain trade-offs; reference answers should define scope and boundary cases.
+  Do not force a before/after story or checklist when it adds no teaching value. If the target
+  repository's schema or skill requires a block, make that block useful for this question rather
+  than silently omitting it or filling it with generic material.
+- Make examples demonstrate the advice. For mechanics, include concrete inputs, modifiers, result,
+  and what the reader does next; distinguish an illustrative sequence from a universal rule. For
+  GM guidance, show what players can observe or choose and how the fiction responds. For a dice
+  explainer, the corrected version in PR #3915 is a useful calibration: calculate a real attack and
+  damage result instead of describing one from a distance, and do not imply every damage or healing
+  amount requires a preceding d20 roll. Borrow the reader-outcome standard, not that article's format.
+- Write for the issue's declared audience. Define terms and abbreviations before relying on them.
+  Verify concrete rules against authoritative references, and clearly separate edition-specific
+  guidance (including 2014 and 2024 D&D where relevant). Do not invent rules, requirements, or
+  certainty.
+- Edit the short answer, opening, headings, examples, checklist, and conclusion together. Remove
+  repeated explanations, empty reassurance, misleading micro-copy, and examples that narrate rather
+  than teach. Keep useful distinctions and practical detail; do not chase an arbitrary length.
+- Select related Answers, tools, and product references by the reader's likely next task. Prefer a
+  relevant cornerstone or neighbour, and omit a tool or Codex Cryptica mention when it does not
+  help answer this question. Keep product claims accurate, restrained, and optional.
+- Treat the existing post-merge `copy-fix` review as a safety net, not a drafting stage or a score to
+  game. Resolve material quality problems you find now, while remaining open to valid editorial
+  corrections later; the goal is a useful Answer, not zero review findings.
+- Before committing, do a critical read against the original issue and these points: name the
+  reader's actual problem, check whether the example proves the advice and enables the reader to do
+  the task, look for a counterexample that breaks an absolute claim, and verify that the ending
+  follows from the article's own guidance. Judge the result by reader outcomes, not by whether each
+  checklist item is present. Correct material problems rather than merely reporting them in the PR
+  summary.""",
+    },
+    "help": {
+        "verb": "Improve the help content requested in",
+        "goal": "make the smallest complete improvement to the help content for the named feature",
+        "artifact": "help content changes",
+        "report_field": "which help content changed and how it was validated",
+        "title_prefix": "docs",
+        "guidance": """Treat this as a documentation task for the feature identified by the issue.
+Inspect the target repository's instructions and existing help content system before editing. Find
+where help for that feature belongs, follow its format and terminology, and verify product behavior
+from the repository rather than inventing instructions. Improve the existing help entry when one
+exists; add an entry only when the feature has no suitable help content. Keep changes focused on
+help content and its required indexes or registries. If the feature or requested guidance is unclear,
+leave content unchanged and explain what needs clarification.""",
     },
 }
 
@@ -248,7 +311,7 @@ def _prompt(
     body = str(issue.get("body") or "(issue has no body)")[:30_000]
     conflict_text = "\n".join(f"- {path}" for path in conflicts) or "None"
     discussion = ""
-    if kind == "answer" and isinstance(issue.get("comments"), list):
+    if kind in {"answer", "help"} and isinstance(issue.get("comments"), list):
         notes = []
         for comment in issue["comments"][-6:]:
             if not isinstance(comment, dict):
@@ -306,6 +369,26 @@ def _drop_empty_local_branch(repo: Path, branch: str, base_branch: str) -> None:
         _run(repo, "git", "branch", "-D", branch, check=False)
 
 
+def _existing_issue_worktree(repo: Path, root: Path, branch: str) -> Path | None:
+    """Find an interrupted issue attempt's registered worktree so edits can be reused."""
+    listing = _run(repo, "git", "worktree", "list", "--porcelain", check=False)
+    for block in listing.split("\n\n"):
+        fields = dict(
+            line.split(" ", 1) for line in block.splitlines() if " " in line
+        )
+        path_text = fields.get("worktree")
+        if fields.get("branch") != f"refs/heads/{branch}" or not path_text:
+            continue
+        path = Path(path_text)
+        try:
+            relative = path.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            continue
+        if relative.parts and relative.parts[0].startswith("issue-") and path.is_dir():
+            return path
+    return None
+
+
 @contextmanager
 def _isolated_issue_worktree(
     repo: Path, root: Path, branch: str, base_branch: str, *, max_concurrent: int = 2
@@ -318,7 +401,10 @@ def _isolated_issue_worktree(
     semaphore = repo_worktree_semaphore(repo, max_concurrent)
     semaphore.acquire()
     try:
-        worktree = Path(tempfile.mkdtemp(prefix="issue-", dir=root))
+        worktree = _existing_issue_worktree(repo, root, branch)
+        reused_worktree = worktree is not None
+        if worktree is None:
+            worktree = Path(tempfile.mkdtemp(prefix="issue-", dir=root))
         lock = repo_git_lock(repo)
         try:
             with lock:
@@ -342,7 +428,16 @@ def _isolated_issue_worktree(
                     branch,
                     check=False,
                 )
-                if remote_branch:
+                if reused_worktree:
+                    if remote_branch:
+                        _run(
+                            repo,
+                            "git",
+                            "fetch",
+                            "origin",
+                            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                        )
+                elif remote_branch:
                     _run(
                         repo,
                         "git",
@@ -380,12 +475,19 @@ def _isolated_issue_worktree(
                         _run(worktree, "git", "switch", "-c", branch)
             # rerere has no business in a one-shot automated worktree merge -- see
             # the matching note in runtime/worktree.py's isolated_worktree.
-            merge = subprocess.run(
-                ["git", "-c", "rerere.enabled=false", "merge", f"origin/{base_branch}", "--no-edit"],
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                check=False,
+            merge_in_progress = bool(
+                _run(worktree, "git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD", check=False)
+            )
+            merge = (
+                subprocess.CompletedProcess([], 1, "", "merge already in progress")
+                if merge_in_progress
+                else subprocess.run(
+                    ["git", "-c", "rerere.enabled=false", "merge", f"origin/{base_branch}", "--no-edit"],
+                    cwd=worktree,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
             )
             conflicts = _run(
                 worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False
@@ -467,9 +569,14 @@ class IssueFixerService:
             return {"issue": issue, "skip": True}
         if _existing_issue_pr(self.project.repo, number) is not None:
             return {"issue": issue, "skip": True}
-        fingerprint = hashlib.sha256(
-            f"{issue.get('title', '')}\0{issue.get('body', '')}".encode()
-        ).hexdigest()[:16]
+        identity = f"{issue.get('title', '')}\0{issue.get('body', '')}"
+        reopen_event = issue.get("reopenEventId")
+        branch = f"{self.config.branch_prefix}{number}"
+        if reopen_event:
+            identity += f"\0reopen={reopen_event}"
+            # Never treat the old merged branch as an already-pushed new fix.
+            branch += f"-reopen-{reopen_event}"
+        fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:16]
         run_id = f"issue-fix-{number}-{fingerprint}"
         claim = self.state.claim_run(
             "issue-fixer",
@@ -478,7 +585,8 @@ class IssueFixerService:
                 "issue": number,
                 "label": self.config.label,
                 "base_branch": self.config.base_branch,
-                "branch": f"{self.config.branch_prefix}{number}",
+                "branch": branch,
+                "reopen_event_id": reopen_event,
             },
         )
         if not claim.claimed:
@@ -494,7 +602,7 @@ class IssueFixerService:
         return {
             "issue": issue,
             "run_id": run_id,
-            "branch": f"{self.config.branch_prefix}{number}",
+            "branch": branch,
             "claimed": True,
             "attempt": claim.record.attempt,
         }
@@ -543,22 +651,45 @@ class IssueFixerService:
                     summary = "Reused the previously pushed issue fix and verified its branch."
                     validation = "Existing remote branch is clean and ahead of the configured base."
                 else:
-                    result: AgentResult = run_agent(
-                        self.config.provider,
-                        _prompt(
-                            worktree,
-                            issue,
-                            self.config.base_branch,
-                            state["branch"],
-                            conflicts,
-                            kind=self.config.kind,
-                        ),
-                        cwd=worktree,
-                        log_path=log_path,
-                        timeout_seconds=self.config.timeout_minutes * 60,
-                        heartbeat_seconds=self.pr_config.heartbeat_seconds,
-                        reasoning_effort=self.pr_config.reasoning_effort,
+                    prompt = _prompt(
+                        worktree,
+                        issue,
+                        self.config.base_branch,
+                        state["branch"],
+                        conflicts,
+                        kind=self.config.kind,
                     )
+                    providers = [self.config.provider]
+                    if self.config.fallback_provider and self.config.fallback_provider not in providers:
+                        providers.append(self.config.fallback_provider)
+                    results: dict[str, AgentResult] = {}
+
+                    def run_provider(provider: str) -> AgentResult:
+                        model = (
+                            self.config.fallback_model
+                            if provider == self.config.fallback_provider
+                            else self.pr_config.model
+                        )
+                        result = run_agent(
+                            provider,
+                            prompt,
+                            cwd=worktree,
+                            log_path=log_path,
+                            timeout_seconds=self.config.timeout_minutes * 60,
+                            heartbeat_seconds=self.pr_config.heartbeat_seconds,
+                            reasoning_effort=self.pr_config.reasoning_effort,
+                            model=model,
+                        )
+                        results[provider] = result
+                        return result
+
+                    accepted = run_with_fallback(providers, run_provider)
+                    used_provider, result = accepted or (providers[-1], results[providers[-1]])
+                    if used_provider != self.config.provider:
+                        _log(
+                            f"issue-fixer issue={number} run_id={run_id} "
+                            f"provider-fallback={self.config.provider}->{used_provider}"
+                        )
                     _run(
                         worktree,
                         "git",

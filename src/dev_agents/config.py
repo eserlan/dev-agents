@@ -23,12 +23,27 @@ class IssueFixerConfig(BaseModel):
     label: str = "bug"
     # The kind frames the work and determines its PR title prefix; all kinds
     # use the same isolated branch, validation, and review pipeline.
-    kind: Literal["fix", "enhancement", "copy", "agent", "answer"] = "fix"
+    kind: Literal["fix", "enhancement", "copy", "agent", "answer", "help"] = "fix"
     provider: Literal["codex", "muse"] = "codex"
+    fallback_provider: Literal["codex", "muse"] | None = None
+    fallback_model: str | None = None
     base_branch: str = "main"
     branch_prefix: str = "dev-agents/issue-"
     timeout_minutes: int = 30
     max_open_issues: int = 5
+
+
+class CopyReviewConfig(BaseModel):
+    """Review Answer changes and verify merged copy-fix corrections."""
+
+    model_config = ConfigDict(frozen=True)
+
+    base_branch: str = "staging"
+    model: str = "gpt-6.1-sol"
+    reasoning_effort: str = "low"
+    timeout_minutes: int = 10
+    page_globs: list[str] = ["*.md", "*.mdx", "*.mdoc"]
+    instructions_path: Path | None = None
 
 
 class ProjectConfig(BaseModel):
@@ -53,6 +68,7 @@ class ProjectConfig(BaseModel):
     # Additional label-driven queues beyond the single `issue_fixer` above,
     # e.g. a "bug" queue plus a "gui-fix" enhancement queue running together.
     issue_fixers: list[IssueFixerConfig] = []
+    copy_review: CopyReviewConfig | None = None
     release_comms: ReleaseCommsConfig | None = None
     discord_notifications: DiscordNotificationsConfig | None = None
 
@@ -150,6 +166,7 @@ class PrFixerConfig(BaseModel):
     log_dir: Path | None = None
     worktree_dir: Path | None = None
     providers: list[str] = ["codex"]
+    model: str | None = None
     reasoning_effort: str = "high"
     timeout_minutes: int = 20
     reconcile_interval_seconds: int = 300

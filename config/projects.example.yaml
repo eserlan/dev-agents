@@ -22,6 +22,8 @@ projects:
       # Secret values stay in a private environment file, never here.
       webhook_secret_env: GITHUB_WEBHOOK_SECRET
       providers: [codex]
+      # Optional Codex model override; defaults to the runtime's pinned model.
+      # model: gpt-6.1-sol
       reasoning_effort: high
       # Green staging PRs without a submitted Copilot review receive the two-pass
       # general + Codex-Cryptica review before auto-merge eligibility is checked.
@@ -56,10 +58,30 @@ projects:
       - label: answer
         kind: answer
         provider: muse
+        fallback_provider: codex
+        fallback_model: gpt-6-luna
         base_branch: staging
         branch_prefix: dev-agents/answer-
         timeout_minutes: 60
-        max_open_issues: 1
+        max_open_issues: 5
+      # Help content improvements for the feature named in each issue.
+      - label: cif
+        kind: help
+        provider: codex
+        base_branch: staging
+        branch_prefix: dev-agents/cif-
+        timeout_minutes: 30
+        max_open_issues: 5
+    # Review copy immediately after an Answer PR merges to staging. Proposals are
+    # published as a GitHub issue; the reviewer never edits the article.
+    copy_review:
+      base_branch: staging
+      page_globs: ["apps/web/src/lib/content/answers/pages/*.ts"]
+      # Relative to the target checkout; keep project editorial policy there.
+      instructions_path: docs/answer-quality-review.md
+      model: gpt-6.1-sol
+      reasoning_effort: low
+      timeout_minutes: 10
     # Required for the promote workflow's "Trigger Release Communications Agent"
     # step: without this block, POSTs to /release-comms are rejected with 401.
     release_comms:

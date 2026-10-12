@@ -14,7 +14,7 @@ import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -87,6 +87,13 @@ def _review_verdict(metadata: dict[str, Any]) -> str | None:
     return None
 
 
+def _review_report_has_fixes(report: dict[str, Any]) -> bool:
+    """Whether the structured review report says the agent made concrete fixes."""
+    review_report = report.get("review_report")
+    fixes = review_report.get("fixes") if isinstance(review_report, dict) else None
+    return report.get("report_valid") is True and isinstance(fixes, list) and bool(fixes)
+
+
 def _round_ended_chain(metadata: dict[str, Any]) -> bool:
     """Whether the review round recorded in ``metadata`` leaves nothing further to verify.
 
@@ -113,25 +120,60 @@ class PrFixerService:
             _state_path(config, project_name), project_name, project.repo
         )
         self.active: set[int] = set()
+        self.rerun_requested: set[int] = set()
+        self.cancel_events: dict[int, Event] = {}
+        self.active_heads: dict[int, str] = {}
         self.lock = Lock()
         self.workflow = self._build_workflow()
 
-    def handle(self, number: int) -> bool:
+    def handle(self, number: int, *, new_head_sha: str | None = None) -> bool:
         with self.lock:
             if number in self.active:
+                if new_head_sha and new_head_sha != self.active_heads.get(number):
+                    self.rerun_requested.add(number)
+                    self.cancel_events[number].set()
+                    _log(
+                        f"head-advanced pr={number} new_head={new_head_sha[:12]}; "
+                        "cancelling stale run and queuing latest head"
+                    )
                 return False
             self.active.add(number)
+            self.cancel_events[number] = Event()
         try:
-            result = self.workflow.invoke({"number": number})
-            # Merge readiness is deliberately independent from the feedback
-            # run claim. A no-op run can be completed while checks are still
-            # being created; a later check_run.completed event must still be
-            # able to request auto-merge for the same PR head.
-            self._ensure_auto_merge(number)
-            return bool(result.get("started", False))
+            started = False
+            while True:
+                result = self.workflow.invoke({"number": number})
+                started = bool(result.get("started", False)) or started
+                with self.lock:
+                    if number in self.rerun_requested:
+                        self.rerun_requested.discard(number)
+                        self.cancel_events[number] = Event()
+                        self.active_heads.pop(number, None)
+                        _log(f"rerunning pr={number} against latest head")
+                        continue
+                # Merge readiness is deliberately independent from the feedback
+                # run claim. A no-op run can be completed while checks are still
+                # being created; a later check_run.completed event must still
+                # be able to request auto-merge for the same PR head.
+                self._ensure_auto_merge(number)
+                with self.lock:
+                    if number in self.rerun_requested:
+                        self.rerun_requested.discard(number)
+                        self.cancel_events[number] = Event()
+                        self.active_heads.pop(number, None)
+                        _log(f"rerunning pr={number} against latest head")
+                        continue
+                    self.active.discard(number)
+                    self.cancel_events.pop(number, None)
+                    self.active_heads.pop(number, None)
+                    break
+            return started
         finally:
             with self.lock:
                 self.active.discard(number)
+                self.rerun_requested.discard(number)
+                self.cancel_events.pop(number, None)
+                self.active_heads.pop(number, None)
             from dev_agents.visualize import schedule_report_refresh
 
             schedule_report_refresh(self.project_name, self.project)
@@ -228,9 +270,53 @@ class PrFixerService:
             "prior_report": None,
         }
 
+    def _finish_superseded_review(
+        self, state: PrFixerRunState, new_sha: str
+    ) -> dict[str, bool]:
+        """Close a review cleanly when an unreported external commit advanced the PR."""
+        number = state["number"]
+        workflow = state.get("workflow", "pr-fixer")
+        old_sha = str(state.get("meta", {}).get("headRefOid", ""))
+        metadata = {"reviewed_head_sha": old_sha, "superseded_by": new_sha}
+        self.state.record_event(
+            workflow,
+            state["run_id"],
+            "finalize",
+            "review_superseded",
+            metadata=metadata,
+        )
+        self.state.complete_run(
+            workflow,
+            state["run_id"],
+            status="failed",
+            error="superseded by a concurrent push to the same branch",
+            metadata=metadata,
+        )
+        _pkg._publish_pr_run_comment(
+            self.project.repo,
+            number,
+            state["run_id"],
+            "review-final",
+            _review_completed_body(
+                number,
+                state["run_id"],
+                state.get("report", {}),
+                state.get("report_url"),
+                int(state.get("review_round", 0)),
+                old_sha,
+                new_sha,
+                fix_pushed=False,
+                superseded_by=new_sha,
+            ),
+        )
+        _log(f"review-superseded pr={number} original_head={old_sha} new_head={new_sha}")
+        return {"started": False}
+
     def _collect_feedback(self, state: PrFixerRunState) -> dict[str, Any]:
         number = state["number"]
         meta, keys = _pkg._feedback(self.project.repo, number)
+        with self.lock:
+            self.active_heads[number] = str(meta.get("headRefOid", "unknown"))
         labels = {label["name"].lower() for label in meta.get("labels", [])}
         if (
             meta.get("baseRefName") != self.config.base_branch
@@ -432,6 +518,24 @@ class PrFixerService:
             )
         else:
             report_url = None
+            _pkg._publish_pr_run_comment(
+                self.project.repo,
+                number,
+                state["run_id"],
+                "fix-started",
+                f"""<!-- dev-agents:pr-fix-started run={state['run_id']} -->
+### 🤖 Dev-agents fix started
+
+Dev-agents has picked up PR #{number} and is working on {len(unseen)} actionable feedback item(s),
+including any failing checks. The agent will investigate, make fixes, and run validation.
+
+- PR head: `{state['meta'].get('headRefOid', 'unknown')}`
+- Attempt: {state.get('attempt', 1)}
+- Run: `{state['run_id']}`
+
+A follow-up comment will report the outcome.
+""",
+            )
         fixed, report = self._fix(
             number,
             state["meta"]["headRefName"],
@@ -520,36 +624,19 @@ class PrFixerService:
                 # this would either burn a review-chain round on nothing, or worse,
                 # permanently block review of the very head that superseded us.
                 # The webhook for that new push already queued its own run.
-                self.state.record_event(
-                    workflow,
-                    state["run_id"],
-                    "finalize",
-                    "review_superseded",
-                    metadata={
-                        "reviewed_head_sha": state.get("meta", {}).get("headRefOid"),
-                        "superseded_by": superseded_head,
-                    },
-                )
-                self.state.complete_run(
-                    workflow,
-                    state["run_id"],
-                    status="failed",
-                    error="superseded by a concurrent push to the same branch",
-                    metadata={
-                        "reviewed_head_sha": state.get("meta", {}).get("headRefOid"),
-                        "superseded_by": superseded_head,
-                    },
-                )
-                _log(f"review-superseded pr={number} superseded_by={superseded_head}")
-                return {"started": False}
+                return self._finish_superseded_review(state, str(superseded_head))
             if not state.get("fixed"):
-                recovery_metadata: dict[str, Any] = {}
                 try:
                     refreshed_meta, _ = _pkg._feedback(self.project.repo, number)
                 except (RuntimeError, json.JSONDecodeError):
                     refreshed_meta = {}
                 old_sha = str(state.get("meta", {}).get("headRefOid", ""))
                 new_sha = str(refreshed_meta.get("headRefOid", ""))
+                if new_sha and new_sha != old_sha and not _review_report_has_fixes(
+                    state.get("report", {})
+                ):
+                    return self._finish_superseded_review(state, new_sha)
+                recovery_metadata: dict[str, Any] = {}
                 if new_sha and new_sha != old_sha:
                     review_round = int(state.get("review_round", 0))
                     recovery_metadata = {
@@ -604,7 +691,12 @@ class PrFixerService:
             old_sha = str(state["meta"].get("headRefOid", ""))
             new_sha = str(refreshed_meta.get("headRefOid", ""))
             review_round = int(state.get("review_round", 0))
-            fix_pushed = bool(new_sha and new_sha != old_sha)
+            head_advanced = bool(new_sha and new_sha != old_sha)
+            report = state.get("report", {})
+            agent_pushed_fix = head_advanced and _review_report_has_fixes(report)
+            if head_advanced and not agent_pushed_fix:
+                return self._finish_superseded_review(state, new_sha)
+            fix_pushed = agent_pushed_fix
             review_passes = (
                 ["general", "codex-review"]
                 if review_round == 0
@@ -631,7 +723,7 @@ class PrFixerService:
                 ).splitlines()
                 if path
             ]
-            review_report = state.get("report", {}).get("review_report")
+            review_report = report.get("review_report")
             validation = None
             if isinstance(review_report, dict) and isinstance(review_report.get("validation"), list):
                 validation = "; ".join(str(item) for item in review_report["validation"])
@@ -650,6 +742,7 @@ class PrFixerService:
                     new_sha,
                     changed_files,
                     validation,
+                    fix_pushed=fix_pushed,
                 ),
             )
             self.state.record_event(
@@ -724,6 +817,20 @@ class PrFixerService:
                 state["run_id"],
                 status="failed",
                 error="agent did not complete the fix",
+            )
+            _pkg._publish_pr_run_comment(
+                self.project.repo,
+                number,
+                state["run_id"],
+                "fix-failed",
+                f"""<!-- dev-agents:pr-fix-failed run={state['run_id']} -->
+### 🤖 Dev-agents fix incomplete
+
+The agent did not complete the fix for PR #{number}. Feedback remains actionable for retry.
+
+- Attempt: {state.get('attempt', 1)}
+- Run: `{state['run_id']}`
+""",
             )
             self._auto_pause_if_exhausted(
                 number,
@@ -866,7 +973,9 @@ class PrFixerService:
                         timeout_seconds=self.config.timeout_minutes * 60,
                         heartbeat_seconds=self.config.heartbeat_seconds,
                         reasoning_effort=self.config.reasoning_effort,
+                        model=self.config.model,
                         on_progress=on_progress,
+                        cancel_event=self.cancel_events.get(number),
                     )
                     report.update(_agent_report(log))
                     result_code = result.returncode
