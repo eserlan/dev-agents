@@ -52,8 +52,28 @@ class AuditReport(BaseModel):
         }
 
 
+_FILLER_WORDS = {"lens", "and", "the"}
+
+
+def canonical_lens(category: str) -> str | None:
+    """Map a check category the auditor paraphrased to its lens identifier.
+
+    The model often writes "Security and privacy lens" or "tests and assertion completeness"
+    for `security-privacy` or `tests`. Only a category that is the lens identifier, or starts
+    with it as whole words, counts; "architecture and privacy" does not cover security-privacy.
+    """
+    words = [word for word in re.split(r"[^a-z0-9]+", category.lower()) if word and word not in _FILLER_WORDS]
+    normalised = "-".join(words)
+    for lens in AUDIT_LENSES:
+        if normalised == lens or normalised.startswith(f"{lens}-"):
+            return lens
+    return None
+
+
 def parse_audit_report(path: Path, *, initial: bool) -> AuditReport:
     report = AuditReport.model_validate_json(path.read_text(encoding="utf-8"))
+    for check in report.checks:
+        check.category = canonical_lens(check.category) or check.category
     if initial and not AUDIT_LENSES.issubset({check.category for check in report.checks}):
         raise ValueError("initial audit must explicitly assess all adversarial lenses")
     if report.verdict == "clean" and (report.findings or any(check.status in {"finding", "unverified"} for check in report.checks)):

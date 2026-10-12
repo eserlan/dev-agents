@@ -173,6 +173,10 @@ Adversarial falsification lenses:
 - accessibility: Inspect semantic controls, focus/hidden states and contrast across all relevant
   theme variants. Where colour values are available, calculate rather than assume adequate contrast.
 
+Record one `checks` entry for every lens above, with `category` set to exactly its identifier:
+premise-inversion, tests, resource-budget, security-privacy, lifecycle, accessibility. Add any
+other areas you reviewed (such as the bundled repository guidance) as separate entries.
+
 For each actionable finding, state its reachable trigger, source location, code evidence, user
 impact, severity and smallest repair. Only report high-confidence findings introduced by this PR.
 Do not invent a defect to fill a category, turn uncertainty into clean, or inherit an earlier clean

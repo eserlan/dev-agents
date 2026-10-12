@@ -73,3 +73,31 @@ def test_human_reference_comments_are_separate_from_bots() -> None:
         {"findings": [{"location": "view.ts:42"}]}, comments, "reviewed", human_reviewers={"alice", "automated"},
     )
     assert comparison["reference_count"] == comparison["overlap_count"] == 1
+
+
+def test_paraphrased_lens_categories_are_canonicalised(tmp_path: Path) -> None:
+    paraphrased = ["Premise-inversion lens", "tests and assertion completeness", "Resource-budget lens",
+                   "Security and privacy lens", "lifecycle", "Accessibility lens"]
+    checks = [{"category": name, "status": "pass", "evidence": "Traced the changed path"} for name in paraphrased]
+    checks.append({"category": "Codex-Cryptica architecture and privacy", "status": "pass", "evidence": "Checked"})
+    path = tmp_path / "audit.json"
+    path.write_text(json.dumps({"verdict": "clean", "findings": [], "categories_checked": ["general"],
+                                "checks": checks, "limitations": []}))
+
+    report = parse_audit_report(path, initial=True)
+
+    assert [check.category for check in report.checks] == [
+        "premise-inversion", "tests", "resource-budget", "security-privacy", "lifecycle", "accessibility",
+        "Codex-Cryptica architecture and privacy",
+    ]
+
+
+def test_a_lens_merely_mentioned_inside_another_category_does_not_count(tmp_path: Path) -> None:
+    checks = [{"category": lens, "status": "pass", "evidence": "Traced"} for lens in sorted(AUDIT_LENSES - {"security-privacy"})]
+    checks.append({"category": "architecture and privacy", "status": "pass", "evidence": "Checked"})
+    path = tmp_path / "audit.json"
+    path.write_text(json.dumps({"verdict": "clean", "findings": [], "categories_checked": ["general"],
+                                "checks": checks, "limitations": []}))
+
+    with pytest.raises(ValueError, match="all adversarial lenses"):
+        parse_audit_report(path, initial=True)
