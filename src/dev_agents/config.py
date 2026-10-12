@@ -192,6 +192,9 @@ class PrFixerConfig(BaseModel):
     review_handoff_branch_prefixes: list[str] = ["claude/"]
     degodify_webhook_path: str = "/degodify"
     degodify_webhook_secret_env: str = "DEGODIFY_WEBHOOK_SECRET"
+    # A full decomposition (dependency install, several extractions, tests, lint and a fallow
+    # audit) needs far longer than the single extraction degodify used to make.
+    degodify_timeout_minutes: int = 60
     # After this many consecutive failed attempts at the same run_id (e.g. a
     # provider quota outage), auto-apply the "paused" label instead of letting
     # reconcile retry-and-comment on it forever.

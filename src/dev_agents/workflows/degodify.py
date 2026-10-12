@@ -1,7 +1,8 @@
-"""Candidate selection for bounded, autonomous god-file decomposition."""
+"""Candidate selection and fallow-guided, autonomous god-file decomposition."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -44,6 +45,37 @@ class DegodifyRunResult:
     pull_request_url: str | None
     dry_run: bool
     succeeded: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class FallowFileReport:
+    """The parts of `fallow inspect --file` that tell an agent where and how to split."""
+
+    exports: list[tuple[str, list[str]]]
+    complex_functions: list[dict[str, Any]]
+    clones: list[str]
+    dead_code: list[str]
+
+    def prompt_section(self) -> str:
+        lines = [f"Exports and the files that use them ({len(self.exports)}). Exports used by the same files usually belong together:"]
+        for name, consumers in self.exports[:MAX_PROMPT_ITEMS]:
+            shown = ", ".join(PurePosixPath(path).name for path in consumers[:4]) or "no direct importers"
+            more = f" (+{len(consumers) - 4} more)" if len(consumers) > 4 else ""
+            lines.append(f"- {name}: {shown}{more}")
+        if self.complex_functions:
+            lines.append("Complex functions to break up (cyclomatic / cognitive):")
+            lines.extend(
+                f"- {item['name']} at line {item['line']}: {item['cyclomatic']} / {item['cognitive']} ({item['severity']})"
+                for item in self.complex_functions[:MAX_PROMPT_ITEMS]
+            )
+        if self.clones:
+            lines.append("Duplicated blocks to consolidate:")
+            lines.extend(f"- {clone}" for clone in self.clones[:MAX_PROMPT_ITEMS])
+        if self.dead_code:
+            lines.append("Dead code to delete:")
+            lines.extend(f"- {item}" for item in self.dead_code[:MAX_PROMPT_ITEMS])
+        return "\n".join(lines)
 
 
 class DegodifyState(TypedDict, total=False):
@@ -62,6 +94,13 @@ class DegodifyState(TypedDict, total=False):
 
 IGNORED_DIRS = {"node_modules", ".git", "dist", "build", "coverage", ".svelte-kit"}
 SOURCE_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".svelte"}
+# A decomposition aims for the WATCH threshold, and must at least cut the file by a quarter to be
+# worth a PR; anything less is the single surgical extraction this workflow used to make.
+TARGET_LINES = 500
+MIN_REDUCTION = 0.25
+# Only one decomposition is open at a time, so nightly runs don't stack refactors on each other.
+BRANCH_PREFIX = "curator/degod-"
+MAX_PROMPT_ITEMS = 25
 
 
 def _emit(state: DegodifyState, event: str, payload: dict[str, Any]) -> None:
@@ -114,9 +153,142 @@ def active_repository_items(repo: Path) -> list[str]:
     return items
 
 
+def fallow_enabled(worktree: Path) -> bool:
+    """Whether the target repository uses fallow (its own config or dependency)."""
+    package = worktree / "package.json"
+    return (worktree / ".fallowrc.json").is_file() or (
+        package.is_file() and '"fallow"' in package.read_text(encoding="utf-8", errors="replace")
+    )
+
+
+def _install_dependencies(worktree: Path) -> bool:
+    """Install locked dependencies so fallow resolves the worktree like CI does."""
+    if (worktree / "node_modules").is_dir():
+        return True
+    if not any((worktree / name).is_file() for name in ("bun.lock", "bun.lockb")):
+        return False
+    try:
+        result = subprocess.run(
+            ("bun", "install", "--frozen-lockfile"), cwd=worktree, capture_output=True, text=True, timeout=900, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _fallow_json(worktree: Path, *args: str, timeout: float = 600) -> dict[str, Any] | None:
+    """Run one read-only fallow query; None when it is unavailable or its output is unusable."""
+    try:
+        result = subprocess.run(
+            ("bunx", "fallow", *args, "--format", "json", "--quiet"),
+            cwd=worktree, capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        data = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def summarize_fallow_inspect(data: dict[str, Any], target: str) -> FallowFileReport:
+    """Reduce `fallow inspect --file` JSON to the evidence a decomposition needs."""
+    evidence = data.get("evidence") or {}
+
+    def section(name: str) -> dict[str, Any]:
+        value = evidence.get(name) or {}
+        inner = value.get("data") if isinstance(value, dict) and "data" in value else value
+        return inner if isinstance(inner, dict) else {}
+
+    exports = [
+        (str(item.get("name")), [str(ref.get("from_file")) for ref in item.get("referenced_by") or [] if ref.get("from_file")])
+        for item in section("trace_file").get("exports") or []
+        if isinstance(item, dict) and item.get("name")
+    ]
+    complex_functions = sorted(
+        (
+            {key: item.get(key) for key in ("name", "line", "cyclomatic", "cognitive", "severity")}
+            for item in section("complexity").get("findings") or []
+            if isinstance(item, dict) and item.get("path") == target
+        ),
+        key=lambda item: -(item.get("cognitive") or 0),
+    )
+    clones = []
+    for group in section("duplication").get("clone_groups") or []:
+        instances = [item for item in group.get("instances") or [] if isinstance(item, dict)]
+        clones.append(", ".join(f"{PurePosixPath(str(item.get('file'))).name}:{item.get('start_line')}-{item.get('end_line')}" for item in instances))
+    dead = section("dead_code")
+    dead_code = [
+        str(item.get("export_name") or item.get("name") or item)
+        for key in ("unused_exports", "unused_types", "unused_class_members", "unused_enum_members")
+        for item in dead.get(key) or []
+        if isinstance(item, dict)
+    ]
+    return FallowFileReport(exports, complex_functions, clones, dead_code)
+
+
+def decomposition_gate(before_lines: int, after_lines: int, audit: dict[str, Any] | None) -> str | None:
+    """Return why a finished decomposition should not become a PR, or None when it qualifies."""
+    if before_lines and (before_lines - after_lines) / before_lines < MIN_REDUCTION:
+        return f"target only shrank from {before_lines} to {after_lines} lines (needs at least {MIN_REDUCTION:.0%})"
+    if audit is not None and audit.get("verdict") == "fail":
+        return "fallow audit failed for the decomposition"
+    return None
+
+
+def _line_count(path: Path) -> int:
+    return len(path.read_text(encoding="utf-8", errors="replace").splitlines()) if path.is_file() else 0
+
+
+# The target repository's own analyzer owns which files may stay large (Codex-Cryptica keeps its
+# data-catalogue exemptions there); the built-in scan is only a fallback for repositories without it.
+REPOSITORY_ANALYZER = "scripts/god-file-analysis.ts"
+
+
+def repository_analysis(repo: Path, *, top_count: int = 50) -> list[DegodifyFile] | None:
+    """Rank files with the repository's own god-file analyzer, or None when it has none."""
+    if not (repo / REPOSITORY_ANALYZER).is_file():
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        report_path = Path(directory) / "god-files.json"
+        try:
+            subprocess.run(
+                ("bun", REPOSITORY_ANALYZER, f"--json-file={report_path}", f"--summary-file={Path(directory) / 'summary.md'}", "--top", str(top_count)),
+                cwd=repo, capture_output=True, text=True, timeout=300, check=False,
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            return None
+    return [
+        DegodifyFile(
+            str(item.get("relativePath") or item["path"]),
+            int(item["totalLines"]),
+            int(item["codeLines"]),
+            str(item.get("type") or "Utility / Module"),
+            str(item.get("status") or "WATCH"),
+            bool(item.get("isDataCatalog", False)),
+        )
+        for item in report.get("topFiles") or []
+        if isinstance(item, dict) and "totalLines" in item and "codeLines" in item
+    ]
+
+
+def open_degodify_pull_request(repo: Path) -> str | None:
+    """Return the URL of an already open degodify PR, if there is one."""
+    try:
+        pulls = gh_json(repo, "pr", "list", "--state", "open", "--json", "headRefName,url", "--limit", "200")
+    except (GitHubError, TypeError):
+        return None
+    for pull in pulls if isinstance(pulls, list) else []:
+        if str(pull.get("headRefName", "")).startswith(BRANCH_PREFIX):
+            return str(pull.get("url") or pull.get("headRefName"))
+    return None
+
+
 def plan_degodify(repo: Path, *, top_count: int = 50) -> CandidateSelection:
     """Produce a read-only decomposition plan for a repository."""
-    return select_candidate(analyze_repository(repo, top_count=top_count), active_repository_items(repo))
+    files = repository_analysis(repo, top_count=top_count)
+    if files is None:
+        files = analyze_repository(repo, top_count=top_count)
+    return select_candidate(files, active_repository_items(repo))
 
 
 def _run_degodify_impl(
@@ -136,9 +308,12 @@ def _run_degodify_impl(
         return DegodifyRunResult(None, None, None, dry_run, True)
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     slug = "".join(char if char.isalnum() else "-" for char in PurePosixPath(candidate.relative_path).name).lower()
-    branch = f"curator/degod-{slug}-{stamp}"
+    branch = f"{BRANCH_PREFIX}{slug}-{stamp}"
     if dry_run:
         return DegodifyRunResult(candidate, branch, None, True, True)
+    if open_pull := open_degodify_pull_request(repo):
+        # Not a failure: tonight's decomposition waits until the previous one has merged.
+        return DegodifyRunResult(candidate, None, None, False, True, f"waiting for open degodify PR {open_pull}")
 
     root = repo / ".dev-agents-worktrees"
     root.mkdir(parents=True, exist_ok=True)
@@ -146,7 +321,10 @@ def _run_degodify_impl(
     try:
         _git(repo, "fetch", "origin", base_branch)
         _git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base_branch}")
-        prompt = build_decomposition_prompt(candidate, branch, base_branch, worktree)
+        use_fallow = fallow_enabled(worktree) and _install_dependencies(worktree)
+        inspected = _fallow_json(worktree, "inspect", "--file", candidate.relative_path) if use_fallow else None
+        fallow = summarize_fallow_inspect(inspected, candidate.relative_path) if inspected else None
+        prompt = build_decomposition_prompt(candidate, branch, base_branch, worktree, fallow)
         configured_providers = providers or [provider]
         def run_provider(name: str) -> AgentResult:
             if name != configured_providers[0]:
@@ -158,10 +336,37 @@ def _run_degodify_impl(
         clean = _git(worktree, "status", "--porcelain") == ""
         changed = _git(worktree, "rev-parse", "HEAD") != _git(worktree, "rev-parse", f"origin/{base_branch}")
         if result is None or not clean or not changed:
-            return DegodifyRunResult(candidate, branch, None, False, False)
+            return DegodifyRunResult(candidate, branch, None, False, False, "agent did not leave a clean, committed change")
+        after_lines = _line_count(worktree / candidate.relative_path)
+        # A fallback provider's reset runs `git clean -fdx`, which also removes node_modules.
+        audit = (
+            _fallow_json(worktree, "audit", "--base", f"origin/{base_branch}")
+            if use_fallow and _install_dependencies(worktree)
+            else None
+        )
+        reason = decomposition_gate(candidate.total_lines, after_lines, audit)
+        if reason:
+            return DegodifyRunResult(candidate, branch, None, False, False, reason)
         _git(worktree, "push", "-u", "origin", branch)
-        title = f"♻️ Curator: [degodify] extract concern from {PurePosixPath(candidate.relative_path).name}"
-        body = f"Automated bounded decomposition of `{candidate.relative_path}`.\n\nAgent: `{provider}`."
+        new_files = [
+            path for path in _git(worktree, "diff", "--name-only", "--diff-filter=A", f"origin/{base_branch}...HEAD").splitlines() if path
+        ]
+        name = PurePosixPath(candidate.relative_path).name
+        title = f"♻️ Curator: [degodify] decompose {name} ({candidate.total_lines} → {after_lines} lines)"
+        body = "\n".join([
+            f"Automated decomposition of `{candidate.relative_path}`, guided by fallow.",
+            "",
+            "| | Before | After |",
+            "| --- | --- | --- |",
+            f"| Lines in `{name}` | {candidate.total_lines} | {after_lines} |",
+            f"| Complex functions flagged | {len(fallow.complex_functions) if fallow else 'n/a'} | see fallow audit |",
+            f"| fallow audit | | {audit.get('verdict') if audit else 'not run'} |",
+            "",
+            "New modules:",
+            *[f"- `{path}` ({_line_count(worktree / path)} lines)" for path in new_files],
+            "",
+            f"Agent: `{accepted[0] if accepted else provider}`.",
+        ])
         pr_url = _gh(repo, "pr", "create", "--base", base_branch, "--head", branch, "--title", title, "--body", body)
         return DegodifyRunResult(candidate, branch, pr_url, False, True)
     finally:
@@ -282,24 +487,48 @@ def select_candidate(files: list[DegodifyFile], active_items: list[str]) -> Cand
     return CandidateSelection(None, skipped)
 
 
-def build_decomposition_prompt(file: DegodifyFile, branch: str, base_branch: str, worktree: Path) -> str:
-    """Build the bounded extraction prompt without performing any mutation."""
-    changed_files_output = _git(worktree, "diff", "--name-only", f"origin/{base_branch}...HEAD", check=False)
-    changed_files = [path for path in changed_files_output.splitlines() if path and (worktree / path).exists()]
-    changed_text = " ".join(changed_files) if changed_files else "<no changed files detected>"
+def build_decomposition_prompt(
+    file: DegodifyFile,
+    branch: str,
+    base_branch: str,
+    worktree: Path,
+    fallow: FallowFileReport | None = None,
+) -> str:
+    """Build the decomposition prompt without performing any mutation."""
+    target = min(TARGET_LINES, file.total_lines // 2)
+    evidence = (
+        fallow.prompt_section()
+        if fallow
+        else "fallow evidence is unavailable; find the seams by reading the file and its importers."
+    )
+    audit_line = (
+        f"- `bunx fallow audit --base origin/{base_branch}` must not fail.\n" if fallow else ""
+    )
     return f"""You are Curator, an autonomous refactoring specialist.
 
-TARGET FILE: {file.relative_path} (Current size: {file.total_lines} lines, {file.code_lines} code lines, type: {file.file_type})
+TARGET FILE: {file.relative_path} ({file.total_lines} lines, {file.code_lines} code lines, type: {file.file_type})
 CURRENT BRANCH: {branch} (branched from {base_branch})
 
-Extract ONE single cohesive responsibility into a dedicated sibling file.
-Preserve the existing public API and behavior. Add focused tests for the extraction.
+Decompose this file thoroughly. One surgical extraction is not enough: move every separable
+responsibility into focused sibling modules until the file is at most {target} lines. Keep the
+original path as a thin module that composes or re-exports the new modules, so every existing
+import and the public API keep working unchanged. Do not change behaviour.
 
-Changed files (use these paths for targeted testing and verification):
-{changed_text}
+Work through it in this order:
+1. Delete the dead code listed below.
+2. Split by responsibility. Use the export and importer map below to find the seams; exports
+   used by the same files usually belong in the same module.
+3. Break each complex function below into smaller named functions.
+4. Replace duplicated blocks with shared helpers.
 
-Run focused tests for the changed files first. For linting and formatting, target only the changed files
-(for example, `bunx eslint <changed-files>` and `bunx prettier --check <changed-files>`); do not run
-the repository-wide `bun run lint` unless a targeted command is unavailable. Run type-check only when
-required by repository instructions. Commit and push HEAD to the PR branch.
-Do not merge the pull request."""
+Fallow evidence for this file:
+{evidence}
+
+Validation before pushing:
+- Add focused tests for each new module; existing tests must keep passing.
+- Lint and format only the changed files (for example `bunx eslint <files>` and
+  `bunx prettier --check <files>`), not the whole repository.
+- Run the type check when the repository instructions require it.
+{audit_line}
+Commit in logical steps (one commit per extracted module is fine) and push HEAD to {branch}.
+Do not open or merge a pull request."""

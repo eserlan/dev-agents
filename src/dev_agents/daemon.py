@@ -195,15 +195,18 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                             ),
                             supplied_candidate=candidate,
                             on_event=degodify_phase,
+                            timeout_seconds=config.degodify_timeout_minutes * 60,
                         )
                         _log(
-                            f"handled delivery={delivery} event=degodify path={candidate.relative_path} succeeded={result.succeeded}"
+                            f"handled delivery={delivery} event=degodify path={candidate.relative_path} "
+                            f"succeeded={result.succeeded} reason={result.reason or '-'}"
                         )
                         claims.complete_run(
                             "degodify",
                             event_id,
                             status="completed" if result.succeeded else "failed",
-                            error=None if result.succeeded else "decomposition failed",
+                            error=None if result.succeeded else (result.reason or "decomposition failed"),
+                            metadata={"reason": result.reason, "pull_request": result.pull_request_url},
                         )
                         from dev_agents.visualize import schedule_report_refresh
 

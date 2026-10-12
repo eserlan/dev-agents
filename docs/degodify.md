@@ -4,9 +4,30 @@ The `degodify` workflow identifies oversized files in target repositories and pe
 
 ## Architecture
 
-1. **Analysis & Candidate Selection**: Scans source files, ranks files exceeding thresholds (`CRITICAL` >= 1000 lines, `WATCH` >= 500 lines), filters out data catalogs, and excludes candidates targeting active branches or open PRs.
-2. **Decomposition Execution**: Creates an isolated git worktree on the target base branch (`staging`), runs the configured agent provider (`muse`, `claude`, `agy`, or `codex`), and verifies that changes are clean and committed.
-3. **Publication**: Pushes `curator/degod-<slug>-<timestamp>` and creates a Pull Request targeting `staging`.
+1. **Analysis & Candidate Selection**: When the target repository has `scripts/god-file-analysis.ts`,
+   its own report ranks the files, so the repository decides which files may stay large (for
+   Codex-Cryptica, the data catalogues exempted by Constitution Principle XIV). Otherwise a built-in
+   scan ranks files exceeding thresholds (`CRITICAL` >= 1000 lines, `WATCH` >= 500 lines) and skips
+   files that look like data catalogues. Files targeted by open PRs or active branches are skipped.
+2. **Fallow evidence**: In repositories that use fallow, dependencies are installed in the isolated
+   worktree and `fallow inspect --file <target>` supplies the file's exports and their importers,
+   complex functions, duplicated blocks and dead code.
+3. **Decomposition**: The agent splits the file into cohesive sibling modules until it is at most
+   500 lines (or half its size, whichever is smaller), keeping the original path as a thin module so
+   imports and behaviour are unchanged. It deletes the dead code, breaks up the complex functions,
+   merges duplicates and adds focused tests.
+4. **Gate**: A PR opens only when the target shrank by at least 25% and `fallow audit --base
+   origin/<base>` does not fail. Otherwise the run fails with the reason and nothing is pushed.
+5. **Publication**: Pushes `curator/degod-<slug>-<timestamp>` and opens a PR against `staging`
+   with before/after line counts and the new modules.
+
+Only one degodify PR is open at a time: while a `curator/degod-*` PR is open, a new run records
+"waiting for open degodify PR" and does nothing, so nightly runs never stack refactors. Each run
+gets `pr_fixer.degodify_timeout_minutes` (default 60). Degodify PRs go through the normal PR review
+chain and auto-merge like any other PR when the review comes back clean.
+
+`fallow fix` is not run: it only removes unused code repository-wide, which would widen the PR
+beyond the target file. The target's own dead code comes from `fallow inspect` instead.
 
 ## CLI Usage
 
