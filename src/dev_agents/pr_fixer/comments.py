@@ -93,6 +93,18 @@ Still working on PR #{number} -- {minutes}m elapsed so far.
 """
 
 
+def _fixes_markdown(review_report: dict[str, Any]) -> str:
+    """List each concrete repair the fixer reported, one per line."""
+    fixes = [item for item in review_report.get("fixes") or [] if isinstance(item, dict)]
+    lines = [
+        f"- `{item['location']}`: {item.get('summary', '')}" if item.get("location") else f"- {item.get('summary', '')}"
+        for item in fixes[:MAX_LISTED_FINDINGS]
+    ]
+    if len(fixes) > MAX_LISTED_FINDINGS:
+        lines.append(f"- …and {len(fixes) - MAX_LISTED_FINDINGS} more in the run report.")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
 def _review_completed_body(
     number: int,
     run_id: str,
@@ -106,35 +118,51 @@ def _review_completed_body(
     failure: str | None = None,
     fix_pushed: bool | None = None,
     superseded_by: str | None = None,
+    follow_up: bool | None = None,
 ) -> str:
     """Render the final state into the same comment used for review progress."""
     review_report = report.get("review_report")
-    verdict = review_report.get("verdict") if isinstance(review_report, dict) else None
+    review_report = review_report if isinstance(review_report, dict) else {}
+    verdict = review_report.get("verdict")
     pushed_fix = (
         fix_pushed
         if fix_pushed is not None
         else bool(new_sha and new_sha != old_sha)
     )
+    round_line = f"- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`"
     if superseded_by:
-        heading = "### 🤖 Luna review superseded"
-        outcome = (
-            f"The PR advanced to `{superseded_by[:12]}` during this review. "
-            "The new head will receive a full review."
-        )
-    elif failure:
+        # Only pushes this run did not make reach here: a run's own fix push is finalized as
+        # "fixes pushed". Say so plainly, and leave out the discarded results.
+        return f"""<!-- dev-agents:pr-review run={run_id} -->
+### 🤖 Luna review superseded
+
+Someone else pushed `{superseded_by[:12]}` to this branch while the review was running, so its
+results applied to an outdated head and were discarded. Nothing was pushed by this run. The new
+head will receive a full review.
+
+- PR: #{number}
+{round_line}
+- Run: `{run_id}`
+{_report_line(report_url)}
+"""
+    if failure:
         heading = "### 🤖 Luna review failed"
         outcome = failure
     elif pushed_fix:
-        heading = "### 🤖 Luna review completed — fixes pushed"
-        outcome = "Concrete findings were identified and fixed."
+        heading = "### 🤖 Luna fixes pushed"
+        outcome = "Luna fixed the review findings and pushed the result."
+        if follow_up:
+            outcome += (
+                f" Because that commit changed the PR, a targeted verification review of it"
+                f" (round {review_round + 2}/{MAX_INTERNAL_REVIEW_ROUNDS}) starts next."
+                " That review is expected; it checks the fix, not a new problem."
+            )
     elif verdict == "clean":
         heading = "### 🤖 Luna review completed — clean"
         outcome = "No actionable defects were found."
     else:
         heading = "### 🤖 Luna review completed"
         outcome = "The review completed without pushing a code change."
-    findings = _findings_summary(report, "No actionable defects found.")
-    fixes = str(report.get("fixes") or "None reported.").strip()
     shown_files = changed_files or []
     files_line = ", ".join(f"`{path}`" for path in shown_files[:12]) or "None"
     if len(shown_files) > 12:
@@ -143,21 +171,49 @@ def _review_completed_body(
     if pushed_fix:
         commit_line = f"Pushed fix commit `{new_sha[:12]}`."
     validation_line = validation or "See the run report for validation details."
+    fixes = _fixes_markdown(review_report)
+    fixes_section = f"\n**What was fixed**\n\n{fixes}" if fixes else ""
+    findings_line = (
+        ""
+        if pushed_fix and fixes
+        else f"- Findings: {_findings_summary(review_report, 'No actionable defects found.')}\n"
+    )
     return f"""<!-- dev-agents:pr-review run={run_id} -->
 {heading}
 
 {outcome}
-
+{fixes_section}
 - PR: #{number}
-- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Findings: {findings}
-- What changed: {fixes}
-- {commit_line}
+{round_line}
+{findings_line}- {commit_line}
 - Changed files: {files_line}
 - Validation: {validation_line}
 - Run: `{run_id}`
 {_report_line(report_url)}
 """
+
+
+MAX_LISTED_FINDINGS = 10
+
+
+def _findings_markdown(report: dict[str, Any]) -> str:
+    """Render each structured finding as its own reviewable list item."""
+    findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
+    if not findings:
+        return "No actionable defects found.\n"
+    lines = []
+    for index, item in enumerate(findings[:MAX_LISTED_FINDINGS], start=1):
+        severity = str(item.get("severity") or "unknown").upper()
+        category = f" · {item['category']}" if item.get("category") else ""
+        lines.append(f"{index}. **{severity}**{category} — `{item.get('location', '?')}`")
+        lines.append(f"   - Impact: {item.get('impact', '')}")
+        if item.get("evidence"):
+            lines.append(f"   - Evidence: {item['evidence']}")
+        if item.get("remediation"):
+            lines.append(f"   - Suggested fix: {item['remediation']}")
+    if len(findings) > MAX_LISTED_FINDINGS:
+        lines.append(f"\n…and {len(findings) - MAX_LISTED_FINDINGS} more in the run report.")
+    return "\n".join(lines) + "\n"
 
 
 def _review_findings_body(
@@ -166,16 +222,18 @@ def _review_findings_body(
     report: dict[str, Any],
     report_url: str | None = None,
     review_round: int = 0,
+    head_sha: str | None = None,
 ) -> str:
-    findings = _findings_summary(report, "No actionable defects found.")
-    scope = "review passes" if review_round == 0 else "targeted post-fix verification"
+    scope = "independent audit" if review_round == 0 else "targeted post-fix verification"
+    count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
+    head_line = f"- PR head: `{head_sha}`\n" if head_sha else ""
     return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna review findings
 
-Luna completed the {scope} for PR #{number}.
+Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}:
 
-- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Findings: {findings}
+{_findings_markdown(report)}
+{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
 - Run: `{run_id}`
 {_report_line(report_url)}
 """
@@ -188,16 +246,18 @@ def _review_fixes_started_body(
     report_url: str | None = None,
     review_round: int = 0,
 ) -> str:
-    findings = _findings_summary(
-        report, "Concrete findings were identified during the review."
+    count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
+    subject = (
+        f"the {count} finding{'' if count == 1 else 's'} reported above"
+        if count
+        else "the concrete findings identified during the review"
     )
     return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna fixes started
 
-Luna is applying the smallest correct fixes for PR #{number}.
+Luna is applying the smallest correct fixes for {subject} on PR #{number}.
 
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Findings being addressed: {findings}
 - Run: `{run_id}`
 {_report_line(report_url)}
 """

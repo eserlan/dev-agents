@@ -834,6 +834,8 @@ const pubSummary = document.querySelector('#pub-summary');
 const pubColumns = document.querySelector('#pub-columns');
 const pubRows = document.querySelector('#pub-rows');
 const indexProject = document.querySelector('#index-project');
+const overview = document.querySelector('#overview');
+const workItems = document.querySelector('#work-items');
 const reportParams = new URLSearchParams(window.location.search);
 const requestedWorkflow = reportParams.get('workflow') || '';
 const requestedRun = reportParams.get('run') || reportParams.get('run_id') || '';
@@ -863,17 +865,124 @@ const indexColumnDefinitions = [
   {key: 'status', label: 'Status'},
   {key: 'project_name', label: 'Project'},
   {key: 'workflow', label: 'Workflow'},
+  {key: 'subject', label: 'Subject'},
   {key: 'run_id', label: 'Run'},
   {key: 'started_at', label: 'Started'},
   {key: 'duration', label: 'Duration'},
   {key: 'publications', label: 'Published'},
-  {key: 'database', label: 'Database'},
 ];
+// Webhook deliveries and reconcile sweeps are plumbing; they dominate counts without saying
+// anything about the work itself, so the overview leaves them out.
+const NOISE_WORKFLOWS = /(webhook|reconcile)/i;
+const FAILED_STATUSES = ['failed', 'error'];
+const ACTIVE_STATUSES = ['running', 'pending', 'scheduled'];
+const LOOP_HEAD_THRESHOLD = 6;
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 }
 function pretty(value) { return escapeHtml(JSON.stringify(value ?? {}, null, 2)); }
+function relativeTime(value) {
+  const timestamp = Date.parse(value); if (!Number.isFinite(timestamp)) return '—';
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+function timeMarkup(value) { return `<time datetime="${escapeHtml(value)}" title="${escapeHtml(value)}">${escapeHtml(relativeTime(value))}</time>`; }
+function githubUrl(project, kind, number) {
+  const slug = (report.githubRepos || {})[project];
+  return slug ? `https://github.com/${slug}/${kind === 'pr' ? 'pull' : 'issues'}/${encodeURIComponent(number)}` : '';
+}
+function runSubject(run) {
+  const metadata = run.metadata || {};
+  if (metadata.pull_request) return {kind: 'pr', number: metadata.pull_request, label: `PR #${metadata.pull_request}`, url: githubUrl(run.project_name, 'pr', metadata.pull_request)};
+  if (metadata.issue) return {kind: 'issue', number: metadata.issue, label: `Issue #${metadata.issue}`, url: githubUrl(run.project_name, 'issue', metadata.issue)};
+  if (typeof metadata.candidate === 'string') return {kind: 'file', label: metadata.candidate.split('/').pop(), url: ''};
+  return null;
+}
+function subjectToken(subject) { return subject && subject.number ? `${subject.kind}:${subject.number}` : ''; }
+function reviewReport(run) { const value = run.metadata?.review_report; return value && typeof value === 'object' ? value : null; }
+function runSummaryText(run) {
+  if (run.error) return run.error;
+  const metadata = run.metadata || {}, review = reviewReport(run);
+  if (review) {
+    const findings = (review.findings || []).length, fixes = (review.fixes || []).length;
+    return `verdict ${review.verdict || '—'} · ${findings} finding${findings === 1 ? '' : 's'} · ${fixes} fix${fixes === 1 ? '' : 'es'}`;
+  }
+  if (typeof metadata.summary === 'string') return metadata.summary;
+  if (metadata.event) return [metadata.event, metadata.action].filter(Boolean).join(' · ');
+  return '';
+}
+function reviewReportMarkup(run) {
+  const review = reviewReport(run); if (!review) return '';
+  const findings = (review.findings || []).map(finding => `<li class="finding sev-${escapeHtml(finding.severity || 'unknown')}"><div><span class="severity">${escapeHtml(finding.severity || '?')}</span>${finding.category ? `<span class="chip">${escapeHtml(finding.category)}</span>` : ''}${finding.location ? `<code>${escapeHtml(finding.location)}</code>` : ''}</div><p>${escapeHtml(finding.impact || finding.summary || '')}</p>${finding.remediation ? `<p class="remediation">→ ${escapeHtml(finding.remediation)}</p>` : ''}</li>`).join('');
+  const fixes = (review.fixes || []).map(fix => `<li>${fix.location ? `<code>${escapeHtml(fix.location)}</code> ` : ''}${escapeHtml(fix.summary || '')}</li>`).join('');
+  const validation = (review.validation || []).map(item => `<li>${escapeHtml(item)}</li>`).join('');
+  return `<div class="review-report"><h4>Review report <span class="status verdict-${escapeHtml(review.verdict || 'unknown')}">${escapeHtml(review.verdict || 'no verdict')}</span></h4>${(review.categories_checked || []).length ? `<p class="passes">Passes: ${review.categories_checked.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join('')}</p>` : ''}${findings ? `<ul class="findings">${findings}</ul>` : '<p>No findings.</p>'}${fixes ? `<h4>Fixes</h4><ul class="plain-list">${fixes}</ul>` : ''}${validation ? `<details><summary>Validation (${review.validation.length})</summary><ul class="plain-list">${validation}</ul></details>` : ''}</div>`;
+}
+function overviewRuns() {
+  const project = indexProject.value;
+  return (report.allRuns || []).filter(run => !NOISE_WORKFLOWS.test(run.workflow) && (!project || run.project_name === project));
+}
+function renderOverview() {
+  const runs = overviewRuns();
+  const failed = runs.filter(run => FAILED_STATUSES.includes(run.status)).length;
+  const active = runs.filter(run => ACTIVE_STATUSES.includes(run.status)).length;
+  const reviews = runs.map(reviewReport).filter(Boolean);
+  const findings = reviews.reduce((total, review) => total + (review.findings || []).length, 0);
+  const fixes = reviews.reduce((total, review) => total + (review.fixes || []).length, 0);
+  const items = new Set(runs.map(run => subjectToken(runSubject(run))).filter(Boolean)).size;
+  const rate = runs.length ? Math.round((failed / runs.length) * 100) : 0;
+  const card = (label, value, note = '', tone = '') => `<div class="kpi ${tone}"><span>${label}</span><b>${value}</b>${note ? `<small>${note}</small>` : ''}</div>`;
+  const hour = 3600 * 1000, end = Math.ceil(Date.now() / hour) * hour;
+  const buckets = Array.from({length: 24}, (_, index) => ({start: end - (24 - index) * hour, ok: 0, bad: 0, active: 0}));
+  runs.forEach(run => {
+    const index = Math.floor((Date.parse(run.started_at) - (end - 24 * hour)) / hour);
+    if (index < 0 || index > 23) return;
+    const bucket = buckets[index];
+    if (FAILED_STATUSES.includes(run.status)) bucket.bad++; else if (ACTIVE_STATUSES.includes(run.status)) bucket.active++; else bucket.ok++;
+  });
+  const peak = Math.max(1, ...buckets.map(bucket => bucket.ok + bucket.bad + bucket.active));
+  const bars = buckets.map(bucket => {
+    const label = new Date(bucket.start).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    const total = bucket.ok + bucket.bad + bucket.active;
+    return `<div class="bar" title="${escapeHtml(label)} · ${total} runs · ${bucket.bad} failed"><i class="bad" style="height:${(bucket.bad / peak) * 100}%"></i><i class="active" style="height:${(bucket.active / peak) * 100}%"></i><i class="ok" style="height:${(bucket.ok / peak) * 100}%"></i></div>`;
+  }).join('');
+  overview.innerHTML = `<div class="kpis">${card('Agent runs · 24h', runs.length)}${card('Failed', failed, `${rate}% of runs`, failed ? 'bad' : '')}${card('Active now', active, '', active ? 'warn' : '')}${card('PRs & issues', items)}${card('Findings raised', findings)}${card('Fixes reported', fixes)}</div><div class="activity"><div class="activity-head"><span>Activity, last 24 hours (excluding webhooks and reconciles)</span><span class="legend-inline"><i class="dot completed"></i>ok <i class="dot running"></i>active <i class="dot failed"></i>failed · peak ${peak}/h</span></div><div class="bars" role="img" aria-label="Hourly agent runs over the last 24 hours">${bars}</div></div>`;
+}
+function renderWorkItems() {
+  const groups = new Map();
+  overviewRuns().forEach(run => {
+    const subject = runSubject(run); if (!subject || !subject.number) return;
+    const key = `${run.project_name}|${subjectToken(subject)}`;
+    if (!groups.has(key)) groups.set(key, {project: run.project_name, subject, runs: [], heads: new Set(), workflows: new Set(), findings: 0, fixes: 0});
+    const group = groups.get(key);
+    group.runs.push(run); group.workflows.add(run.workflow);
+    if (run.metadata?.head_sha) group.heads.add(run.metadata.head_sha);
+    const review = reviewReport(run); if (review) { group.findings += (review.findings || []).length; group.fixes += (review.fixes || []).length; }
+  });
+  const sorted = [...groups.values()].map(group => {
+    group.runs.sort((a, b) => runActivityTimestamp(b) - runActivityTimestamp(a));
+    group.latest = group.runs[0];
+    group.failed = group.runs.filter(run => FAILED_STATUSES.includes(run.status)).length;
+    group.looping = group.subject.kind === 'pr' && group.heads.size >= LOOP_HEAD_THRESHOLD;
+    return group;
+  }).sort((a, b) => (b.looping - a.looping) || (runActivityTimestamp(b.latest) - runActivityTimestamp(a.latest)));
+  if (!sorted.length) { workItems.innerHTML = ''; return; }
+  const cards = sorted.map(group => {
+    const latestReview = group.runs.map(reviewReport).find(Boolean);
+    const title = group.subject.url ? `<a href="${escapeHtml(group.subject.url)}" target="_blank" rel="noreferrer">${escapeHtml(group.subject.label)}</a>` : escapeHtml(group.subject.label);
+    return `<div class="work-item${group.looping ? ' looping' : ''}${group.failed ? ' has-failures' : ''}"><div class="wi-head"><b>${multiProject ? `${escapeHtml(group.project)} · ` : ''}${title}</b><span class="status ${escapeHtml(group.latest.status)}">${escapeHtml(group.latest.status)}</span></div>${group.looping ? `<p class="flag">⟳ ${group.heads.size} heads reviewed: possible review/fix loop</p>` : ''}<p class="wi-stats">${group.runs.length} run${group.runs.length === 1 ? '' : 's'}${group.heads.size ? ` · ${group.heads.size} head${group.heads.size === 1 ? '' : 's'}` : ''}${group.failed ? ` · <span class="bad-text">${group.failed} failed</span>` : ''}</p><p class="wi-stats">${group.findings} finding${group.findings === 1 ? '' : 's'} · ${group.fixes} fix${group.fixes === 1 ? '' : 'es'}${latestReview ? ` · last verdict <b>${escapeHtml(latestReview.verdict || '—')}</b>` : ''}</p><div class="wi-foot"><span>${[...group.workflows].map(name => `<span class="chip">${escapeHtml(name)}</span>`).join('')}</span>${timeMarkup(group.latest.updated_at || group.latest.started_at)}</div><button type="button" class="wi-runs" data-token="${escapeHtml(subjectToken(group.subject))}" data-project="${escapeHtml(group.project)}">Show runs</button></div>`;
+  }).join('');
+  workItems.innerHTML = `<div class="section-head"><h2>Work items</h2><span class="subtitle">PRs and issues the agents touched in the last 24 hours. A PR whose agents reviewed ${LOOP_HEAD_THRESHOLD}+ different heads is flagged as a possible loop.</span></div><div class="work-grid">${cards}</div>`;
+  workItems.querySelectorAll('.wi-runs').forEach(button => button.addEventListener('click', () => {
+    indexSearch.value = button.dataset.token;
+    if (multiProject && indexProject.value !== button.dataset.project) { indexProject.value = button.dataset.project; renderOverview(); renderWorkItems(); }
+    renderIndex(); indexColumns.scrollIntoView({behavior: 'smooth', block: 'start'});
+  }));
+}
 function findWorkflow(name) { return report.workflows.find(item => item.name === name) || null; }
 function findRun(project, workflow, runId) { return (report.allRuns || []).find(run => run.project_name === project && run.workflow === workflow && run.run_id === runId) || null; }
 function runKey(run) { return JSON.stringify([run.project_name, run.run_id]); }
@@ -961,7 +1070,7 @@ function indexSortValue(run, key) {
     return Number.isFinite(milliseconds) && milliseconds >= 0 ? milliseconds : -1;
   }
   if (key === 'publications') return publicationCount(run);
-  if (key === 'database') return run.database_path || '';
+  if (key === 'subject') return runSubject(run)?.label || '';
   if (key === 'started_at') {
     const timestamp = Date.parse(run.started_at);
     return Number.isFinite(timestamp) ? timestamp : 0;
@@ -991,7 +1100,7 @@ function renderIndexColumns() {
 }
 function formatRunDetails(run) {
   const publications = (run.publications || []).map(publication => `<div class="publication-detail"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b>${publication.destination ? ` · ${escapeHtml(publication.destination)}` : ''}${publication.public_url ? ` · <a href="${escapeHtml(publication.public_url)}" target="_blank" rel="noreferrer">${escapeHtml(publication.public_url)}</a>` : ''}${publication.page_url ? `<small>${escapeHtml(publication.page_url)}</small>` : ''}${publication.error ? `<p class="error">${escapeHtml(publication.error)}</p>` : ''}</div>`).join('');
-  return `<div class="run-title"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${projectPrefix(run)}${escapeHtml(run.workflow)} / ${escapeHtml(run.run_id)}</b></div><p>Started ${escapeHtml(run.started_at)} · completed ${escapeHtml(run.completed_at || '—')} · duration ${escapeHtml(duration(run))}</p>${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}<details><summary>Run metadata</summary><pre>${pretty(run.metadata)}</pre></details><h3>Publications (${publicationCount(run)})</h3>${publications || '<p>No publication receipts recorded.</p>'}<h3>Events (${run.events.length})</h3>${run.events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.node)}</b> · ${escapeHtml(event.event)} <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}</time><pre>${pretty(event.metadata)}</pre></div>`).join('') || '<p>No recorded events.</p>'}`;
+  return `<div class="run-title"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${projectPrefix(run)}${escapeHtml(run.workflow)} / ${escapeHtml(run.run_id)}</b>${subjectLink(run)}</div><p>Started ${escapeHtml(run.started_at)} · completed ${escapeHtml(run.completed_at || '—')} · duration ${escapeHtml(duration(run))}</p><p class="db-path">Database <code>${escapeHtml(run.database_path || '—')}</code></p>${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}${reviewReportMarkup(run)}<details><summary>Run metadata</summary><pre>${pretty(run.metadata)}</pre></details><h3>Publications (${publicationCount(run)})</h3>${publications || '<p>No publication receipts recorded.</p>'}<h3>Events (${run.events.length})</h3>${run.events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.node)}</b> · ${escapeHtml(event.event)} <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}</time><pre>${pretty(event.metadata)}</pre></div>`).join('') || '<p>No recorded events.</p>'}`;
 }
 function openIndexedRun(run) {
   const workflow = findWorkflow(run.workflow);
@@ -1000,8 +1109,13 @@ function openIndexedRun(run) {
   }
   indexDetails.hidden = false; indexDetails.innerHTML = formatRunDetails(run); indexDetails.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
+function subjectLink(run) {
+  const subject = runSubject(run); if (!subject) return '';
+  return subject.url ? ` <a class="subject-link" href="${escapeHtml(subject.url)}" target="_blank" rel="noreferrer">${escapeHtml(subject.label)} ↗</a>` : ` <span class="chip">${escapeHtml(subject.label)}</span>`;
+}
 function indexRowMarkup(run) {
-  return `<button class="index-row" data-project="${escapeHtml(run.project_name)}" data-workflow="${escapeHtml(run.workflow)}" data-run="${escapeHtml(run.run_id)}"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><small class="project">${escapeHtml(run.project_name)}</small><b>${escapeHtml(run.workflow)}</b><code>${escapeHtml(run.run_id)}</code><time>${escapeHtml(run.started_at)}</time><span>${escapeHtml(duration(run))}</span><span>${escapeHtml(publicationCount(run))} published</span><small>${escapeHtml(run.database_path.split('/').pop())}</small></button>`;
+  const subject = runSubject(run), summary = runSummaryText(run);
+  return `<button class="index-row st-${escapeHtml(run.status)}" data-project="${escapeHtml(run.project_name)}" data-workflow="${escapeHtml(run.workflow)}" data-run="${escapeHtml(run.run_id)}"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><small class="project">${escapeHtml(run.project_name)}</small><b>${escapeHtml(run.workflow)}</b><span class="subject"><b>${escapeHtml(subject?.label || '—')}</b>${summary ? `<small title="${escapeHtml(summary)}">${escapeHtml(summary)}</small>` : ''}</span><code>${escapeHtml(run.run_id)}</code>${timeMarkup(run.started_at)}<span>${escapeHtml(duration(run))}</span><span class="published">${escapeHtml(publicationCount(run))} published</span></button>`;
 }
 function bindIndexRows() {
   indexRows.querySelectorAll('.index-row').forEach(row => row.addEventListener('click', () => openIndexedRun(findRun(row.dataset.project, row.dataset.workflow, row.dataset.run))));
@@ -1010,7 +1124,8 @@ function renderIndex() {
   const query = indexSearch.value.trim().toLowerCase(), status = indexStatus.value, workflows = selectedIndexWorkflows(), project = indexProject.value;
   const filtered = (report.allRuns || []).filter(run => {
     if (project && run.project_name !== project) return false;
-    const searchable = `${run.project_name} ${run.workflow} ${run.run_id} ${run.delivery_id || ''} ${run.error || ''} ${JSON.stringify(run.metadata)} ${run.events.map(event => `${event.node} ${event.event}`).join(' ')}`.toLowerCase();
+    const subject = runSubject(run);
+    const searchable = `${run.project_name} ${run.workflow} ${run.run_id} ${subjectToken(subject)} ${subject?.label || ''} ${run.delivery_id || ''} ${run.error || ''} ${JSON.stringify(run.metadata)} ${run.events.map(event => `${event.node} ${event.event}`).join(' ')}`.toLowerCase();
     return (!query || searchable.includes(query)) && (!status || run.status === status) && workflows.has(run.workflow);
   });
   const failed = filtered.filter(run => ['failed', 'error'].includes(run.status)).length;
@@ -1135,7 +1250,7 @@ function updateDetails() {
 function updateRun() {
   currentRun = currentWorkflow.runs.find(run => runKey(run) === runSelect.value) || null; selectedNode = null; emptyState.hidden = Boolean(currentRun);
   if (!currentRun) { runSummary.innerHTML = '<p>No persisted runs for this workflow.</p>'; eventList.innerHTML = ''; updateDetails(); draw(); return; }
-  runSummary.innerHTML = `<div class="run-title"><span class="status ${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span><b>${projectPrefix(currentRun)}${escapeHtml(currentRun.run_id)}</b></div><p>Started ${escapeHtml(currentRun.started_at)} · completed ${escapeHtml(currentRun.completed_at || '—')} · attempt ${escapeHtml(currentRun.attempt)}</p>${currentRun.error ? `<p class="error">${escapeHtml(currentRun.error)}</p>` : ''}<details><summary>Run metadata</summary><pre>${pretty(currentRun.metadata)}</pre></details>`;
+  runSummary.innerHTML = `<div class="run-title"><span class="status ${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span><b>${projectPrefix(currentRun)}${escapeHtml(currentRun.run_id)}</b>${subjectLink(currentRun)}</div><p>Started ${escapeHtml(currentRun.started_at)} · completed ${escapeHtml(currentRun.completed_at || '—')} · duration ${escapeHtml(duration(currentRun))} · attempt ${escapeHtml(currentRun.attempt)}</p>${currentRun.error ? `<p class="error">${escapeHtml(currentRun.error)}</p>` : ''}${reviewReportMarkup(currentRun)}<details><summary>Run metadata</summary><pre>${pretty(currentRun.metadata)}</pre></details>`;
   eventList.innerHTML = currentRun.events.length ? currentRun.events.map(event => `<button class="event-row" data-node="${escapeHtml(event.node)}"><span>${escapeHtml(event.sequence)}</span><b>${escapeHtml(event.node)}</b><span>${escapeHtml(event.event)}</span><i class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</i></button>`).join('') : '<p>No node events recorded.</p>';
   eventList.querySelectorAll('.event-row').forEach(button => button.addEventListener('click', () => { selectedNode = button.dataset.node; updateDetails(); draw(); })); updateDetails(); draw();
 }
@@ -1152,7 +1267,7 @@ canvas.addEventListener('pointermove', event => { if (dragging) { pan.x += event
 canvas.addEventListener('pointerup', event => { dragging = false; canvas.releasePointerCapture(event.pointerId); });
 canvas.addEventListener('wheel', event => { event.preventDefault(); const factor = event.deltaY < 0 ? 1.1 : 0.9, bounds = canvas.getBoundingClientRect(), before = worldPoint(event.clientX - bounds.left, event.clientY - bounds.top); zoom = Math.max(.45, Math.min(2.5, zoom * factor)); pan.x = event.clientX - bounds.left - before.x * zoom; pan.y = event.clientY - bounds.top - before.y * zoom; draw(); }, {passive: false});
 workflowSelect.addEventListener('change', updateWorkflow); runSelect.addEventListener('change', updateRun); document.querySelector('#reset-view').addEventListener('click', resetView); window.addEventListener('resize', resizeCanvas);
-indexSearch.addEventListener('input', renderIndex); indexStatus.addEventListener('change', renderIndex); indexProject.addEventListener('change', renderIndex);
+indexSearch.addEventListener('input', renderIndex); indexStatus.addEventListener('change', renderIndex); indexProject.addEventListener('change', () => { renderOverview(); renderWorkItems(); renderIndex(); });
 pubSearch.addEventListener('input', renderPublications); pubStatus.addEventListener('change', renderPublications);
 document.querySelector('#daemon-tab').addEventListener('click', () => setReportView('daemon'));
 document.querySelector('#release-comms-tab').addEventListener('click', () => setReportView('release-comms'));
@@ -1167,6 +1282,8 @@ if (requestedWorkflow && findWorkflow(requestedWorkflow)) {
   updateWorkflowFilterSummary();
   if (requestedRun) indexSearch.value = requestedRun;
 }
+renderOverview();
+renderWorkItems();
 renderIndex();
 if (requestedWorkflow && findWorkflow(requestedWorkflow) && reportWorkflowNames().includes(requestedWorkflow)) {
   workflowSelect.value = requestedWorkflow;
@@ -1189,6 +1306,8 @@ def _interactive_app(data: dict[str, Any]) -> str:
       <button id="release-comms-tab" type="button" role="tab" aria-selected="false" aria-controls="pub-panel">Release comms</button>
     </nav>
     <section id="index-panel" class="run-index" role="tabpanel" aria-labelledby="daemon-tab">
+      <div id="overview" class="overview"></div>
+      <div id="work-items" class="work-items"></div>
       <div class="index-header"><div><h2>Daemon run index</h2><p class="subtitle">Recent jobs are visible; jobs older than 1 hour are collapsed. Report messages older than 1 day are omitted.</p></div><strong id="index-summary"></strong></div>
       <div class="index-filters"><input id="index-search" type="search" placeholder="Search run, event, PR, error…" aria-label="Search daemon runs"><select id="index-project" aria-label="Filter by project" hidden><option value="">All projects</option></select><details id="index-workflow-filter" class="workflow-filter"><summary>Workflows: <span id="index-workflow-summary">All workflows</span></summary><div id="index-workflow-options" class="workflow-options" role="group" aria-label="Filter by workflow"></div></details><select id="index-status" aria-label="Filter by status"><option value="">All statuses</option><option value="completed">completed</option><option value="rejected">rejected</option><option value="failed">failed</option><option value="running">running</option><option value="pending">pending</option><option value="scheduled">scheduled</option></select></div>
       <div id="index-columns" class="index-columns" role="row" aria-label="Sort runs by column"></div>
@@ -1281,6 +1400,7 @@ def render_projects_report(
     data = {
         "projects": project_names,
         "repositories": {name: str(config.repo) for name, config in projects.items()},
+        "githubRepos": {name: config.github for name, config in projects.items() if config.github},
         "generatedAt": generated_at.timestamp() * 1000,
         "retention": {
             "hideAfterSeconds": int(REPORT_HIDE_AFTER.total_seconds()),
@@ -1309,15 +1429,22 @@ def render_projects_report(
 :root{{color-scheme:dark;--bg:#0d1117;--panel:#151c26;--panel2:#1b2532;--border:#334155;--text:#e5edf5;--muted:#94a3b8;--gold:#f8d477;--cyan:#7dd3fc;--green:#46d7aa;--red:#ff7280}}
 *{{box-sizing:border-box}}body{{font:14px system-ui,sans-serif;max-width:1500px;margin:0 auto;padding:24px;background:var(--bg);color:var(--text)}}h1,h2,h3{{color:var(--gold);margin-top:0}}h1{{margin-bottom:4px}}code,pre,select,button{{font-family:ui-monospace,SFMono-Regular,monospace}}code{{color:var(--cyan)}}
 .report-tabs{{display:flex;gap:8px;margin-top:24px}}.report-tabs button{{border-radius:8px 8px 0 0;border-bottom:2px solid transparent;color:var(--muted)}}.report-tabs button[aria-selected="true"]{{background:var(--panel);border-color:var(--gold);color:var(--gold)}}
-.subtitle,.hint,.legend{{color:var(--muted)}}.run-index,.explorer{{margin-top:24px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.run-index{{padding:18px}}.index-header{{display:flex;justify-content:space-between;gap:16px;align-items:start}}.index-header h2{{margin-bottom:4px}}.index-header .subtitle{{margin:0}}.index-header strong{{color:var(--cyan);white-space:nowrap}}.index-filters{{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 10px}}input,select,button{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px}}input{{min-width:260px;flex:1}}button{{cursor:pointer}}button:hover{{border-color:var(--gold)}}.index-columns,.index-row{{display:grid;grid-template-columns:86px 110px 125px minmax(150px,1.4fr) minmax(165px,1fr) 70px 100px 145px;align-items:center;gap:10px;text-align:left;font-size:12px}}.index-columns{{margin-bottom:5px}}.index-column{{border:0;background:transparent;color:var(--muted);padding:6px 10px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;text-align:left;white-space:nowrap}}.index-column:hover,.index-column[aria-sort="asc"],.index-column[aria-sort="desc"]{{color:var(--gold)}}.index-rows{{display:grid;gap:5px}}.index-row{{font-family:system-ui}}.index-row code,.index-row time,.index-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row time,.index-row small{{color:var(--muted)}}.index-row b{{overflow:hidden;text-overflow:ellipsis}}.older-runs{{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}}.older-runs summary{{padding:6px 10px}}.older-index-rows{{display:grid;gap:5px;margin-top:6px}}.index-details{{border-top:1px solid var(--border);margin-top:14px;padding-top:14px;max-width:900px}}.publication-detail{{border-left:2px solid var(--green);padding:7px 0 7px 10px;margin:7px 0}}.publication-detail small{{display:block;color:var(--muted);overflow-wrap:anywhere;margin-top:4px}}.publication-detail a{{color:var(--cyan);overflow-wrap:anywhere}}.empty-index{{color:var(--muted)}}.toolbar{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--border);background:#111923}}label{{display:flex;align-items:center;gap:8px;color:var(--muted)}}.hint{{margin-left:auto;font-size:12px}}
+.subtitle,.hint,.legend{{color:var(--muted)}}.run-index,.explorer{{margin-top:24px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}}.run-index{{padding:18px}}.index-header{{display:flex;justify-content:space-between;gap:16px;align-items:start}}.index-header h2{{margin-bottom:4px}}.index-header .subtitle{{margin:0}}.index-header strong{{color:var(--cyan);white-space:nowrap}}.index-filters{{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 10px}}input,select,button{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px}}input{{min-width:260px;flex:1}}button{{cursor:pointer}}button:hover{{border-color:var(--gold)}}.index-columns,.index-row{{display:grid;grid-template-columns:86px 110px 125px minmax(200px,2fr) minmax(120px,1fr) 95px 70px 90px;align-items:center;gap:10px;text-align:left;font-size:12px}}.index-columns{{margin-bottom:5px}}.index-column{{border:0;background:transparent;color:var(--muted);padding:6px 10px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;text-align:left;white-space:nowrap}}.index-column:hover,.index-column[aria-sort="asc"],.index-column[aria-sort="desc"]{{color:var(--gold)}}.index-rows{{display:grid;gap:5px}}.index-row{{font-family:system-ui}}.index-row code,.index-row time,.index-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row time,.index-row small{{color:var(--muted)}}.index-row b{{overflow:hidden;text-overflow:ellipsis}}.older-runs{{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}}.older-runs summary{{padding:6px 10px}}.older-index-rows{{display:grid;gap:5px;margin-top:6px}}.index-details{{border-top:1px solid var(--border);margin-top:14px;padding-top:14px;max-width:900px}}.publication-detail{{border-left:2px solid var(--green);padding:7px 0 7px 10px;margin:7px 0}}.publication-detail small{{display:block;color:var(--muted);overflow-wrap:anywhere;margin-top:4px}}.publication-detail a{{color:var(--cyan);overflow-wrap:anywhere}}.empty-index{{color:var(--muted)}}.toolbar{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--border);background:#111923}}label{{display:flex;align-items:center;gap:8px;color:var(--muted)}}.hint{{margin-left:auto;font-size:12px}}
 .explorer-grid{{display:grid;grid-template-columns:minmax(0,1fr) 350px;min-height:520px}}#graph-host{{position:relative;min-height:520px;background:radial-gradient(#263342 1px,transparent 1px);background-size:22px 22px;overflow:hidden}}canvas{{display:block;width:100%;height:520px;cursor:grab}}canvas:active{{cursor:grabbing}}.empty-state{{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}}.inspector{{padding:18px;overflow:auto;max-height:620px;background:#111923;border-left:1px solid var(--border)}}.inspector hr{{border:0;border-top:1px solid var(--border);margin:18px 0}}.inspector p{{color:var(--muted);line-height:1.45}}.run-title{{display:flex;gap:9px;align-items:center;flex-wrap:wrap}}.run-title b{{overflow-wrap:anywhere}}.status{{display:inline-block;border-radius:999px;padding:2px 7px;font-size:11px;background:#334155;color:var(--muted)}}.status.completed{{background:#123e3c;color:#8af0cf}}.status.failed,.status.error{{background:#542a34;color:#ffb6bd}}.status.running,.status.pending{{background:#4a3a1b;color:#ffe5a1}}.error{{color:#ffb6bd!important}}pre{{white-space:pre-wrap;overflow:auto;background:#0b1016;border-radius:7px;padding:9px;font-size:11px;color:#cbd5e1}}details summary{{cursor:pointer;color:var(--cyan)}}.event-detail{{border-left:2px solid var(--border);padding:6px 0 8px 10px;margin:9px 0}}.event-detail time{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}.event-detail pre{{margin:7px 0 0}}.event-row{{width:100%;display:grid;grid-template-columns:24px 1fr auto auto;gap:7px;align-items:center;text-align:left;margin:5px 0;padding:7px;font-family:system-ui;font-size:12px}}.event-row span:first-child{{color:var(--muted)}}.event-row b{{overflow:hidden;text-overflow:ellipsis}}.event-row span:nth-child(3){{color:var(--muted);overflow:hidden;text-overflow:ellipsis}}.event-row .status{{font-size:10px}}.legend{{display:flex;gap:18px;flex-wrap:wrap;padding:10px 16px 14px;font-size:12px}}.legend span{{display:flex;gap:6px;align-items:center}}.dot{{width:9px;height:9px;border-radius:50%;display:inline-block;background:#64748b}}.dot.completed{{background:var(--green)}}.dot.failed{{background:var(--red)}}
 .workflow-filter{{border:1px solid var(--border);border-radius:7px;background:var(--panel2);color:var(--text);padding:8px 10px;min-width:190px}}.workflow-filter summary{{cursor:pointer;color:var(--muted)}}.workflow-options{{display:grid;gap:6px;margin-top:8px;max-height:240px;overflow:auto}}.workflow-option{{display:flex;align-items:center;gap:7px;color:var(--text);font-size:12px}}
 .pub-columns,.pub-row{{grid-template-columns:86px 110px minmax(130px,1fr) minmax(180px,1.6fr) 145px 145px}}.pub-row{{font-family:system-ui}}.pub-row code,.pub-row time,.pub-row small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.pub-row time,.pub-row small{{color:var(--muted)}}.pub-row a{{color:var(--cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 @media(max-width:900px){{.pub-columns,.pub-row{{grid-template-columns:80px 1fr auto}}.pub-columns .index-column:nth-child(4),.pub-columns .index-column:nth-child(5),.pub-columns .index-column:nth-child(6),.pub-row time,.pub-row small,.pub-row a{{display:none}}}}
 @media(max-width:900px){{.explorer-grid{{grid-template-columns:1fr}}.inspector{{border-left:0;border-top:1px solid var(--border);max-height:none}}.hint{{width:100%;margin-left:0}}}}
-@media(max-width:900px){{.index-columns,.index-row{{grid-template-columns:80px 1fr auto}}.index-columns .index-column:nth-child(2),.index-columns .index-column:nth-child(5),.index-columns .index-column:nth-child(7),.index-columns .index-column:nth-child(8),.index-row time,.index-row span:last-of-type,.index-row small{{display:none}}.index-row code{{grid-column:2}}}}
-</style></head><body><h1>Workflow run explorer</h1>
-<p class="subtitle">{project_summary}</p>
-<p class="subtitle">Interactive canvas built from persisted SQLite events. This replaces the static Mermaid-first view (the former static LangGraph flow); the graph structure remains available through the generated data.</p>
+@media(max-width:900px){{.index-columns,.index-row{{grid-template-columns:80px auto 1fr}}.index-columns .index-column:nth-child(n+5),.index-columns .index-column:nth-child(2),.index-row time,.index-row code,.index-row>span:nth-last-child(-n+2),.index-row small.project{{display:none}}}}
+.page-header{{display:flex;justify-content:space-between;align-items:end;gap:16px;flex-wrap:wrap;padding-bottom:18px;border-bottom:1px solid var(--border)}}.page-header h1{{font-size:26px;letter-spacing:-.01em}}.page-header .eyebrow{{color:var(--cyan);font-size:11px;text-transform:uppercase;letter-spacing:.14em;margin:0 0 6px}}.generated{{color:var(--muted);font-size:12px;text-align:right}}.footnote{{color:var(--muted);font-size:11px;margin-top:28px;opacity:.8}}
+.overview{{margin-bottom:22px}}.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}}.kpi{{background:linear-gradient(160deg,var(--panel2),#121922);border:1px solid var(--border);border-radius:11px;padding:12px 14px;display:flex;flex-direction:column;gap:2px}}.kpi span{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}}.kpi b{{font-size:26px;font-variant-numeric:tabular-nums}}.kpi small{{color:var(--muted)}}.kpi.bad{{border-color:#7a3340}}.kpi.bad b{{color:var(--red)}}.kpi.warn b{{color:var(--gold)}}
+.activity{{margin-top:12px;border:1px solid var(--border);border-radius:11px;padding:12px 14px;background:#111923}}.activity-head{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:8px}}.legend-inline{{display:flex;gap:6px;align-items:center}}.bars{{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;height:70px;align-items:end}}.bar{{height:100%;display:flex;flex-direction:column-reverse;background:#18212c;border-radius:3px;overflow:hidden}}.bar i{{display:block;width:100%}}.bar .ok{{background:var(--green);opacity:.75}}.bar .active{{background:var(--gold)}}.bar .bad{{background:var(--red)}}.bar:hover{{outline:1px solid var(--cyan)}}.dot.running{{background:var(--gold)}}
+.work-items{{margin-bottom:22px}}.section-head{{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}}.section-head h2{{margin:0}}.work-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px;max-height:430px;overflow:auto;padding-right:4px}}.work-item{{border:1px solid var(--border);border-left:3px solid var(--green);border-radius:10px;padding:11px 12px;background:var(--panel2);display:flex;flex-direction:column;gap:5px}}.work-item.has-failures{{border-left-color:var(--red)}}.work-item.looping{{border-color:var(--gold);border-left-color:var(--gold);box-shadow:0 0 0 1px #f8d47733}}.wi-head{{display:flex;justify-content:space-between;align-items:center;gap:8px}}.wi-head a,.subject-link{{color:var(--cyan);text-decoration:none}}.wi-head a:hover,.subject-link:hover{{text-decoration:underline}}.work-item p{{margin:0;font-size:12px;color:var(--muted)}}.work-item .flag{{color:var(--gold);font-weight:600}}.bad-text{{color:var(--red)}}.wi-foot{{display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:11px;color:var(--muted)}}.wi-foot>span{{display:flex;flex-wrap:wrap;gap:4px}}.wi-runs{{align-self:flex-start;padding:4px 9px;font-size:11px}}
+.chip{{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:1px 7px;font-size:10px;color:var(--muted);margin-right:4px;font-family:ui-monospace,SFMono-Regular,monospace}}
+.index-row{{border-left:3px solid transparent;transition:background .12s,border-color .12s}}.index-row:hover{{background:#202c3b}}.index-row.st-failed,.index-row.st-error{{border-left-color:var(--red)}}.index-row.st-running,.index-row.st-pending{{border-left-color:var(--gold)}}.index-row .subject{{display:flex;flex-direction:column;min-width:0}}.index-row .subject b{{color:var(--text)}}.index-row .subject small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row .published{{color:var(--muted)}}
+.review-report{{border:1px solid var(--border);border-radius:9px;padding:10px 12px;margin:12px 0;background:#0f151d}}.review-report h4{{margin:0 0 8px;display:flex;align-items:center;gap:8px}}.review-report .passes{{margin:0 0 8px}}.status.verdict-clean{{background:#123e3c;color:#8af0cf}}.status.verdict-findings{{background:#4a3a1b;color:#ffe5a1}}.findings,.plain-list{{list-style:none;margin:0;padding:0;display:grid;gap:8px}}.finding{{border-left:3px solid var(--border);padding:4px 0 4px 10px}}.finding p{{margin:4px 0 0;color:var(--text)!important}}.finding .remediation{{color:var(--muted)!important}}.finding code{{margin-left:4px;overflow-wrap:anywhere}}.severity{{text-transform:uppercase;font-size:10px;font-weight:700;letter-spacing:.06em;margin-right:6px}}.sev-high,.sev-critical{{border-left-color:var(--red)}}.sev-high .severity,.sev-critical .severity{{color:var(--red)}}.sev-medium{{border-left-color:var(--gold)}}.sev-medium .severity{{color:var(--gold)}}.sev-low{{border-left-color:var(--cyan)}}.sev-low .severity{{color:var(--cyan)}}.plain-list li{{font-size:12px;color:var(--muted)}}.db-path{{font-size:11px}}
+</style></head><body><header class="page-header"><div><p class="eyebrow">dev-agents</p><h1>Workflow run explorer</h1>
+<p class="subtitle">{project_summary}</p></div><p class="generated">Generated {_text(generated_at.strftime("%Y-%m-%d %H:%M UTC"))}<br>Showing the last 24 hours</p></header>
 {_interactive_app(data)}
+<p class="footnote">Interactive canvas built from persisted SQLite events. This replaces the static Mermaid-first view (the former static LangGraph flow); the graph structure remains available through the generated data.</p>
 </body></html>"""

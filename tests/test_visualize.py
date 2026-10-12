@@ -256,6 +256,9 @@ def test_report_contains_graph_and_run_timeline(tmp_path: Path) -> None:
     assert 'id="index-workflow-options"' in report
     assert 'type="checkbox"' in report
     assert "webhook|reconcile" in report
+    assert 'id="overview"' in report
+    assert 'id="work-items"' in report
+    assert '"githubRepos": {}' in report
 
 
 def test_workflow_graph_contains_clickable_topology() -> None:

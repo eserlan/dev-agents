@@ -552,6 +552,37 @@ def test_failed_review_does_not_auto_pause_below_the_failure_cap(
     assert [call for call in calls if call[:3] == ("gh", "pr", "edit")] == []
 
 
+def test_own_push_without_a_report_is_not_called_superseded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fixer that pushed and then died before reporting made the new head itself."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(state_path=tmp_path / "state.db"))
+    run_id = "pr-review-42-old-sha"
+    service.state.claim_run("pr-review", run_id, metadata={"pull_request": 42, "head_sha": "old-sha", "review_round": 0})
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: ({"headRefOid": "fix-sha"}, []))
+    comments: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer._publish_pr_run_comment",
+        lambda _repo, _number, _run_id, phase, body: comments.append((phase, body)) or True,
+    )
+
+    service._finalize({
+        "number": 42, "workflow": "pr-review", "run_id": run_id, "claimed": True,
+        "review_only": True, "review_round": 0, "fixed": False,
+        "meta": {"headRefOid": "old-sha"},
+        "report": {"own_commits": ["fix-sha", "merge-sha"]},
+    })
+
+    record = service.state.get_run("pr-review", run_id)
+    assert record is not None
+    assert record.error != "superseded by a concurrent push to the same branch"
+    assert record.metadata["review_fix_pushed"] is True
+    assert record.metadata["review_follow_up_head_sha"] == "fix-sha"
+    assert "The fixer pushed `fix-sha` but stopped before reporting" in dict(comments)["review-final"]
+
+
 def test_superseded_review_does_not_exhaust_the_chain(tmp_path: Path) -> None:
     """A run whose accept_provider check detected a concurrent push (Jules, a
     human, or an overlapping run landing a new commit mid-review) must not be

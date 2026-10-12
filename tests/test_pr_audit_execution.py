@@ -44,7 +44,11 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
     ))
     run_id = "review-42"
     service.state.claim_run("pr-review", run_id, metadata={"pull_request": 42, "head_sha": head})
-    monkeypatch.setattr("dev_agents.pr_fixer._publish_pr_run_comment", lambda *_args: True)
+    comments: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer._publish_pr_run_comment",
+        lambda _repo, _number, _run_id, phase, body: comments.append((phase, body)) or True,
+    )
     calls: list[str] = []
 
     def agent(_provider: str, prompt: str, **kwargs) -> AgentResult:
@@ -105,6 +109,14 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert service.state.get_run("pr-review", run_id).metadata["audit_telemetry"]["findings_count"] == 1
         assert service.state.get_run("pr-review", run_id).metadata["fixer_telemetry"]["returncode"] == 0
         assert [event.node for event in service.state.list_run_events("pr-review", run_id)][-3:] == ["auditor", "fixer", "fixer"]
+        phases = [phase for phase, _body in comments]
+        assert phases.index("review-findings") < phases.index("review-fixes-started")
+        findings_body = dict(comments)["review-findings"]
+        assert "**HIGH** · security-privacy — `feature.txt:1`" in findings_body
+        assert "Suggested fix: Validate before use" in findings_body
+        assert "reported above" in dict(comments)["review-fixes-started"]
+    if mode == "clean":
+        assert "review-findings" not in [phase for phase, _body in comments]
     if mode == "stale":
         assert report["superseded_by"] != head
 
@@ -127,3 +139,51 @@ def test_later_reference_feedback_is_persisted_once_for_the_audited_revision(tmp
     before = len(service.state.list_run_events("pr-review", "run-1"))
     service._track_audit_comparison(42, meta)
     assert len(service.state.list_run_events("pr-review", "run-1")) == before
+
+
+def test_own_fix_push_does_not_cancel_the_active_run(tmp_path: Path) -> None:
+    from threading import Event
+
+    origin, repo, _head = setup_repository(tmp_path)
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
+        state_path=tmp_path / "state.db", worktree_dir=tmp_path / "worktrees", log_dir=tmp_path / "logs",
+    ))
+    git(repo, "checkout", "feature")
+    (repo / "feature.txt").write_text("fixed")
+    git(repo, "commit", "-am", "fix")
+    own_head = git(repo, "rev-parse", "HEAD")
+    service.active.add(42)
+    service.cancel_events[42] = Event()
+    service.active_worktrees[42] = repo
+
+    assert service.handle(42, new_head_sha=own_head) is False
+    assert not service.cancel_events[42].is_set()
+    assert 42 in service.rerun_requested
+
+    git(origin, "checkout", "feature")
+    (origin / "external.txt").write_text("concurrent push")
+    git(origin, "add", ".")
+    git(origin, "commit", "-m", "external change")
+    foreign_head = git(origin, "rev-parse", "HEAD")
+    assert service.handle(42, new_head_sha=foreign_head) is False
+    assert service.cancel_events[42].is_set()
+
+
+def test_final_comments_explain_fix_pushes_and_supersession() -> None:
+    from dev_agents.pr_fixer.comments import _review_completed_body
+
+    report = {"report_valid": True, "review_report": {
+        "verdict": "findings",
+        "findings": [{"severity": "medium", "location": "a.ts:1", "impact": "Wrong price"}],
+        "fixes": [{"location": "a.ts:1", "summary": "Parse the price with the shop precision"}],
+    }}
+    pushed = _review_completed_body(7, "run-7", report, old_sha="a" * 40, new_sha="b" * 40, fix_pushed=True, follow_up=True)
+    assert "### 🤖 Luna fixes pushed" in pushed
+    assert "- `a.ts:1`: Parse the price with the shop precision" in pushed
+    assert "round 2/3" in pushed and "That review is expected" in pushed
+    assert "Pushed fix commit `bbbbbbbbbbbb`" in pushed
+
+    superseded = _review_completed_body(7, "run-7", report, superseded_by="c" * 40)
+    assert "Someone else pushed `cccccccccccc`" in superseded
+    assert "Nothing was pushed by this run" in superseded
+    assert "Findings:" not in superseded and "What changed" not in superseded

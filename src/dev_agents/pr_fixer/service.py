@@ -44,6 +44,7 @@ from .comments import (
     _fix_summary_body,
     _publish_fix_summary,
     _review_completed_body,
+    _review_findings_body,
     _review_fixes_started_body,
     _review_progress_body,
     _review_started_body,
@@ -131,19 +132,47 @@ class PrFixerService:
         self.rerun_requested: set[int] = set()
         self.cancel_events: dict[int, Event] = {}
         self.active_heads: dict[int, str] = {}
+        self.active_worktrees: dict[int, Path] = {}
         self.lock = Lock()
         self.workflow = self._build_workflow()
+
+    def _is_own_push(self, number: int, head_sha: str) -> bool:
+        """Whether ``head_sha`` was committed in the active run's own worktree.
+
+        The agent commits before it pushes, so its pushed head is HEAD or an ancestor of HEAD
+        in that worktree. A head pushed by anyone else is absent there unless the agent
+        fetched and merged it, in which case its result already includes that push.
+        """
+        worktree = self.active_worktrees.get(number)
+        if worktree is None:
+            return False
+        try:
+            _pkg._run(worktree, "git", "merge-base", "--is-ancestor", head_sha, "HEAD")
+        except RuntimeError:
+            return False
+        return True
 
     def handle(self, number: int, *, new_head_sha: str | None = None) -> bool:
         with self.lock:
             if number in self.active:
                 if new_head_sha and new_head_sha != self.active_heads.get(number):
                     self.rerun_requested.add(number)
-                    self.cancel_events[number].set()
-                    _log(
-                        f"head-advanced pr={number} new_head={new_head_sha[:12]}; "
-                        "cancelling stale run and queuing latest head"
-                    )
+                    if self._is_own_push(number, new_head_sha):
+                        # The running fixer pushed this head itself. Cancelling it here would
+                        # kill it before it reports its fixes, and the finalizer would then
+                        # mistake its own commit for a concurrent push. Let it finish; the
+                        # queued rerun starts the targeted post-fix verification.
+                        self.active_heads[number] = new_head_sha
+                        _log(
+                            f"head-advanced pr={number} new_head={new_head_sha[:12]}; "
+                            "pushed by the active fixer, verifying after it finishes"
+                        )
+                    else:
+                        self.cancel_events[number].set()
+                        _log(
+                            f"head-advanced pr={number} new_head={new_head_sha[:12]}; "
+                            "cancelling stale run and queuing latest head"
+                        )
                 return False
             self.active.add(number)
             self.cancel_events[number] = Event()
@@ -685,7 +714,8 @@ A follow-up comment will report the outcome.
                     refreshed_meta = {}
                 old_sha = str(state.get("meta", {}).get("headRefOid", ""))
                 new_sha = str(refreshed_meta.get("headRefOid", ""))
-                if new_sha and new_sha != old_sha and not _review_report_has_fixes(
+                own_push = new_sha in (state.get("report", {}).get("own_commits") or [])
+                if new_sha and new_sha != old_sha and not own_push and not _review_report_has_fixes(
                     state.get("report", {})
                 ):
                     return self._finish_superseded_review(state, new_sha)
@@ -730,7 +760,12 @@ A follow-up comment will report the outcome.
                         state.get("report", {}),
                         state.get("report_url"),
                         int(state.get("review_round", 0)),
-                        failure="The review agent did not complete successfully; see the daemon log.",
+                        failure=(
+                            f"The fixer pushed `{new_sha[:12]}` but stopped before reporting what it"
+                            " changed. A verification review will check the pushed commit."
+                            if own_push and new_sha != old_sha
+                            else "The review agent did not complete successfully; see the daemon log."
+                        ),
                     ),
                 )
                 self._auto_pause_if_exhausted(
@@ -796,6 +831,7 @@ A follow-up comment will report the outcome.
                     changed_files,
                     validation,
                     fix_pushed=fix_pushed,
+                    follow_up=follow_up_pending,
                 ),
             )
             self.state.record_event(
@@ -973,6 +1009,8 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 max_concurrent=self.config.max_concurrent_worktree_runs,
             ) as (worktree, conflicts):
                 _log(f"worktree pr={number} path={worktree}")
+                with self.lock:
+                    self.active_worktrees[number] = worktree
                 if conflicts:
                     _log(f"merge-conflict pr={number} paths={','.join(conflicts)}")
                 log_dir = (
@@ -1084,6 +1122,16 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             return AgentResult(1, False)
                         if audit.verdict == "clean":
                             return audit_result
+                        # Publish what the auditor found before any repair starts, so the PR shows
+                        # the findings themselves rather than only that fixing is under way.
+                        if run_id and self.state.get_run("pr-review", run_id):
+                            _pkg._publish_pr_run_comment(
+                                self.project.repo, number, run_id, "review-findings",
+                                _review_findings_body(
+                                    number, run_id, audit.model_dump(),
+                                    review_round=review_round, head_sha=original_head or None,
+                                ),
+                            )
                         # Do not hand findings to a writer after a concurrent push changed their
                         # source. Cancellation and normal final supersession handling still apply.
                         with repo_git_lock(self.project.repo):
@@ -1100,7 +1148,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             self.state.record_event("pr-review", run_id, "fixer", "fixer_started", metadata={"findings_count": len(audit.findings)})
                             _pkg._publish_pr_run_comment(
                                 self.project.repo, number, run_id, "review-fixes-started",
-                                _review_fixes_started_body(number, run_id, report, review_round=review_round),
+                                _review_fixes_started_body(number, run_id, audit.model_dump(), review_round=review_round),
                             )
 
                     final_message = log.with_suffix(".fixer.txt")
@@ -1239,6 +1287,10 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 # PR reviews and fixes are intentionally Codex-only. Keep the legacy providers
                 # field for config compatibility, but never let another agent handle PR code.
                 accepted = run_with_fallback((PR_FIX_PROVIDER,), run_provider, accept_provider)
+                # Remember which commits this run made before the worktree is removed, so the
+                # finalizer can still recognise its own push if the agent died before reporting.
+                own_range = f"{original_head}..HEAD" if original_head else "HEAD^!"
+                report["own_commits"] = _pkg._run(worktree, "git", "rev-list", own_range, check=False).splitlines()
                 if superseded_by:
                     report["superseded_by"] = superseded_by[-1]
                     _log(
@@ -1256,6 +1308,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         succeeded = True
         except RuntimeError as error:
             _log(f"worktree-failed pr={number} error={error}")
+        finally:
+            with self.lock:
+                self.active_worktrees.pop(number, None)
         return succeeded, report
 
     def _auto_merge_eligible(self, meta: dict[str, Any], keys: list[str]) -> bool:
