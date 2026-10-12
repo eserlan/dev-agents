@@ -1160,6 +1160,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             return AgentResult(1, False)
                         prompt = _review_fix_prompt(worktree, number, audit.model_dump(), base, conflicts)
                         _log(f"fixer-start pr={number} audited_findings={len(audit.findings)}")
+                        fixer_started.append(True)
                         if run_id and self.state.get_run("pr-review", run_id):
                             self.state.record_event("pr-review", run_id, "fixer", "fixer_started", metadata={"findings_count": len(audit.findings)})
                             _pkg._publish_pr_run_comment(
@@ -1218,6 +1219,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
 
                 original_head = str((meta or {}).get("headRefOid", ""))
                 superseded_by: list[str] = []
+                # Set once a review run hands its findings to the fixer. Until then the run is a
+                # read-only audit, which must not push anything (see accept_provider).
+                fixer_started: list[bool] = []
 
                 def accept_provider(_provider: str, result: Any) -> bool:
                     # A worktree shares refs/remotes/* with the common .git dir, so this
@@ -1246,9 +1250,14 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         worktree, "git", "diff", "--name-only", "--diff-filter=U", check=False
                     )
                     worktree_clean = _pkg._run(worktree, "git", "status", "--porcelain") == ""
+                    # An audit that changed nothing must not push the worktree's staging merge:
+                    # that new head would invalidate the clean verdict it just earned and start
+                    # another review (PR #4032), every time staging moves during a review.
+                    audit_only = review_only and not fixer_started
 
                     if (
-                        local_head
+                        not audit_only
+                        and local_head
                         and origin_head
                         and local_head != origin_head
                         and origin_head == original_head
@@ -1296,8 +1305,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         # evidence of a genuine review/fix failure, and must not consume
                         # a review-chain round or trip the exhaustion guard.
                         superseded_by.append(origin_head)
+                    current = pushed or (audit_only and origin_head == original_head)
                     return bool(
-                        result.returncode == 0 and pushed and not conflict_markers and worktree_clean
+                        result.returncode == 0 and current and not conflict_markers and worktree_clean
                     )
 
                 # PR reviews and fixes are intentionally Codex-only. Keep the legacy providers

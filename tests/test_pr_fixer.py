@@ -631,14 +631,12 @@ def test_superseded_review_does_not_exhaust_the_chain(tmp_path: Path) -> None:
     assert plan["scope"] == "full"
 
 
-def test_clean_review_auto_pushes_unpushed_base_merge(monkeypatch, tmp_path: Path) -> None:
+def test_clean_audit_succeeds_without_pushing_the_base_merge(monkeypatch, tmp_path: Path) -> None:
     """isolated_worktree merges origin/{base} into the branch to surface conflicts
-    before the agent runs. When base has moved and that merge is clean, local HEAD
-    ends up one commit ahead of origin/{branch} even though the agent found nothing
-    to fix -- a housekeeping commit, not agent output. The agent's own "clean status"
-    self-check doesn't catch this (a committed-but-unpushed commit leaves git status
-    empty), so the daemon must push it itself as a provable fast-forward rather than
-    reporting a real review as failed."""
+    before the agent runs, so local HEAD is one housekeeping commit ahead when base
+    has moved. A read-only audit must not push it: the new head would invalidate the
+    clean verdict and start another review (PR #4032). The audit still succeeds,
+    because the branch is still the head it reviewed."""
     origin = tmp_path / "origin"
     origin.mkdir()
     for command in (
@@ -708,11 +706,10 @@ def test_clean_review_auto_pushes_unpushed_base_merge(monkeypatch, tmp_path: Pat
     assert succeeded is True
     assert report.get("review_report", {}).get("verdict") == "clean"
     assert "superseded_by" not in report
-    # The housekeeping merge commit must actually be on origin now.
     origin_feature_head = subprocess.run(
         ["git", "rev-parse", "feature/x"], cwd=origin, check=True, capture_output=True, text=True
     ).stdout.strip()
-    assert origin_feature_head != pr_head
+    assert origin_feature_head == pr_head
 
 
 def _service_with_reviews(tmp_path: Path) -> tuple[PrFixerService, StateRepository]:
