@@ -91,13 +91,18 @@ def provider_command(
     timeout_seconds: float = 1200,
     reasoning_effort: str = "medium",
     model: str | None = None,
+    read_only: bool = False,
 ) -> list[str]:
     """Build the command line for a configured provider."""
     if provider == "codex":
+        permissions = (
+            ["--sandbox", "read-only", "--ignore-user-config", "-c", 'approval_policy="never"']
+            if read_only else ["--dangerously-bypass-approvals-and-sandbox"]
+        )
         return [
             "codex",
             "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
+            *permissions,
             "-m",
             model or CODEX_MODEL,
             "-c",
@@ -152,6 +157,8 @@ def run_agent(
     on_progress: Callable[[int], None] | None = None,
     progress_interval_seconds: float = 600.0,
     cancel_event: Event | None = None,
+    read_only: bool = False,
+    output_schema_path: Path | None = None,
 ) -> AgentResult:
     """Run a provider, forwarding output to a durable log and emitting heartbeats.
 
@@ -173,11 +180,19 @@ def run_agent(
             prompt_stream.seek(0)
         try:
             command = provider_command(provider, prompt, timeout_seconds, reasoning_effort, model)
+            if read_only:
+                if provider != "codex":
+                    raise ValueError("read_only auditing requires the Codex provider")
+                command = provider_command(provider, prompt, timeout_seconds, reasoning_effort, model, read_only=True)
             if last_message_path is not None:
                 if provider != "codex":
                     raise ValueError("last_message_path requires the Codex provider")
                 last_message_path.parent.mkdir(parents=True, exist_ok=True)
                 command.extend(["--output-last-message", str(last_message_path)])
+            if output_schema_path is not None:
+                if provider != "codex":
+                    raise ValueError("output_schema_path requires the Codex provider")
+                command.extend(["--output-schema", str(output_schema_path)])
             process = subprocess.Popen(
                 command,
                 cwd=cwd,

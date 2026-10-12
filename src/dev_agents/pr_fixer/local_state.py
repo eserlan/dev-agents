@@ -50,7 +50,10 @@ def _cleanup_artifacts(project_name: str, project: ProjectConfig, config: PrFixe
         config.log_dir or Path.home() / ".local/state/dev-agents" / project_name / "logs"
     ).expanduser()
     worktree_root = (config.worktree_dir or Path.home() / ".cache/dev-agents/pr-fixer").expanduser()
-    removed_logs = remove_older_than(log_dir, "pr-*.log", config.log_retention_days * 86400)
+    removed_logs = sum(
+        remove_older_than(log_dir, pattern, config.log_retention_days * 86400)
+        for pattern in ("pr-*.log", "pr-*.audit.json", "pr-*.audit.schema.json", "pr-*.fixer.txt")
+    )
     age_seconds = config.worktree_retention_days * 86400
     # "pr-*" is the PR-fixer's own worktree prefix; "issue-*" is the label-driven
     # issue fixer's -- both share worktree_root, but only "pr-*" was ever swept here.

@@ -94,11 +94,12 @@ later `check_run.completed` attempt. After `gh pr merge --auto --squash`, the da
 GitHub set `autoMergeRequest` (or merged the PR) and records the result.
 
 With `review_without_copilot: true` (the default), an open, non-draft PR targeting the configured
-base branch is checked for a submitted Copilot review. If none exists, the daemon runs a two-pass
-internal review—even when GitHub has not reported any checks yet: a general defect pass followed by
-the target repository's canonical `.agent/skills/codex-review/SKILL.md` pass (with compatibility
-fallbacks for older repositories). Concrete findings are fixed,
-tested, committed, and pushed from an isolated worktree. Auto-merge remains stricter and requires
+base branch is checked for a submitted Copilot review. If none exists, the daemon runs an independent
+read-only auditor, even when GitHub has not reported any checks yet. The auditor inspects general
+defects and the target repository's canonical `.agent/skills/codex-review/SKILL.md` guidance (with
+compatibility fallbacks for older repositories). Only valid, evidence-backed findings are handed to
+a separate fixer for repairs, tests, commits and pushes in the isolated worktree. A clean audit runs
+no fixer; malformed or incomplete audits cannot qualify as clean. Auto-merge requires
 at least one completed successful check. A review chain allows one full initial review and, only
 when that review pushes a fix, a targeted post-fix verification of the resulting diff and prior
 findings. If that verification itself pushes a fix without a `clean` verdict, the new head has
@@ -109,6 +110,30 @@ that extra round such a PR would wait forever for a review that could never come
 round, and a later user push starts a new chain; duplicate webhook and reconciliation deliveries
 are deduplicated. If the last round still is not clean, auto-merge stays deferred and a human
 should review and merge.
+
+The auditor falsifies premises and examines test completeness, frame/resource budgets,
+security/privacy boundaries, lifecycle ownership and accessibility. Passing tests do not substitute
+for tracing those paths. Relative Markdown links, reference definitions and backtick document paths
+are recursively bundled, including the general methodology, patterns catalogue and constitution.
+Cycles are deduplicated, paths escaping the target repository are rejected, and missing/over-budget
+guidance is explicitly listed. The auditor uses Codex `--sandbox read-only`, never approvals, and
+`--ignore-user-config` to exclude user-configured MCP servers and hooks. Its final response is a
+schema-constrained JSON file; the daemon checks that source HEAD and worktree status are unchanged.
+Auditing and fixing share the configured run time budget. A concurrent push stops a stale auditor's
+findings from reaching the fixer.
+
+Independent audit evidence is persisted before repair. Each run records stage, source SHA, verdict,
+finding count, categorized checks, limitations and audit artifact path. Later Copilot and independent
+human inline reviews are compared by original source revision and location, with snapshots stored
+in the event history. `potential_false_negative_rate` is a positional diagnostic proxy; unmatched
+comments are candidates to investigate, not automatically confirmed misses. Reference feedback is
+never fed into the independent audit. The existing reviewer decision still controls merge readiness.
+Fixer execution has separate start/completion events and records its exit code and timeout status.
+Audit logs, JSON/schema files and final fixer reports follow the PR log retention period.
+
+[dev-agents #22](https://github.com/eserlan/dev-agents/issues/22) owns this separation and reviewer
+quality tracking. Read-only historical replays are documented in
+[the PR auditor replay notes](../evals/pr-audit/README.md).
 
 To avoid concurrent-agent rewrite loops, `pause_on_external_agent_commits` is enabled by default.
 When the latest commit author matches `external_agent_logins` (Jules is included in the example

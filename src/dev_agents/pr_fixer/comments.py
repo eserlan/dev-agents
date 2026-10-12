@@ -51,14 +51,14 @@ def _review_started_body(
     review_round: int = 0,
 ) -> str:
     scope = (
-        "the full two-pass review (general defects followed by the repository-specific Codex review)"
+        "the independent read-only audit (general defects and bundled repository-specific guidance)"
         if review_round == 0
         else "the one allowed targeted post-fix verification of the changed diff and prior findings"
     )
     return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna review started
 
-Luna has started {scope} for PR #{number}.
+Luna has started {scope} for PR #{number}. A separate fixer runs only after evidence-backed findings.
 
 - PR head: `{meta.get('headRefOid', 'unknown')}`
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`

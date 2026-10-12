@@ -33,6 +33,14 @@ def test_codex_provider_command_can_use_luna_high_reasoning() -> None:
     )
 
 
+def test_auditor_uses_enforced_read_only_without_user_mcp_or_hooks() -> None:
+    command = provider_command("codex", "audit", read_only=True)
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "--ignore-user-config" in command
+    assert 'approval_policy="never"' in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+
 def test_claude_provider_command_uses_haiku_medium() -> None:
     assert provider_command("claude", "fix it") == [
         "claude",

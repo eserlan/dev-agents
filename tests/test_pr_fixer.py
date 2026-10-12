@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -180,8 +181,8 @@ def test_review_prompt_requires_lifecycle_comments(tmp_path: Path) -> None:
 
     assert "pr-review run=pr-review-42-abc123" in prompt
     assert "Never edit, PATCH, or" in prompt
-    assert "as new PR comments" in prompt
-    assert "DEV_AGENTS_REVIEW_REPORT_BEGIN" in prompt
+    assert "Never edit, PATCH, or post a comment" in prompt
+    assert "separate fixer owns implementation" in prompt
 
 
 def test_review_prompt_shows_a_concrete_findings_example(tmp_path: Path) -> None:
@@ -199,8 +200,9 @@ def test_review_prompt_shows_a_concrete_findings_example(tmp_path: Path) -> None
         run_id="pr-review-42-abc123",
     )
     fix_prompt = _prompt(tmp_path, 42, ["comment:1"], "staging", [])
+    assert '"verdict":"findings"' in fix_prompt
+    assert '"confidence"' in review_prompt
     for prompt in (review_prompt, fix_prompt):
-        assert '"verdict":"findings"' in prompt
         for field in ("severity", "category", "location", "impact", "remediation"):
             assert f'"{field}"' in prompt
 
@@ -643,15 +645,14 @@ def test_clean_review_auto_pushes_unpushed_base_merge(monkeypatch, tmp_path: Pat
     )
 
     def fake_run_agent(_provider: str, _prompt: str, *, log_path: Path, **_kwargs: Any) -> Any:
-        log_path.write_text(
-            "DEV_AGENTS_REVIEW_REPORT_BEGIN\n"
-            "FINDINGS: none\n"
-            "FIXES: none\n"
-            'REPORT_JSON: {"verdict":"clean","findings":[],'
-            '"categories_checked":["general"],"validation":["tests passed"],"fixes":[]}\n'
-            "DEV_AGENTS_REVIEW_REPORT_END\n",
-            encoding="utf-8",
-        )
+        from dev_agents.pr_fixer.audit import AUDIT_LENSES
+
+        assert _kwargs["read_only"] is True
+        _kwargs["last_message_path"].write_text(json.dumps({
+            "verdict": "clean", "findings": [], "categories_checked": ["general"],
+            "checks": [{"category": category, "status": "pass", "evidence": "Read changed path"}
+                       for category in sorted(AUDIT_LENSES)], "limitations": [],
+        }))
         return SimpleNamespace(returncode=0, timed_out=False)
 
     monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", fake_run_agent)

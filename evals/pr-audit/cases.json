@@ -1,0 +1,6 @@
+[
+  {"pr":3685,"location":"fit-bounds","impact":"label|edge|clip"},
+  {"pr":3687,"location":"community|hull","impact":"canvas|frame|cop(y|ies)|pan|DPI"},
+  {"pr":3690,"location":"svelte|css","impact":"contrast"},
+  {"pr":3691,"location":"HelpAssistantMessage","impact":"remote|track|privacy|image|network"}
+]

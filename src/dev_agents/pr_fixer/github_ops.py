@@ -43,7 +43,7 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
             "view",
             str(number),
             "--json",
-            "number,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews,commits,autoMergeRequest,url,body",
+            "number,author,headRefName,headRefOid,baseRefName,state,isDraft,labels,mergeable,mergeStateStatus,reviewDecision,reviews,commits,autoMergeRequest,url,body",
         )
     )
     slug = _pkg.repository_slug(repo)
