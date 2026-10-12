@@ -278,6 +278,26 @@ def _external_agent_commit(meta: dict[str, Any], config: PrFixerConfig) -> str |
     return None
 
 
+def _review_handoff_agent(meta: dict[str, Any], config: PrFixerConfig) -> str | None:
+    """Name the agent that repairs this PR's review findings itself, if one owns it.
+
+    Matches the head branch prefix (a Claude Code session names its branches `claude/...`,
+    even when its early commits are authored as the user) or any commit authored by a
+    configured login.
+    """
+    branch = str(meta.get("headRefName") or "")
+    for prefix in config.review_handoff_branch_prefixes:
+        if prefix and branch.startswith(prefix):
+            return prefix.rstrip("/")
+    configured = {login.strip().lower() for login in config.review_handoff_logins if login.strip()}
+    for commit in meta.get("commits") or []:
+        for author in (commit.get("authors") or []) if isinstance(commit, dict) else []:
+            login = str(author.get("login") or "").strip() if isinstance(author, dict) else ""
+            if login.lower() in configured:
+                return login
+    return None
+
+
 def _has_copilot_review(meta: dict[str, Any]) -> bool:
     """Return whether GitHub has a submitted review from a Copilot account."""
     for review in meta.get("reviews", []):

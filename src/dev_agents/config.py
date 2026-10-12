@@ -185,6 +185,11 @@ class PrFixerConfig(BaseModel):
     pause_on_external_agent_commits: bool = True
     external_agent_logins: list[str] = ["google-labs-jules[bot]"]
     external_agent_resume_label: str = "dev-agents-resume"
+    # Agents that answer review comments on PRs they own, such as a Claude Code session following
+    # its PR. On those PRs dev-agents still audits and posts findings, but leaves the repairs to
+    # that agent instead of racing it with its own fixer. Its pushes then get a fresh review.
+    review_handoff_logins: list[str] = ["claude"]
+    review_handoff_branch_prefixes: list[str] = ["claude/"]
     degodify_webhook_path: str = "/degodify"
     degodify_webhook_secret_env: str = "DEGODIFY_WEBHOOK_SECRET"
     # After this many consecutive failed attempts at the same run_id (e.g. a

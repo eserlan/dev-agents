@@ -36,7 +36,7 @@ def setup_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return origin, repo, head
 
 
-@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop"])
+@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "handoff"])
 def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     origin, repo, head = setup_repository(tmp_path)
     service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
@@ -100,8 +100,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         return AgentResult(0, False)
 
     monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", agent)
-    succeeded, report = service._fix(42, "feature", [], review_only=True, meta={"headRefOid": head}, run_id=run_id)
-    assert succeeded == (mode in {"clean", "findings", "incomplete_findings"})
+    meta = {"headRefOid": head, **({"headRefName": "claude/feature"} if mode == "handoff" else {})}
+    succeeded, report = service._fix(42, "feature", [], review_only=True, meta=meta, run_id=run_id)
+    assert succeeded == (mode in {"clean", "findings", "incomplete_findings", "handoff"})
     assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop"} else ["auditor"])
     if mode == "findings":
         assert report["review_report"]["verdict"] == "findings"
@@ -116,6 +117,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert "**HIGH** · security-privacy — `feature.txt:1`" in findings_body
         assert "Suggested fix: Validate before use" in findings_body
         assert "reported above" in dict(comments)["review-fixes-started"]
+    if mode == "handoff":
+        assert report["handoff_agent"] == "claude"
+        assert [phase for phase, _body in comments] == ["review-findings"]
     if mode == "incomplete_findings":
         assert "Not verified, needs a human check" in dict(comments)["review-findings"]
         assert "accessibility: Contrast tokens were not resolvable" in dict(comments)["review-findings"]
@@ -191,3 +195,25 @@ def test_final_comments_explain_fix_pushes_and_supersession() -> None:
     assert "Someone else pushed `cccccccccccc`" in superseded
     assert "Nothing was pushed by this run" in superseded
     assert "Findings:" not in superseded and "What changed" not in superseded
+
+
+def test_review_handoff_agent_matches_branch_prefix_or_commit_login() -> None:
+    from dev_agents.pr_fixer.github_ops import _review_handoff_agent
+
+    config = PrFixerConfig()
+    assert _review_handoff_agent({"headRefName": "claude/merchant-stock"}, config) == "claude"
+    by_login = {"headRefName": "feature", "commits": [
+        {"authors": [{"login": "eserlan"}]}, {"authors": [{"login": "claude"}]},
+    ]}
+    assert _review_handoff_agent(by_login, config) == "claude"
+    assert _review_handoff_agent({"headRefName": "feature", "commits": [{"authors": [{"login": "eserlan"}]}]}, config) is None
+    assert _review_handoff_agent({"headRefName": "claude/x"}, PrFixerConfig(review_handoff_branch_prefixes=[], review_handoff_logins=[])) is None
+
+
+def test_final_comment_explains_handed_off_findings() -> None:
+    from dev_agents.pr_fixer.comments import _review_completed_body
+
+    report = {"handoff_agent": "claude", "review_report": {"verdict": "findings", "findings": [], "fixes": []}}
+    body = _review_completed_body(9, "run-9", report, old_sha="a" * 40, new_sha="a" * 40)
+    assert "### 🤖 Luna review completed — findings left for claude" in body
+    assert "Its next push gets a fresh review" in body

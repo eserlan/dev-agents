@@ -54,6 +54,7 @@ from .github_ops import (
     _external_agent_commit,
     _has_copilot_review,
     _is_issue_fix_pr,
+    _review_handoff_agent,
     _review_is_due,
 )
 from .local_state import _load_state, _state_path
@@ -1135,6 +1136,18 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                     review_round=review_round, head_sha=original_head or None,
                                 ),
                             )
+                        handoff_agent = _review_handoff_agent(meta or {}, self.config)
+                        if handoff_agent:
+                            # The PR's own agent repairs from the findings comment; a parallel
+                            # fixer here only races it (PR #4028). Its next push is re-reviewed.
+                            report["handoff_agent"] = handoff_agent
+                            _log(f"review-handoff pr={number} agent={handoff_agent} findings={len(audit.findings)}")
+                            if run_id and self.state.get_run("pr-review", run_id):
+                                self.state.record_event(
+                                    "pr-review", run_id, "fixer", "handed_off",
+                                    metadata={"agent": handoff_agent, "findings_count": len(audit.findings)},
+                                )
+                            return audit_result
                         # Do not hand findings to a writer after a concurrent push changed their
                         # source. Cancellation and normal final supersession handling still apply.
                         with repo_git_lock(self.project.repo):

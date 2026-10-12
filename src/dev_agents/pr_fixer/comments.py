@@ -145,9 +145,17 @@ head will receive a full review.
 - Run: `{run_id}`
 {_report_line(report_url)}
 """
+    handoff_agent = report.get("handoff_agent")
     if failure:
         heading = "### 🤖 Luna review failed"
         outcome = failure
+    elif handoff_agent and not pushed_fix:
+        heading = f"### 🤖 Luna review completed — findings left for {handoff_agent}"
+        outcome = (
+            f"This PR is driven by {handoff_agent}, so Luna left the findings above for it to fix"
+            " instead of pushing its own repairs. Its next push gets a fresh review; auto-merge"
+            " waits for a clean one."
+        )
     elif pushed_fix:
         heading = "### 🤖 Luna fixes pushed"
         outcome = "Luna fixed the review findings and pushed the result."
