@@ -173,6 +173,13 @@ Adversarial falsification lenses:
 - accessibility: Inspect semantic controls, focus/hidden states and contrast across all relevant
   theme variants. Where colour values are available, calculate rather than assume adequate contrast.
 
+This is a static source review. Rendering the UI, running a browser, and visual, mobile or
+screen-reader testing are unavailable and not expected. Never mark a check unverified or the audit
+incomplete only because something could not be rendered or seen. Judge each lens from the source:
+markup, labels and roles, focus handling, and contrast calculated from the theme's colour tokens.
+List anything that can only be confirmed visually under `limitations`, and set the check's status
+from the source evidence you do have.
+
 Record one `checks` entry for every lens above, with `category` set to exactly its identifier:
 premise-inversion, tests, resource-budget, security-privacy, lifecycle, accessibility. Add any
 other areas you reviewed (such as the bundled repository guidance) as separate entries.

@@ -36,7 +36,7 @@ def setup_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return origin, repo, head
 
 
-@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "fix_noop"])
+@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop"])
 def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     origin, repo, head = setup_repository(tmp_path)
     service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
@@ -74,9 +74,10 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
             }
             if mode == "mutation":
                 (worktree / "feature.txt").write_text("unauthorised audit edit")
-            if mode == "incomplete":
+            if mode in {"incomplete", "incomplete_findings"}:
                 audit["verdict"] = "incomplete"
-                audit["checks"][0]["status"] = "unverified"
+                accessibility = next(check for check in audit["checks"] if check["category"] == "accessibility")
+                accessibility.update(status="unverified", evidence="Contrast tokens were not resolvable")
             if mode == "stale":
                 git(origin, "checkout", "feature")
                 (origin / "external.txt").write_text("concurrent push")
@@ -100,8 +101,8 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
 
     monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", agent)
     succeeded, report = service._fix(42, "feature", [], review_only=True, meta={"headRefOid": head}, run_id=run_id)
-    assert succeeded == (mode in {"clean", "findings"})
-    assert calls == (["auditor", "fixer"] if mode in {"findings", "fix_noop"} else ["auditor"])
+    assert succeeded == (mode in {"clean", "findings", "incomplete_findings"})
+    assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop"} else ["auditor"])
     if mode == "findings":
         assert report["review_report"]["verdict"] == "findings"
         assert report["audit_report"]["findings"][0]["evidence"] == "The new branch bypasses validation"
@@ -115,6 +116,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert "**HIGH** · security-privacy — `feature.txt:1`" in findings_body
         assert "Suggested fix: Validate before use" in findings_body
         assert "reported above" in dict(comments)["review-fixes-started"]
+    if mode == "incomplete_findings":
+        assert "Not verified, needs a human check" in dict(comments)["review-findings"]
+        assert "accessibility: Contrast tokens were not resolvable" in dict(comments)["review-findings"]
     if mode == "clean":
         assert "review-findings" not in [phase for phase, _body in comments]
     if mode == "stale":

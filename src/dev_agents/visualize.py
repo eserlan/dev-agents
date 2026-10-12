@@ -20,6 +20,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 from dev_agents.config import ProjectConfig
 from dev_agents.runtime import state_database_path
@@ -43,6 +44,7 @@ PR_DATABASE_WORKFLOWS = (
     "degodify",
     "github-webhook",
 )
+OSLO = ZoneInfo("Europe/Oslo")
 REPORT_HIDE_AFTER = timedelta(hours=1)
 REPORT_DELETE_AFTER = timedelta(days=1)
 REPORT_DEPLOY_BACKOFF = timedelta(hours=24)
@@ -882,6 +884,9 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 }
 function pretty(value) { return escapeHtml(JSON.stringify(value ?? {}, null, 2)); }
+// Times are stored in UTC; show them in Norwegian local time.
+const LOCAL_TIME = new Intl.DateTimeFormat('nb-NO', {timeZone: 'Europe/Oslo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'});
+function localTime(value) { const timestamp = Date.parse(value); return value && Number.isFinite(timestamp) ? LOCAL_TIME.format(timestamp) : '—'; }
 function relativeTime(value) {
   const timestamp = Date.parse(value); if (!Number.isFinite(timestamp)) return '—';
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
@@ -890,7 +895,7 @@ function relativeTime(value) {
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
   return `${Math.floor(seconds / 86400)}d ago`;
 }
-function timeMarkup(value) { return `<time datetime="${escapeHtml(value)}" title="${escapeHtml(value)}">${escapeHtml(relativeTime(value))}</time>`; }
+function timeMarkup(value) { return `<time datetime="${escapeHtml(value)}" title="${escapeHtml(localTime(value))}">${escapeHtml(relativeTime(value))}</time>`; }
 function githubUrl(project, kind, number) {
   const slug = (report.githubRepos || {})[project];
   return slug ? `https://github.com/${slug}/${kind === 'pr' ? 'pull' : 'issues'}/${encodeURIComponent(number)}` : '';
@@ -946,7 +951,7 @@ function renderOverview() {
   });
   const peak = Math.max(1, ...buckets.map(bucket => bucket.ok + bucket.bad + bucket.active));
   const bars = buckets.map(bucket => {
-    const label = new Date(bucket.start).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    const label = new Date(bucket.start).toLocaleTimeString('nb-NO', {timeZone: 'Europe/Oslo', hour: '2-digit', minute: '2-digit'});
     const total = bucket.ok + bucket.bad + bucket.active;
     return `<div class="bar" title="${escapeHtml(label)} · ${total} runs · ${bucket.bad} failed"><i class="bad" style="height:${(bucket.bad / peak) * 100}%"></i><i class="active" style="height:${(bucket.active / peak) * 100}%"></i><i class="ok" style="height:${(bucket.ok / peak) * 100}%"></i></div>`;
   }).join('');
@@ -1100,7 +1105,7 @@ function renderIndexColumns() {
 }
 function formatRunDetails(run) {
   const publications = (run.publications || []).map(publication => `<div class="publication-detail"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b>${publication.destination ? ` · ${escapeHtml(publication.destination)}` : ''}${publication.public_url ? ` · <a href="${escapeHtml(publication.public_url)}" target="_blank" rel="noreferrer">${escapeHtml(publication.public_url)}</a>` : ''}${publication.page_url ? `<small>${escapeHtml(publication.page_url)}</small>` : ''}${publication.error ? `<p class="error">${escapeHtml(publication.error)}</p>` : ''}</div>`).join('');
-  return `<div class="run-title"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${projectPrefix(run)}${escapeHtml(run.workflow)} / ${escapeHtml(run.run_id)}</b>${subjectLink(run)}</div><p>Started ${escapeHtml(run.started_at)} · completed ${escapeHtml(run.completed_at || '—')} · duration ${escapeHtml(duration(run))}</p><p class="db-path">Database <code>${escapeHtml(run.database_path || '—')}</code></p>${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}${reviewReportMarkup(run)}<details><summary>Run metadata</summary><pre>${pretty(run.metadata)}</pre></details><h3>Publications (${publicationCount(run)})</h3>${publications || '<p>No publication receipts recorded.</p>'}<h3>Events (${run.events.length})</h3>${run.events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.node)}</b> · ${escapeHtml(event.event)} <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}</time><pre>${pretty(event.metadata)}</pre></div>`).join('') || '<p>No recorded events.</p>'}`;
+  return `<div class="run-title"><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span><b>${projectPrefix(run)}${escapeHtml(run.workflow)} / ${escapeHtml(run.run_id)}</b>${subjectLink(run)}</div><p>Started ${escapeHtml(localTime(run.started_at))} · completed ${escapeHtml(localTime(run.completed_at))} · duration ${escapeHtml(duration(run))}</p><p class="db-path">Database <code>${escapeHtml(run.database_path || '—')}</code></p>${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}${reviewReportMarkup(run)}<details><summary>Run metadata</summary><pre>${pretty(run.metadata)}</pre></details><h3>Publications (${publicationCount(run)})</h3>${publications || '<p>No publication receipts recorded.</p>'}<h3>Events (${run.events.length})</h3>${run.events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.node)}</b> · ${escapeHtml(event.event)} <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(localTime(event.started_at))}</time><pre>${pretty(event.metadata)}</pre></div>`).join('') || '<p>No recorded events.</p>'}`;
 }
 function openIndexedRun(run) {
   const workflow = findWorkflow(run.workflow);
@@ -1180,7 +1185,7 @@ function renderPubColumns() {
 }
 function pubRowMarkup(publication) {
   const content = pubContent(publication);
-  return `<button class="index-row pub-row" data-project="${escapeHtml(publication.project_name)}" data-workflow="${escapeHtml(publication.workflow)}" data-run="${escapeHtml(publication.run_id)}"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b><span>${escapeHtml(publication.destination || '—')}</span>${content ? `<a href="${escapeHtml(content)}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">${escapeHtml(content)}</a>` : '<span>—</span>'}<time>${escapeHtml(publication.published_at)}</time><code>${projectPrefix(publication)}${escapeHtml(publication.workflow)}/${escapeHtml(publication.run_id)}</code></button>`;
+  return `<button class="index-row pub-row" data-project="${escapeHtml(publication.project_name)}" data-workflow="${escapeHtml(publication.workflow)}" data-run="${escapeHtml(publication.run_id)}"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span><b>${escapeHtml(publication.channel)}</b><span>${escapeHtml(publication.destination || '—')}</span>${content ? `<a href="${escapeHtml(content)}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">${escapeHtml(content)}</a>` : '<span>—</span>'}<time>${escapeHtml(localTime(publication.published_at))}</time><code>${projectPrefix(publication)}${escapeHtml(publication.workflow)}/${escapeHtml(publication.run_id)}</code></button>`;
 }
 function bindPubRows() {
   pubRows.querySelectorAll('.pub-row').forEach(row => row.addEventListener('click', () => openIndexedRun(findRun(row.dataset.project, row.dataset.workflow, row.dataset.run))));
@@ -1245,12 +1250,12 @@ function updateDetails() {
   const events = eventForNode(selectedNode), publications = publicationsForNode(selectedNode); if (!selectedNode) { nodeDetails.innerHTML = '<p>Select a node to inspect its events.</p>'; return; }
   const node = currentWorkflow.graph.nodes.find(item => item.id === selectedNode);
   const publicationMarkup = publications.map(publication => `<div class="publication-detail"><span class="status ${escapeHtml(publication.status)}">${escapeHtml(publication.status)}</span>${publication.destination ? ` <b>${escapeHtml(publication.destination)}</b>` : ''}${publication.public_url ? ` · <a href="${escapeHtml(publication.public_url)}" target="_blank" rel="noreferrer">${escapeHtml(publication.public_url)}</a>` : ''}${publication.page_url ? `<small>${escapeHtml(publication.page_url)}</small>` : ''}${publication.external_id ? `<small>ID: ${escapeHtml(publication.external_id)}</small>` : ''}</div>`).join('');
-  nodeDetails.innerHTML = `<h3>${escapeHtml(nodeLabel(node || {label: selectedNode}))}</h3>` + (publicationMarkup ? `<h4>Publication receipts</h4>${publicationMarkup}` : '') + (events.length ? `<h4>Events</h4>${events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.event)}</b> <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(event.started_at)}${event.completed_at && event.completed_at !== event.started_at ? ` → ${escapeHtml(event.completed_at)}` : ''}</time><pre>${pretty(event.metadata)}</pre></div>`).join('')}` : '<p>No recorded events for this node in the selected run.</p>');
+  nodeDetails.innerHTML = `<h3>${escapeHtml(nodeLabel(node || {label: selectedNode}))}</h3>` + (publicationMarkup ? `<h4>Publication receipts</h4>${publicationMarkup}` : '') + (events.length ? `<h4>Events</h4>${events.map(event => `<div class="event-detail"><div><b>${escapeHtml(event.event)}</b> <span class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</span></div><time>${escapeHtml(localTime(event.started_at))}${event.completed_at && event.completed_at !== event.started_at ? ` → ${escapeHtml(localTime(event.completed_at))}` : ''}</time><pre>${pretty(event.metadata)}</pre></div>`).join('')}` : '<p>No recorded events for this node in the selected run.</p>');
 }
 function updateRun() {
   currentRun = currentWorkflow.runs.find(run => runKey(run) === runSelect.value) || null; selectedNode = null; emptyState.hidden = Boolean(currentRun);
   if (!currentRun) { runSummary.innerHTML = '<p>No persisted runs for this workflow.</p>'; eventList.innerHTML = ''; updateDetails(); draw(); return; }
-  runSummary.innerHTML = `<div class="run-title"><span class="status ${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span><b>${projectPrefix(currentRun)}${escapeHtml(currentRun.run_id)}</b>${subjectLink(currentRun)}</div><p>Started ${escapeHtml(currentRun.started_at)} · completed ${escapeHtml(currentRun.completed_at || '—')} · duration ${escapeHtml(duration(currentRun))} · attempt ${escapeHtml(currentRun.attempt)}</p>${currentRun.error ? `<p class="error">${escapeHtml(currentRun.error)}</p>` : ''}${reviewReportMarkup(currentRun)}<details><summary>Run metadata</summary><pre>${pretty(currentRun.metadata)}</pre></details>`;
+  runSummary.innerHTML = `<div class="run-title"><span class="status ${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span><b>${projectPrefix(currentRun)}${escapeHtml(currentRun.run_id)}</b>${subjectLink(currentRun)}</div><p>Started ${escapeHtml(localTime(currentRun.started_at))} · completed ${escapeHtml(localTime(currentRun.completed_at))} · duration ${escapeHtml(duration(currentRun))} · attempt ${escapeHtml(currentRun.attempt)}</p>${currentRun.error ? `<p class="error">${escapeHtml(currentRun.error)}</p>` : ''}${reviewReportMarkup(currentRun)}<details><summary>Run metadata</summary><pre>${pretty(currentRun.metadata)}</pre></details>`;
   eventList.innerHTML = currentRun.events.length ? currentRun.events.map(event => `<button class="event-row" data-node="${escapeHtml(event.node)}"><span>${escapeHtml(event.sequence)}</span><b>${escapeHtml(event.node)}</b><span>${escapeHtml(event.event)}</span><i class="status ${escapeHtml(event.status)}">${escapeHtml(event.status)}</i></button>`).join('') : '<p>No node events recorded.</p>';
   eventList.querySelectorAll('.event-row').forEach(button => button.addEventListener('click', () => { selectedNode = button.dataset.node; updateDetails(); draw(); })); updateDetails(); draw();
 }
@@ -1444,7 +1449,7 @@ def render_projects_report(
 .index-row{{border-left:3px solid transparent;transition:background .12s,border-color .12s}}.index-row:hover{{background:#202c3b}}.index-row.st-failed,.index-row.st-error{{border-left-color:var(--red)}}.index-row.st-running,.index-row.st-pending{{border-left-color:var(--gold)}}.index-row .subject{{display:flex;flex-direction:column;min-width:0}}.index-row .subject b{{color:var(--text)}}.index-row .subject small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.index-row .published{{color:var(--muted)}}
 .review-report{{border:1px solid var(--border);border-radius:9px;padding:10px 12px;margin:12px 0;background:#0f151d}}.review-report h4{{margin:0 0 8px;display:flex;align-items:center;gap:8px}}.review-report .passes{{margin:0 0 8px}}.status.verdict-clean{{background:#123e3c;color:#8af0cf}}.status.verdict-findings{{background:#4a3a1b;color:#ffe5a1}}.findings,.plain-list{{list-style:none;margin:0;padding:0;display:grid;gap:8px}}.finding{{border-left:3px solid var(--border);padding:4px 0 4px 10px}}.finding p{{margin:4px 0 0;color:var(--text)!important}}.finding .remediation{{color:var(--muted)!important}}.finding code{{margin-left:4px;overflow-wrap:anywhere}}.severity{{text-transform:uppercase;font-size:10px;font-weight:700;letter-spacing:.06em;margin-right:6px}}.sev-high,.sev-critical{{border-left-color:var(--red)}}.sev-high .severity,.sev-critical .severity{{color:var(--red)}}.sev-medium{{border-left-color:var(--gold)}}.sev-medium .severity{{color:var(--gold)}}.sev-low{{border-left-color:var(--cyan)}}.sev-low .severity{{color:var(--cyan)}}.plain-list li{{font-size:12px;color:var(--muted)}}.db-path{{font-size:11px}}
 </style></head><body><header class="page-header"><div><p class="eyebrow">dev-agents</p><h1>Workflow run explorer</h1>
-<p class="subtitle">{project_summary}</p></div><p class="generated">Generated {_text(generated_at.strftime("%Y-%m-%d %H:%M UTC"))}<br>Showing the last 24 hours</p></header>
+<p class="subtitle">{project_summary}</p></div><p class="generated">Generated {_text(generated_at.astimezone(OSLO).strftime("%d.%m.%Y %H:%M %Z"))}<br>Showing the last 24 hours</p></header>
 {_interactive_app(data)}
 <p class="footnote">Interactive canvas built from persisted SQLite events. This replaces the static Mermaid-first view (the former static LangGraph flow); the graph structure remains available through the generated data.</p>
 </body></html>"""

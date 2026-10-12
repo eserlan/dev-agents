@@ -227,13 +227,24 @@ def _review_findings_body(
     scope = "independent audit" if review_round == 0 else "targeted post-fix verification"
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
     head_line = f"- PR head: `{head_sha}`\n" if head_sha else ""
+    unverified = [
+        check for check in report.get("checks") or []
+        if isinstance(check, dict) and check.get("status") == "unverified"
+    ]
+    unverified_section = (
+        "**Not verified, needs a human check** (auto-merge stays blocked until resolved):\n\n"
+        + "\n".join(f"- {check.get('category', '?')}: {check.get('evidence', '')}" for check in unverified)
+        + "\n\n"
+        if unverified
+        else ""
+    )
     return f"""<!-- dev-agents:pr-review run={run_id} -->
 ### 🤖 Luna review findings
 
 Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}:
 
 {_findings_markdown(report)}
-{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
+{unverified_section}{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
 - Run: `{run_id}`
 {_report_line(report_url)}
 """

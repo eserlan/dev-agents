@@ -1117,7 +1117,10 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                 "audit_report_path": str(audit_path),
                             })
                             self.state.record_event("pr-review", run_id, "auditor", "audit_completed", metadata=telemetry)
-                        if audit.verdict == "incomplete":
+                        # Incomplete coverage with concrete findings still gets those findings
+                        # fixed; the unverified checks are reported for a human, and the chain's
+                        # clean-verdict requirement keeps auto-merge blocked until they're resolved.
+                        if audit.verdict == "incomplete" and not audit.findings:
                             report.update(report_valid=False, report_error="auditor coverage is incomplete")
                             return AgentResult(1, False)
                         if audit.verdict == "clean":
