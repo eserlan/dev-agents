@@ -82,6 +82,14 @@ class PublicationRecord:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class GalleryAssetRecord:
+    key: str
+    url: str
+    purpose: str
+    size: str
+
+
 def _process_identity(pid: int) -> dict[str, int | str]:
     """Return a PID plus OS start identity so PID reuse cannot revive a dead claim."""
     identity: dict[str, int | str] = {"pid": pid}
@@ -152,7 +160,7 @@ class StateRepository:
     configured log directory and store only metadata and the log path in ``metadata``.
     """
 
-    CURRENT_SCHEMA_VERSION = 4
+    CURRENT_SCHEMA_VERSION = 5
     BUSY_TIMEOUT_MS = 30_000
     STALE_RUN_SECONDS = 60 * 60
 
@@ -225,6 +233,10 @@ class StateRepository:
             if version < 4:
                 self._migrate_to_v4(connection)
                 connection.execute("UPDATE schema_version SET version = 4")
+                version = 4
+            if version < 5:
+                self._migrate_to_v5(connection)
+                connection.execute("UPDATE schema_version SET version = 5")
             connection.commit()
         except sqlite3.DatabaseError:
             if connection is not None:
@@ -356,6 +368,67 @@ class StateRepository:
                 ON publications(project_name, workflow, run_id, published_at);
             """
         )
+
+    @staticmethod
+    def _migrate_to_v5(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS gallery_assets (
+                project_name TEXT NOT NULL,
+                asset_key TEXT NOT NULL,
+                url TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                size TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY(project_name, asset_key),
+                FOREIGN KEY(project_name) REFERENCES projects(project_name)
+            );
+            CREATE INDEX IF NOT EXISTS gallery_assets_active_idx
+                ON gallery_assets(project_name, active, asset_key);
+            """
+        )
+
+    def sync_gallery_assets(self, assets: list[dict[str, str]]) -> int:
+        """Replace the active public gallery inventory while retaining stale rows."""
+        now = _timestamp()
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE gallery_assets SET active = 0 WHERE project_name = ?",
+                (self.project_name,),
+            )
+            for asset in assets:
+                key = asset["key"]
+                connection.execute(
+                    """
+                    INSERT INTO gallery_assets(
+                        project_name, asset_key, url, purpose, size, active, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(project_name, asset_key) DO UPDATE SET
+                        url = excluded.url,
+                        purpose = excluded.purpose,
+                        size = excluded.size,
+                        active = 1,
+                        synced_at = excluded.synced_at
+                    """,
+                    (self.project_name, key, asset["url"], asset["purpose"], asset.get("size", ""), now),
+                )
+        return len(assets)
+
+    def list_gallery_assets(self) -> list[GalleryAssetRecord]:
+        """Return the current active gallery inventory in stable key order."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT asset_key, url, purpose, size FROM gallery_assets
+                WHERE project_name = ? AND active = 1 ORDER BY asset_key
+                """,
+                (self.project_name,),
+            ).fetchall()
+        return [
+            GalleryAssetRecord(str(row["asset_key"]), str(row["url"]), str(row["purpose"]), str(row["size"]))
+            for row in rows
+        ]
 
     def _quarantine_corrupt_database(self) -> Path:
         stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")

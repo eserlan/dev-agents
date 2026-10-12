@@ -79,6 +79,13 @@ approval; that approval packages and installs the candidate but does not itself
 click the Reddit post action. See the [Reddit Publisher Operations runbook](reddit-publisher-operations.md)
 for setup, deploy, and troubleshooting steps.
 
+For Codex Cryptica, the Instagram backfill refreshes the public asset gallery at
+`https://assets.codexcryptica.com/gallery` into the project's SQLite state database. Every
+gallery image is eligible unless its asset is already recorded as published to Instagram (or
+the same image was published through its article page). The scheduler publishes at the configured
+interval, rotates past failed images while unused assets remain, and uses the last stored gallery
+inventory if the gallery cannot be reached during a refresh.
+
 The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.
 It no longer needs a listener, publisher script, or daemon systemd unit.

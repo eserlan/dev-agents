@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -20,6 +21,7 @@ from dev_agents.workflows.release_content import (
     collect_release_delta,
     derive_discord_from_bluesky,
     ensure_shas_present,
+    fetch_gallery_assets,
     generate_announcement_image,
     is_png_image,
     load_asset_inventory,
@@ -37,6 +39,66 @@ from dev_agents.workflows.release_content import (
     sync_asset_db,
     verify_draft_images,
 )
+
+
+def test_fetch_gallery_assets_parses_public_inventory_and_rejects_untrusted_urls(monkeypatch):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            payload = {
+                "groups": [
+                    {
+                        "items": [
+                            {
+                                "key": "og/a.jpg",
+                                "url": "https://assets.codexcryptica.com/og/a.jpg",
+                                "purpose": "A",
+                                "size": "2 KB",
+                            },
+                            {
+                                "key": "og/private.jpg",
+                                "url": "https://evil.example/og/private.jpg",
+                                "purpose": "Private",
+                            },
+                        ]
+                    }
+                ],
+                "silhouettes": [
+                    {
+                        "r2Path": "silhouettes/rogue.png",
+                        "url": "https://assets.codexcryptica.com/silhouettes/rogue.png?v=2",
+                        "name": "Rogue",
+                    }
+                ],
+            }
+            return (
+                '<script id="gallery-data" type="application/json">'
+                + json.dumps(payload)
+                + "</script>"
+            ).encode()
+
+    monkeypatch.setattr("dev_agents.workflows.release_content.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    assert fetch_gallery_assets() == [
+        {
+            "key": "og/a.jpg",
+            "url": "https://assets.codexcryptica.com/og/a.jpg",
+            "purpose": "A",
+            "size": "2 KB",
+        },
+        {
+            "key": "silhouettes/rogue.png",
+            "url": "https://assets.codexcryptica.com/silhouettes/rogue.png?v=2",
+            "purpose": "Rogue",
+            "size": "",
+        },
+    ]
 
 
 @pytest.mark.parametrize(

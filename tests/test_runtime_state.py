@@ -72,7 +72,7 @@ def test_state_repository_migrates_schema_and_enables_wal(tmp_path):
     assert record.metadata["_worker_identity"]["pid"] > 0
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
     assert connection.execute("SELECT status FROM delivery_claims").fetchone()[0] == "completed"
     events = store.list_run_events("workflow", "run-1")
     assert [event.event for event in events] == ["run_started", "run_completed"]
@@ -110,6 +110,27 @@ def test_pid_reuse_cannot_keep_an_abandoned_claim_running(tmp_path):
     store.update_run("pr-review", "run-1", metadata={"_worker_identity": identity})
     retry = store.claim_run("pr-review", "run-1")
     assert retry.claimed and retry.record.attempt == 2
+
+
+def test_state_repository_syncs_gallery_inventory_and_marks_stale_assets_inactive(tmp_path):
+    store = StateRepository(tmp_path / "state.db", "demo", tmp_path / "repo")
+    first = [
+        {"key": "og/old.jpg", "url": "https://assets.codexcryptica.com/og/old.jpg", "purpose": "Old", "size": "10 KB"},
+        {"key": "announcements/new.png", "url": "https://assets.codexcryptica.com/announcements/new.png", "purpose": "New", "size": "20 KB"},
+    ]
+    assert store.sync_gallery_assets(first) == 2
+    assert [asset.key for asset in store.list_gallery_assets()] == [
+        "announcements/new.png",
+        "og/old.jpg",
+    ]
+
+    store.sync_gallery_assets([first[1]])
+    assert [asset.key for asset in store.list_gallery_assets()] == ["announcements/new.png"]
+    store.sync_gallery_assets(first)
+    assert [asset.key for asset in store.list_gallery_assets()] == [
+        "announcements/new.png",
+        "og/old.jpg",
+    ]
 
 
 def test_state_repository_records_publication_receipts(tmp_path):

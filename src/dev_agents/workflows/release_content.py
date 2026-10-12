@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Collection
 from dataclasses import dataclass, field
@@ -602,6 +603,80 @@ def sync_asset_db(
             text = text[:following].rstrip("\n") + "\n" + block + text[following:]
     path.write_text(text, encoding="utf-8")
     return [row.split("`")[1] for row in rows]
+
+
+def fetch_gallery_assets(
+    gallery_url: str = "https://assets.codexcryptica.com/gallery", timeout_seconds: float = 30
+) -> list[dict[str, str]]:
+    """Scrape the public, allowlisted gallery index into normalized asset rows."""
+    request = urllib.request.Request(
+        gallery_url,
+        headers={"User-Agent": "dev-agents-instagram-backfill/1.0", "Accept": "text/html"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"gallery returned HTTP {response.status}")
+        html = response.read().decode("utf-8")
+    match = re.search(
+        r'<script id="gallery-data" type="application/json">(.*?)</script>', html, re.DOTALL
+    )
+    if match is None:
+        raise ValueError("gallery response did not contain gallery-data")
+    payload = json.loads(match.group(1))
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(groups, list):
+        raise TypeError("gallery-data has no groups list")
+
+    assets: dict[str, dict[str, str]] = {}
+    for group in groups:
+        items = group.get("items") if isinstance(group, dict) else None
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", "")).strip()
+            url = str(item.get("url", "")).strip()
+            parsed = urllib.parse.urlsplit(url)
+            if (
+                not key
+                or not url
+                or parsed.scheme != "https"
+                or parsed.hostname != "assets.codexcryptica.com"
+                or parsed.path.lstrip("/") != key
+            ):
+                continue
+            assets[key] = {
+                "key": key,
+                "url": url,
+                "purpose": str(item.get("purpose", "")).strip() or key,
+                "size": str(item.get("size", "")).strip(),
+            }
+    silhouettes = payload.get("silhouettes", []) if isinstance(payload, dict) else []
+    if isinstance(silhouettes, list):
+        for item in silhouettes:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("r2Path", "")).strip()
+            url = str(item.get("url", "")).strip()
+            parsed = urllib.parse.urlsplit(url)
+            if (
+                not key
+                or not url
+                or parsed.scheme != "https"
+                or parsed.hostname != "assets.codexcryptica.com"
+                or parsed.path.lstrip("/") != key
+            ):
+                continue
+            assets[key] = {
+                "key": key,
+                "url": url,
+                "purpose": str(item.get("name", "")).strip() or key,
+                "size": "",
+            }
+    if not assets:
+        raise ValueError("gallery-data contained no usable image assets")
+    return [assets[key] for key in sorted(assets)]
 
 
 def is_png_image(path: Path) -> bool:

@@ -1046,7 +1046,13 @@ def publish_release_drafts(
             if "instagram" in recommended_channels and publication_key("instagram", "instagram", page_url) not in already_published:
                 try:
                     caption_source = str((instagram_draft or draft or {}).get("text", ""))
-                    receipt = publish_instagram(caption=prepare_bluesky_text(caption_source, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
+                    caption = (
+                        caption_source
+                        if instagram_draft is not None
+                        and instagram_draft.get("galleryAsset") == "true"
+                        else prepare_bluesky_text(caption_source, page_url)
+                    )
+                    receipt = publish_instagram(caption=caption, page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
                     record_receipt(receipt)
                     result["instagram"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001

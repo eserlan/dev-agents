@@ -16,6 +16,7 @@ import json
 import os
 import random
 import time
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -56,6 +57,7 @@ from dev_agents.workflows.release_content import (
     WriterResult,
     collect_content_image_posts,
     ensure_shas_present,
+    fetch_gallery_assets,
 )
 
 
@@ -725,7 +727,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                 continue
             last_attempt_slot = slot
 
-            def run_backfill(run_id: str = run_id) -> None:
+            def run_backfill(run_id: str = run_id, slot: int = slot) -> None:
                 try:
                     # Recheck just before publishing in case a live deploy post
                     # arrived while the backfill worker was fetching production.
@@ -751,7 +753,13 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                         ".sha",
                     )
                     ensure_shas_present(project.repo, production_sha)
-                    candidates = collect_content_image_posts(
+                    try:
+                        gallery_count = claims.sync_gallery_assets(fetch_gallery_assets())
+                        _log(f"instagram-image-backfill gallery-synced assets={gallery_count}")
+                    except Exception as error:  # noqa: BLE001 - use last durable inventory
+                        _log(f"instagram-image-backfill gallery-refresh-failed: {error}")
+                    gallery = claims.list_gallery_assets()
+                    content_images = collect_content_image_posts(
                         project.repo, production_sha, None, include_all=True
                     )
                     posted_pages = {
@@ -759,19 +767,51 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                         for record in current_history
                         if record.status in ("published", "staged")
                     }
-                    candidate = next(
-                        (
-                            item
-                            for item in candidates
-                            if item["pageUrl"] not in posted_pages
-                        ),
-                        None,
+                    posted_content_images = {
+                        item["image"]
+                        for item in content_images
+                        if item["pageUrl"] in posted_pages
+                    }
+                    used_asset_keys: set[str] = set()
+                    failed_asset_keys: set[str] = set()
+                    for record in current_history:
+                        key = urllib.parse.parse_qs(
+                            urllib.parse.urlsplit(record.page_url).query
+                        ).get("asset", [""])[0]
+                        if key and record.status in ("published", "staged"):
+                            used_asset_keys.add(key)
+                        elif key and record.status == "failed":
+                            failed_asset_keys.add(key)
+                    available = [
+                        asset
+                        for asset in gallery
+                        if asset.key not in used_asset_keys
+                        and asset.url not in posted_content_images
+                    ]
+                    # A failed asset should not block the queue while other gallery
+                    # images remain. Retry failed assets after exhausting fresh ones.
+                    fresh = [asset for asset in available if asset.key not in failed_asset_keys]
+                    pool = fresh or available
+                    selected = pool[slot % len(pool)] if pool else None
+                    candidate = (
+                        {
+                            "text": (
+                                f"From the Codex Cryptica art gallery: {selected.purpose}. "
+                                "Explore more at https://codexcryptica.com"
+                            ),
+                            "pageUrl": "https://assets.codexcryptica.com/gallery?asset="
+                            + urllib.parse.quote(selected.key, safe=""),
+                            "image": selected.url,
+                            "galleryAsset": "true",
+                        }
+                        if selected is not None
+                        else None
                     )
                     if candidate is None:
                         claims.complete_run(
                             "instagram-image-backfill",
                             run_id,
-                            metadata={"completed": "no-unpublished-content-images"},
+                            metadata={"completed": "no-unpublished-gallery-images"},
                         )
                         return
 

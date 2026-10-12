@@ -102,7 +102,7 @@ class ContentQueueConfig(BaseModel):
 
 
 class InstagramImageBackfillConfig(BaseModel):
-    """Paced publishing of existing article and answer cover images."""
+    """Paced publishing of images from the public asset gallery."""
 
     model_config = ConfigDict(frozen=True)
 
