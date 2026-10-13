@@ -38,6 +38,7 @@ from .audit import (
     compare_reference_comments,
     parse_audit_report,
 )
+from .claims import repair_claim
 from .comments import (
     _auto_pause_body,
     _external_agent_pause_body,
@@ -54,7 +55,6 @@ from .github_ops import (
     _external_agent_commit,
     _has_copilot_review,
     _is_issue_fix_pr,
-    _review_handoff_agent,
     _review_is_due,
 )
 from .local_state import _load_state, _state_path
@@ -469,11 +469,41 @@ class PrFixerService:
             if review_only
             else f"pr-{number}-{head_sha}-{fingerprint}"
         )
+        previous = self.state.get_run(workflow, run_id)
+        pending = previous.metadata if previous and previous.metadata.get("repair_pending") else {}
+        if pending:
+            now = time.time()
+            opened = float(pending["repair_opened_at"])
+            claim_info = pending.get("repair_claim")
+            if not claim_info:
+                slug = _pkg.repository_slug(self.project.repo)
+                try:
+                    pages = json.loads(_pkg._run(self.project.repo, "gh", "api", "--paginate",
+                                                "--slurp", f"repos/{slug}/issues/{number}/comments"))
+                    claim_info = repair_claim([c for page in pages for c in page], run_id,
+                                              opened, self.config.review_claim_window_seconds)
+                except (RuntimeError, ValueError, TypeError):
+                    # Cannot establish ownership: retry on reconciliation instead of racing.
+                    return {"meta": meta, "keys": keys, "skip": True}
+                if claim_info:
+                    self.state.update_run(workflow, run_id, metadata={"repair_claim": claim_info})
+                    pending = {**pending, "repair_claim": claim_info}
+                    self.state.record_event(workflow, run_id, "fixer", "repair_claimed", metadata=claim_info)
+                    _pkg._publish_pr_run_comment(
+                        self.project.repo, number, run_id, "repair-claimed",
+                        f"### 🤖 Repair claimed by {claim_info['login']}\n\n"
+                        "Dev-agents will wait for a push. If none arrives within 30 minutes of "
+                        "the claim, its fixer will resume.\n",
+                    )
+            until = float(claim_info["expires_at"]) if claim_info else opened + self.config.review_claim_window_seconds
+            if now < until:
+                return {"meta": meta, "keys": keys, "skip": True}
         review_skill_path, _ = _review_skill(self.project.repo)
         claim = self.state.claim_run(
             workflow,
             run_id,
             metadata={
+                **pending,
                 "pull_request": number,
                 "head_sha": head_sha,
                 "feedback": keys,
@@ -697,6 +727,10 @@ A follow-up comment will report the outcome.
             return {"started": False}
         number = state["number"]
         workflow = state.get("workflow", "pr-fixer")
+        if state.get("review_only") and state.get("report", {}).get("repair_pending"):
+            self.state.update_run(workflow, state["run_id"], status="waiting",
+                                    metadata={"repair_pending": True})
+            return {"started": False}
         if state.get("review_only"):
             superseded_head = state.get("report", {}).get("superseded_by")
             if superseded_head:
@@ -1079,16 +1113,22 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                 self.state.record_event("pr-review", run_id, "auditor", "audit_failed", status="failed", metadata=failure)
                             return AgentResult(1, timed_out)
 
-                        audit_result = run_agent(
-                            PR_FIX_PROVIDER, prompt, cwd=worktree,
-                            log_path=log.with_suffix(".audit.log"),
-                            timeout_seconds=self.config.timeout_minutes * 60,
-                            heartbeat_seconds=self.config.heartbeat_seconds,
-                            reasoning_effort=self.config.reasoning_effort, model=self.config.model,
-                            on_progress=on_progress, cancel_event=self.cancel_events.get(number),
-                            last_message_path=audit_path, read_only=True,
-                            output_schema_path=schema_path,
-                        )
+                        saved = self.state.get_run("pr-review", run_id) if run_id else None
+                        resuming = bool(saved and saved.metadata.get("repair_pending"))
+                        if resuming and saved:
+                            audit_path.write_text(json.dumps(saved.metadata["audit_report"]))
+                            audit_result = AgentResult(0, False)
+                        else:
+                            audit_result = run_agent(
+                                PR_FIX_PROVIDER, prompt, cwd=worktree,
+                                log_path=log.with_suffix(".audit.log"),
+                                timeout_seconds=self.config.timeout_minutes * 60,
+                                heartbeat_seconds=self.config.heartbeat_seconds,
+                                reasoning_effort=self.config.reasoning_effort, model=self.config.model,
+                                on_progress=on_progress, cancel_event=self.cancel_events.get(number),
+                                last_message_path=audit_path, read_only=True,
+                                output_schema_path=schema_path,
+                            )
                         if audit_result.returncode != 0 or audit_result.timed_out:
                             return audit_failed("independent auditor did not complete", timed_out=audit_result.timed_out)
                         if (
@@ -1128,26 +1168,25 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             return audit_result
                         # Publish what the auditor found before any repair starts, so the PR shows
                         # the findings themselves rather than only that fixing is under way.
-                        if run_id and self.state.get_run("pr-review", run_id):
+                        opened_at = time.time()
+                        if not resuming and run_id and self.state.get_run("pr-review", run_id):
                             _pkg._publish_pr_run_comment(
                                 self.project.repo, number, run_id, "review-findings",
                                 _review_findings_body(
                                     number, run_id, audit.model_dump(),
                                     review_round=review_round, head_sha=original_head or None,
+                                    claim_window_seconds=self.config.review_claim_window_seconds,
                                 ),
                             )
-                        handoff_agent = _review_handoff_agent(meta or {}, self.config)
-                        if handoff_agent:
-                            # The PR's own agent repairs from the findings comment; a parallel
-                            # fixer here only races it (PR #4028). Its next push is re-reviewed.
-                            report["handoff_agent"] = handoff_agent
-                            _log(f"review-handoff pr={number} agent={handoff_agent} findings={len(audit.findings)}")
-                            if run_id and self.state.get_run("pr-review", run_id):
-                                self.state.record_event(
-                                    "pr-review", run_id, "fixer", "handed_off",
-                                    metadata={"agent": handoff_agent, "findings_count": len(audit.findings)},
-                                )
+                        if (not resuming and run_id and self.config.review_claim_window_seconds
+                                and self.state.get_run("pr-review", run_id)):
+                            self.state.update_run("pr-review", run_id, metadata={
+                                "repair_pending": True, "repair_opened_at": opened_at,
+                            })
+                            report["repair_pending"] = True
                             return audit_result
+                        if resuming and run_id:
+                            self.state.update_run("pr-review", run_id, metadata={"repair_pending": False})
                         # Do not hand findings to a writer after a concurrent push changed their
                         # source. Cancellation and normal final supersession handling still apply.
                         with repo_git_lock(self.project.repo):

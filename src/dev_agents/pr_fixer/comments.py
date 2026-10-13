@@ -231,6 +231,7 @@ def _review_findings_body(
     report_url: str | None = None,
     review_round: int = 0,
     head_sha: str | None = None,
+    claim_window_seconds: int = 60,
 ) -> str:
     scope = "independent audit" if review_round == 0 else "targeted post-fix verification"
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
@@ -252,6 +253,15 @@ def _review_findings_body(
 Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}:
 
 {_findings_markdown(report)}
+Dev-agents will fix these findings by default. An active external development process can
+claim this run within {claim_window_seconds} seconds by posting exactly:
+
+`/dev-agents claim {run_id}`
+
+Claims from repository owners, members or collaborators pause the fixer for up to 30 minutes.
+A push starts a fresh review; without a push, dev-agents resumes fixing. Attribution alone
+does not claim the work.
+
 {unverified_section}{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
 - Run: `{run_id}`
 {_report_line(report_url)}

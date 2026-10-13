@@ -36,13 +36,15 @@ def setup_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return origin, repo, head
 
 
-@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "handoff"])
+@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "claude_attributed", "claim_wait"])
 def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     origin, repo, head = setup_repository(tmp_path)
     service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
+        review_claim_window_seconds=60 if mode == "claim_wait" else 0,
         state_path=tmp_path / "state.db", worktree_dir=tmp_path / "worktrees", log_dir=tmp_path / "logs",
+        review_handoff_branch_prefixes=["claude/"] if mode == "handoff" else [],
     ))
-    run_id = "review-42"
+    run_id = f"pr-review-42-{head}"
     service.state.claim_run("pr-review", run_id, metadata={"pull_request": 42, "head_sha": head})
     comments: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -101,10 +103,16 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
 
     monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", agent)
     meta = {"headRefOid": head, **({"headRefName": "claude/feature"} if mode == "handoff" else {})}
+    if mode == "claude_attributed":
+        meta.update(headRefName="claude/feature", commits=[
+            {"authors": [{"login": "eserlan"}, {"login": "claude"}]},
+            {"authors": [{"login": "eserlan"}]},
+        ])
     succeeded, report = service._fix(42, "feature", [], review_only=True, meta=meta, run_id=run_id)
-    assert succeeded == (mode in {"clean", "findings", "incomplete_findings", "handoff"})
-    assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop"} else ["auditor"])
-    if mode == "findings":
+    assert succeeded == (mode in {"clean", "findings", "incomplete_findings", "claude_attributed", "claim_wait"})
+    assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop", "claude_attributed"} else ["auditor"])
+    if mode in {"findings", "claude_attributed"}:
+        assert "handoff_agent" not in report
         assert report["review_report"]["verdict"] == "findings"
         assert report["audit_report"]["findings"][0]["evidence"] == "The new branch bypasses validation"
         assert report["review_report"]["findings"][0]["evidence"] == "The new branch bypasses validation"
@@ -123,6 +131,45 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
     if mode == "incomplete_findings":
         assert "Not verified, needs a human check" in dict(comments)["review-findings"]
         assert "accessibility: Contrast tokens were not resolvable" in dict(comments)["review-findings"]
+    if mode == "claim_wait":
+        assert report["repair_pending"]
+        service._finalize({"number": 42, "claimed": True, "review_only": True,
+                           "workflow": "pr-review", "run_id": run_id, "report": report})
+        assert service.state.get_run("pr-review", run_id).status == "waiting"
+        opened = service.state.get_run("pr-review", run_id).metadata["repair_opened_at"]
+        meta.update(headRefName="feature", state="OPEN", baseRefName="staging",
+                    mergeable="MERGEABLE", labels=[], reviews=[], checks=[])
+        monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda *_args: (meta, []))
+        monkeypatch.setattr("dev_agents.pr_fixer.repository_slug", lambda *_args: "owner/repo")
+        original_run = __import__("dev_agents.pr_fixer", fromlist=["_run"])._run
+        monkeypatch.setattr("dev_agents.pr_fixer._run",
+                            lambda repo, *args, **kwargs: "[[]]" if args[:2] == ("gh", "api")
+                            else original_run(repo, *args, **kwargs))
+        monkeypatch.setattr("dev_agents.pr_fixer.service.time.time", lambda: opened + 59)
+        assert service._collect_feedback({"number": 42})["skip"]
+        from datetime import UTC, datetime
+        created = int(opened) + 10
+        claim_comment = {"id": 12, "body": f"/dev-agents claim {run_id}",
+                         "author_association": "OWNER", "user": {"login": "writer"},
+                         "created_at": datetime.fromtimestamp(created, UTC).isoformat()}
+        monkeypatch.setattr("dev_agents.pr_fixer._run",
+                            lambda repo, *args, **kwargs: json.dumps([[claim_comment]])
+                            if args[:2] == ("gh", "api") else original_run(repo, *args, **kwargs))
+        monkeypatch.setattr("dev_agents.pr_fixer.service.time.time", lambda: opened + 61)
+        assert service._collect_feedback({"number": 42})["skip"]
+        claimed = service.state.get_run("pr-review", run_id).metadata["repair_claim"]
+        assert claimed["login"] == "writer"
+        monkeypatch.setattr("dev_agents.pr_fixer.service.time.time", lambda: created + 1799)
+        assert service._collect_feedback({"number": 42})["skip"]
+        monkeypatch.setattr("dev_agents.pr_fixer.service.time.time", lambda: created + 1800)
+        collected = service._collect_feedback({"number": 42})
+        assert collected["claimed"]
+        # The saved audit is reused after the wait, including across service restarts.
+        succeeded, resumed = service._fix(42, "feature", [], review_only=True,
+                                          meta=meta, run_id=run_id)
+        assert succeeded and not resumed.get("repair_pending")
+        assert calls == ["auditor", "fixer"]
+        assert [phase for phase, _ in comments].count("review-findings") == 1
     if mode == "clean":
         assert "review-findings" not in [phase for phase, _body in comments]
     if mode == "stale":
@@ -200,14 +247,15 @@ def test_final_comments_explain_fix_pushes_and_supersession() -> None:
 def test_review_handoff_agent_matches_branch_prefix_or_commit_login() -> None:
     from dev_agents.pr_fixer.github_ops import _review_handoff_agent
 
-    config = PrFixerConfig()
+    config = PrFixerConfig(review_handoff_logins=["claude"], review_handoff_branch_prefixes=["claude/"])
     assert _review_handoff_agent({"headRefName": "claude/merchant-stock"}, config) == "claude"
     by_login = {"headRefName": "feature", "commits": [
         {"authors": [{"login": "eserlan"}]}, {"authors": [{"login": "claude"}]},
     ]}
     assert _review_handoff_agent(by_login, config) == "claude"
+    assert _review_handoff_agent(by_login, PrFixerConfig()) is None
     assert _review_handoff_agent({"headRefName": "feature", "commits": [{"authors": [{"login": "eserlan"}]}]}, config) is None
-    assert _review_handoff_agent({"headRefName": "claude/x"}, PrFixerConfig(review_handoff_branch_prefixes=[], review_handoff_logins=[])) is None
+    assert _review_handoff_agent({"headRefName": "claude/x"}, PrFixerConfig()) is None
 
 
 def test_final_comment_explains_handed_off_findings() -> None:

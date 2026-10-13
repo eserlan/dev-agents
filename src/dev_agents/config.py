@@ -185,11 +185,11 @@ class PrFixerConfig(BaseModel):
     pause_on_external_agent_commits: bool = True
     external_agent_logins: list[str] = ["google-labs-jules[bot]"]
     external_agent_resume_label: str = "dev-agents-resume"
-    # Agents that answer review comments on PRs they own, such as a Claude Code session following
-    # its PR. On those PRs dev-agents still audits and posts findings, but leaves the repairs to
-    # that agent instead of racing it with its own fixer. Its pushes then get a fresh review.
-    review_handoff_logins: list[str] = ["claude"]
-    review_handoff_branch_prefixes: list[str] = ["claude/"]
+    # External repairs require an explicit, expiring claim on the reviewed run.
+    review_claim_window_seconds: int = Field(default=60, ge=0)
+    # Retained for configuration compatibility; attribution no longer hands off repairs.
+    review_handoff_logins: list[str] = []
+    review_handoff_branch_prefixes: list[str] = []
     degodify_webhook_path: str = "/degodify"
     degodify_webhook_secret_env: str = "DEGODIFY_WEBHOOK_SECRET"
     # A full decomposition (dependency install, several extractions, tests, lint and a fallow
