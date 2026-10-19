@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 from threading import Event
+from uuid import uuid4
 
 from dev_agents.runtime.retention import remove_older_than
 
@@ -143,6 +144,76 @@ def provider_command(
     return [provider, "-p", prompt]
 
 
+class AgentCleanupError(RuntimeError):
+    """The run may still contain live processes; retain its worktree."""
+
+
+def _user_systemd_available() -> bool:
+    """Probe without exposing the manager's environment in logs."""
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _group_has_live_processes(pgid: int) -> bool:
+    """Ignore dead children awaiting reaping by their new parent on Linux."""
+    if Path("/proc/self/stat").exists():
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+                if int(fields[2]) == pgid and fields[0] not in {"Z", "X"}:
+                    return True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _stop_process_group(process: subprocess.Popen[str], grace_seconds: float = 5) -> None:
+    """Wait for the group, not just its leader, before escalating survivors."""
+    for stop_signal in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, stop_signal)
+        except ProcessLookupError:
+            break
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            process.poll()
+            if not _group_has_live_processes(process.pid):
+                process.wait()
+                return
+            time.sleep(0.05)
+    if _group_has_live_processes(process.pid):
+        raise AgentCleanupError(f"Agent process group {process.pid} did not stop")
+    process.wait()
+
+
+def _stop_scope(unit: str) -> None:
+    # stop waits for the cgroup, including descendants in separate sessions.
+    result = subprocess.run(
+        ["systemctl", "--user", "stop", unit],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=15, check=False,
+    )
+    if result.returncode:
+        state = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=LoadState", "--value"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if state.stdout.strip() != "not-found":
+            raise AgentCleanupError(f"Could not stop agent scope {unit}: {result.stderr.strip()}")
+
+
+
 def run_agent(
     provider: str,
     prompt: str,
@@ -173,6 +244,7 @@ def run_agent(
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\n=== agent started provider={provider} ===\n")
         stream.flush()
+        scope = f"dev-agents-run-{uuid4().hex}.scope" if _user_systemd_available() else None
         prompt_stream = None
         if provider == "codex":
             prompt_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")  # noqa: SIM115 - closed immediately after spawn in finally
@@ -193,6 +265,11 @@ def run_agent(
                 if provider != "codex":
                     raise ValueError("output_schema_path requires the Codex provider")
                 command.extend(["--output-schema", str(output_schema_path)])
+            if scope is not None:
+                command = [
+                    "systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    f"--unit={scope}", "--property=TimeoutStopSec=5s", "--", *command,
+                ]
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -210,34 +287,34 @@ def run_agent(
         deadline = start + timeout_seconds
         last_progress_at = start
         timed_out = False
-        while process.poll() is None:
-            if cancel_event is not None and cancel_event.is_set():
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                stream.write("=== agent cancelled: PR head advanced ===\n")
-                stream.flush()
-                break
-            now = time.monotonic()
-            remaining = deadline - now
-            if remaining <= 0:
-                timed_out = True
-                process.kill()
-                stream.write("=== agent timeout ===\n")
-                stream.flush()
-                break
-            time.sleep(min(heartbeat_seconds, remaining))
-            if process.poll() is None:
-                stream.write("=== agent heartbeat ===\n")
-                stream.flush()
+        try:
+            while process.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    stream.write("=== agent cancelled: PR head advanced ===\n")
+                    stream.flush()
+                    break
                 now = time.monotonic()
-                if on_progress is not None and now - last_progress_at >= progress_interval_seconds:
-                    last_progress_at = now
-                    on_progress(int(now - start))
+                remaining = deadline - now
+                if remaining <= 0:
+                    timed_out = True
+                    stream.write("=== agent timeout ===\n")
+                    stream.flush()
+                    break
+                time.sleep(min(heartbeat_seconds, remaining))
+                if process.poll() is None:
+                    stream.write("=== agent heartbeat ===\n")
+                    stream.flush()
+                    now = time.monotonic()
+                    if on_progress is not None and now - last_progress_at >= progress_interval_seconds:
+                        last_progress_at = now
+                        on_progress(int(now - start))
+        finally:
+            try:
+                if scope is not None:
+                    _stop_scope(scope)
+                _stop_process_group(process)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise AgentCleanupError("Could not confirm agent shutdown") from error
         returncode = process.wait()
         stream.write(f"=== agent finished exit={returncode} timed_out={timed_out} ===\n")
     sweep_agent_tmp()

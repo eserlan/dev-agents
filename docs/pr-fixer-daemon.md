@@ -307,3 +307,13 @@ deployment; changed content is limited to one public upload per hour and 24 uplo
 24 hours by default. Local report files still refresh immediately. A Vercel daily-quota response
 pauses further attempts for 24 hours. Configure
 the limits with `report_vercel_min_interval_seconds` and `report_vercel_max_deployments_24h`.
+
+
+Agent subprocesses run in individual transient user systemd scopes when the user
+manager is available. Cancellation, timeout, and normal completion stop all
+processes in that scope before releasing the worktree, including children that
+start separate sessions. systemd allows five seconds for termination before
+killing survivors. Outside systemd, cleanup waits for and escalates the original
+process group; children that detach into separate sessions are not covered by
+that fallback. If shutdown cannot be confirmed, the PR worktree is retained for
+inspection rather than removed. No service restart is performed by this change.

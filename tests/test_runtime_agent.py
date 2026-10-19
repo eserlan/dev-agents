@@ -211,3 +211,107 @@ def test_codex_final_message_is_separate_from_echoed_log(
     assert result.returncode == 0
     assert output.read_text() == "Final assessment"
     assert "Echoed prompt" in (tmp_path / "agent.log").read_text()
+
+
+@pytest.fixture(autouse=True)
+def disable_systemd_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dev_agents.runtime.agent._user_systemd_available", lambda: False)
+
+
+@pytest.mark.parametrize("use_scope", [False, True])
+@pytest.mark.parametrize("cancel", [True, False])
+def test_cancellation_and_timeout_kill_surviving_descendant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancel: bool, use_scope: bool,
+) -> None:
+    import signal
+    import sys
+    from threading import Event, Thread
+
+    if use_scope:
+        import subprocess
+
+        probe = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        if probe.returncode:
+            pytest.skip("user systemd manager unavailable")
+        monkeypatch.setattr("dev_agents.runtime.agent._user_systemd_available", lambda: True)
+
+    ready = tmp_path / "child.pid"
+    child = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{child!r}], start_new_session={use_scope!r}); time.sleep(60)"
+    )
+    monkeypatch.setattr(
+        "dev_agents.runtime.agent.provider_command",
+        lambda *_args, **_kwargs: [sys.executable, "-c", parent],
+    )
+    event = Event()
+
+    def trigger() -> None:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        if cancel:
+            event.set()
+
+    watcher = Thread(target=trigger)
+    watcher.start()
+    try:
+        result = run_agent(
+            "codex", "test", cwd=tmp_path, log_path=tmp_path / "agent.log",
+            timeout_seconds=10 if cancel else 1, heartbeat_seconds=.01,
+            cancel_event=event,
+        )
+        assert result.timed_out is (not cancel)
+        assert result.returncode != 0
+        child_pid = int(ready.read_text())
+        # A reparented child may remain a zombie until PID 1 reaps it.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stat = Path(f"/proc/{child_pid}/stat")
+            if not stat.exists() or stat.read_text().split(") ", 1)[1].startswith("Z"):
+                break
+            time.sleep(.01)
+        else:
+            pytest.fail("test descendant survived run_agent cleanup")
+    finally:
+        watcher.join()
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_scope_stop_accepts_a_collected_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from dev_agents.runtime.agent import _stop_scope
+
+    results = iter([
+        subprocess.CompletedProcess([], 5, stderr="Unit not loaded"),
+        subprocess.CompletedProcess([], 1, stdout="not-found\n"),
+    ])
+    monkeypatch.setattr("dev_agents.runtime.agent.subprocess.run", lambda *a, **kw: next(results))
+    _stop_scope("dev-agents-test.scope")
+
+
+def test_scope_stop_does_not_hide_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from dev_agents.runtime.agent import _stop_scope
+
+    results = iter([
+        subprocess.CompletedProcess([], 1, stderr="Access denied"),
+        subprocess.CompletedProcess([], 0, stdout="loaded\n"),
+    ])
+    monkeypatch.setattr("dev_agents.runtime.agent.subprocess.run", lambda *a, **kw: next(results))
+    with pytest.raises(RuntimeError, match="Access denied"):
+        _stop_scope("dev-agents-test.scope")

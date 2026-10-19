@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, Semaphore
 
+from dev_agents.runtime.agent import AgentCleanupError
+
 _repo_locks: dict[str, Lock] = {}
 _repo_locks_guard = Lock()
 _repo_semaphores: dict[str, Semaphore] = {}
@@ -81,7 +83,7 @@ def isolated_worktree(
 ) -> Iterator[tuple[Path, list[str]]]:
     """Yield a detached branch worktree and merge-base conflict paths.
 
-    The worktree is always force-removed on exit, including agent failures.
+    The worktree is force-removed on exit unless agent shutdown could not be confirmed.
     Blocks until fewer than `max_concurrent` worktrees are active for this repo
     (see `repo_worktree_semaphore`) -- held for the whole context, since the
     caller's agent run and validation build happen while still inside it.
@@ -92,6 +94,7 @@ def isolated_worktree(
     try:
         worktree = Path(tempfile.mkdtemp(prefix="pr-", dir=root))
         lock = repo_git_lock(repo)
+        retain_worktree = False
         try:
             with lock:
                 # A bare `git fetch origin <branch>` only populates FETCH_HEAD; it
@@ -132,8 +135,12 @@ def isolated_worktree(
             if merge.returncode != 0 and not conflicts:
                 raise RuntimeError(f"merge failed for base branch {base_branch}: {merge.stderr.strip()}")
             yield worktree, conflicts
+        except AgentCleanupError:
+            retain_worktree = True
+            raise
         finally:
-            with lock:
-                _run(repo, "git", "worktree", "remove", "--force", str(worktree), check=False)
+            if not retain_worktree:
+                with lock:
+                    _run(repo, "git", "worktree", "remove", "--force", str(worktree), check=False)
     finally:
         semaphore.release()

@@ -144,3 +144,21 @@ def test_isolated_worktree_sees_new_commits_pushed_between_calls(tmp_path: Path)
 
     assert second_head != first_head
     assert second_head == true_tip
+
+
+def test_isolated_worktree_retained_when_agent_shutdown_fails(tmp_path: Path) -> None:
+    import pytest
+
+    from dev_agents.runtime.agent import AgentCleanupError
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _init_origin_with_branch(origin, "feature")
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "clone", str(origin), str(checkout)], check=True, capture_output=True)
+    with (
+        pytest.raises(AgentCleanupError),
+        isolated_worktree(checkout, tmp_path / "worktrees", "feature", "main") as (worktree, _),
+    ):
+        raise AgentCleanupError("still running")
+    assert (worktree / "feature.txt").exists()
