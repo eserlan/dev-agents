@@ -48,7 +48,9 @@ the built-in skills as a fallback:
   token cost, muse falls back to programmatic drawing). The image prompt
   carries the shortform writer's per-draft `imageBrief` (the scene to draw)
   and `imageStyle`, which the writer picks to suit the subject from the target
-  checkout's `.social/image-styles.md` (one `- ` bullet per style). A style
+  checkout's `.social/image-styles.md` (one `- ` bullet per style; an optional
+  trailing `— suits: <genres/themes>` note guides the pick and is stripped
+  before the image prompt). A style
   that is missing or not copied exactly from the list falls back to a
   deterministic pick from the run ID and draft index. Without that file, or
   without a brief, the provider picks freely as before. Output is magic-byte

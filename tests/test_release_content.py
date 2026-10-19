@@ -943,8 +943,9 @@ def test_generate_announcement_image_prompt_carries_brief_and_style(
         run_id="7",
         timeout_seconds=60,
         brief="Overhead view of a cluttered GM table",
-        style="woodcut print",
+        style="Hearth-lit chiaroscuro — suits: taverns, intrigue",
     )
     assert "Overhead view of a cluttered GM table" in prompts[0]
-    assert "woodcut print" in prompts[0]
+    assert "Hearth-lit chiaroscuro" in prompts[0]
+    assert "suits:" not in prompts[0]
     assert "{brief}" not in prompts[0] and "{style}" not in prompts[0]

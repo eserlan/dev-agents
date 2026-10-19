@@ -43,10 +43,11 @@ Every post follows this arc, in order — don't skip parts:
    draft a clearly different scene. Leave the art style to `imageStyle` and
    never ask for words, UI text, or logos in the picture.
 7. **Image style** — every draft also gets `imageStyle`: copy one line exactly
-   from Image styles below, choosing the style whose mood best suits this
-   subject (e.g. a map feature suits cartography, a horror tool suits dark
-   painting). Prefer different styles across drafts in this batch. Leave it
-   empty when no styles are listed.
+   from Image styles below (including its `suits:` note), choosing the style
+   whose `suits:` note best matches this post's genre and theme (e.g. a
+   sci-fi feature never gets a fantasy-village look). Prefer different styles
+   across drafts in this batch when the fit is equally good. Leave it empty
+   when no styles are listed.
 
 Image styles (copy one exactly):
 {image_styles}

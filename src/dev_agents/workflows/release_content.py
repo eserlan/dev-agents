@@ -471,7 +471,8 @@ Visual style (follow it closely):
 {style}
 
 Constraints:
-- PNG format, landscape orientation, around 1600x1000 pixels.
+- PNG format, 16:9 landscape, around 1600x900 pixels.
+- Full-bleed, edge-to-edge composition: no borders, frames, mats, or panels.
 - Illustration or scene only: do NOT render any words, letters, numbers, logos,
   or watermarks in the image.
 - Reply with only DONE when the file is saved, or FAILED when it cannot be done.
@@ -758,7 +759,9 @@ def generate_announcement_image(
             "dest": str(dest),
             "subject": subject.strip() or "(no subject)",
             "brief": brief.strip() or "(none; choose a scene that fits the post)",
-            "style": style.strip() or "(none; choose a fitting style)",
+            # A trailing "— suits: ..." note guides the writer's pick, not the drawing.
+            "style": style.split("— suits:", 1)[0].strip(" —")
+            or "(none; choose a fitting style)",
         },
     )
     for index, provider in enumerate(providers):
