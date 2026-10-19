@@ -25,9 +25,11 @@ from dev_agents.workflows.release_content import (
     generate_announcement_image,
     is_png_image,
     load_asset_inventory,
+    load_image_styles,
     load_skill_prompt,
     parse_evaluator_result,
     parse_writer_result,
+    pick_image_style,
     prepare_bluesky_text,
     recommend_channels,
     render_template,
@@ -557,7 +559,10 @@ def test_merge_generates_art_for_missing_images(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "repo"
-    repo.mkdir()
+    (repo / ".social").mkdir(parents=True)
+    (repo / ".social/image-styles.md").write_text(
+        "- ink sketch\n- woodcut print\n", encoding="utf-8"
+    )
     project = ProjectConfig(
         repo=repo,
         github="owner/repo",
@@ -577,7 +582,15 @@ def test_merge_generates_art_for_missing_images(
     )
     monkeypatch.setattr(
         "dev_agents.workflows.release_comms.run_shortform_writer_pass",
-        lambda **kwargs: [{"pageUrl": "p", "text": "Hi", "image": "capture:/generators"}],
+        lambda **kwargs: [
+            {
+                "pageUrl": "p",
+                "text": "Hi",
+                "image": "capture:/generators",
+                "imageBrief": "A GM's hands rolling dice over a map",
+                "imageStyle": "woodcut print",
+            }
+        ],
     )
     monkeypatch.setattr(
         "dev_agents.workflows.release_comms.run_longform_writer_pass",
@@ -595,9 +608,12 @@ def test_merge_generates_art_for_missing_images(
         lambda repo, statuses, purpose: [],
     )
     made: list[str] = []
+    art_requests: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "dev_agents.workflows.release_comms.generate_announcement_image",
-        lambda **kwargs: made.append(str(kwargs["dest"])) or kwargs["dest"],
+        lambda **kwargs: art_requests.append(kwargs)
+        or made.append(str(kwargs["dest"]))
+        or kwargs["dest"],
     )
     events: list[tuple[str, dict[str, Any]]] = []
     result = run_release_comms(
@@ -607,6 +623,8 @@ def test_merge_generates_art_for_missing_images(
     assert result.completed is True
     assert len(made) == 1
     assert made[0].endswith("gen-123-0.png")
+    assert art_requests[0]["brief"] == "A GM's hands rolling dice over a map"
+    assert art_requests[0]["style"] == "woodcut print"
     images = dict(events)["images"]
     assert images["capture_requested"] == "capture:/generators,capture:/generators"
     assert "generated" not in images
@@ -784,6 +802,8 @@ def test_shortform_prompt_includes_known_assets(
     db_dir = tmp_path / "docs" / "deployment"
     db_dir.mkdir(parents=True)
     (db_dir / "r2-asset-db.md").write_text("`announcements/hero-v1.png`", encoding="utf-8")
+    (tmp_path / ".social").mkdir()
+    (tmp_path / ".social/image-styles.md").write_text("- woodcut print\n", encoding="utf-8")
     seen: dict[str, str] = {}
     monkeypatch.setattr(
         "dev_agents.workflows.release_content.run_agent",
@@ -799,6 +819,8 @@ def test_shortform_prompt_includes_known_assets(
         timeout_seconds=60,
     )
     assert "announcements/hero-v1.png" in seen["prompt"]
+    assert "- woodcut print" in seen["prompt"]
+    assert "{image_styles}" not in seen["prompt"]
 
 
 def test_is_png_image_checks_magic_bytes(tmp_path: Path) -> None:
@@ -860,3 +882,69 @@ def test_generate_announcement_image_returns_none_when_all_fail(
         is None
     )
     assert not dest.exists()
+
+
+def test_parse_writer_result_keeps_image_brief_only_when_given() -> None:
+    result = parse_writer_result(
+        {
+            "bluesky": [
+                {"pageUrl": "p", "text": "One", "image": "", "imageBrief": " A lantern-lit map "},
+                {"pageUrl": "q", "text": "Two", "image": "", "imageBrief": "  "},
+            ]
+        }
+    )
+    assert result is not None
+    assert result.bluesky[0]["imageBrief"] == "A lantern-lit map"
+    assert "imageBrief" not in result.bluesky[1]
+
+
+def test_load_image_styles_reads_bullets_and_tolerates_missing_file(tmp_path: Path) -> None:
+    assert load_image_styles(tmp_path) == []
+    (tmp_path / ".social").mkdir()
+    (tmp_path / ".social/image-styles.md").write_text(
+        "# Styles\n\nIntro text.\n- ink sketch\n- \n- painted map, warm light\n",
+        encoding="utf-8",
+    )
+    assert load_image_styles(tmp_path) == ["ink sketch", "painted map, warm light"]
+
+
+def test_pick_image_style_is_deterministic_and_varies_by_seed() -> None:
+    styles = [f"style {n}" for n in range(8)]
+    assert pick_image_style([], "run:0") == ""
+    assert pick_image_style(styles, "run:0") == pick_image_style(styles, "run:0")
+    assert len({pick_image_style(styles, f"run-{n}:0") for n in range(40)}) > 1
+
+
+def test_pick_image_style_prefers_listed_writer_choice() -> None:
+    styles = ["ink sketch", "woodcut print"]
+    assert pick_image_style(styles, "run:0", " woodcut print ") == "woodcut print"
+    assert pick_image_style(styles, "run:0", "neon cyberpunk") in styles
+    assert pick_image_style([], "run:0", "woodcut print") == ""
+
+
+def test_generate_announcement_image_prompt_carries_brief_and_style(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prompts: list[str] = []
+    dest = tmp_path / "art.png"
+
+    def fake(provider: str, prompt: str, **kwargs: Any) -> AgentResult:
+        prompts.append(prompt)
+        dest.write_bytes(PNG_MAGIC + b"\x00")
+        return AgentResult(returncode=0, timed_out=False)
+
+    monkeypatch.setattr("dev_agents.workflows.release_content.run_agent", fake)
+    generate_announcement_image(
+        repo=tmp_path,
+        subject="dice",
+        dest=dest,
+        providers=["agy"],
+        log_dir=tmp_path,
+        run_id="7",
+        timeout_seconds=60,
+        brief="Overhead view of a cluttered GM table",
+        style="woodcut print",
+    )
+    assert "Overhead view of a cluttered GM table" in prompts[0]
+    assert "woodcut print" in prompts[0]
+    assert "{brief}" not in prompts[0] and "{style}" not in prompts[0]

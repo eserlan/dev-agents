@@ -22,7 +22,7 @@ Already posted in the last two weeks (page, channels, what was said):
 Do not reuse the opening, phrasing, or angle of anything above, and do not
 write about a feature that appears there; it has already been announced.
 
-Every post follows this four-part arc, in order — don't skip parts:
+Every post follows this arc, in order — don't skip parts:
 1. **Need / problem** — open with the campaign or worldbuilding itch, not the
    feature name.
 2. **So I built…** — the feature as the direct response to that need.
@@ -35,6 +35,21 @@ Every post follows this four-part arc, in order — don't skip parts:
    Known assets below that actually shows the feature. When no existing asset
    fits, write `capture:<pageUrl>` to request a fresh screenshot instead of
    guessing a key that may not exist.
+6. **Image brief** — every draft also gets `imageBrief`: one or two sentences
+   of art direction, used only if fresh art has to be drawn. Describe one
+   concrete scene that shows this post's idea: the subject, where it is, how
+   it is framed (close-up, overhead, wide), and the mood or lighting. Make it
+   specific to this feature, not a generic fantasy tableau, and give each
+   draft a clearly different scene. Leave the art style to `imageStyle` and
+   never ask for words, UI text, or logos in the picture.
+7. **Image style** — every draft also gets `imageStyle`: copy one line exactly
+   from Image styles below, choosing the style whose mood best suits this
+   subject (e.g. a map feature suits cartography, a horror tool suits dark
+   painting). Prefer different styles across drafts in this batch. Leave it
+   empty when no styles are listed.
+
+Image styles (copy one exactly):
+{image_styles}
 
 Known assets (exact R2 keys — reuse one when it fits):
 {known_assets}
@@ -63,5 +78,5 @@ Voice rules:
   fit 300 characters.
 
 Respond with ONLY a fenced ```json block shaped like:
-{"bluesky": [{"pageUrl": "<url or empty>", "text": "<post>", "image": "<R2 key or capture:<pageUrl>>"}]}
+{"bluesky": [{"pageUrl": "<url or empty>", "text": "<post>", "image": "<R2 key or capture:<pageUrl>>", "imageBrief": "<scene for fresh art>", "imageStyle": "<one line from Image styles>"}]}
 No other prose.

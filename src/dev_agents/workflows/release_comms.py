@@ -25,8 +25,10 @@ from dev_agents.workflows.release_content import (
     collect_release_delta,
     extract_json_block,
     generate_announcement_image,
+    load_image_styles,
     parse_evaluator_result,
     parse_writer_result,
+    pick_image_style,
     recommend_channels,
     run_evaluator_pass,
     run_longform_writer_pass,
@@ -379,6 +381,7 @@ def build_release_comms_workflow() -> Any:
         stem = "".join(
             char if char.isalnum() or char in "-_" else "-" for char in state["promote_run_id"]
         )
+        styles = load_image_styles(state["repo"])
         generated: list[tuple[str, str, Path]] = []
         seen_pages: set[str] = set()
         for index, (draft, status) in enumerate(zip(drafts, statuses)):
@@ -392,6 +395,10 @@ def build_release_comms_workflow() -> Any:
             made = generate_announcement_image(
                 repo=state["repo"],
                 subject=f"{draft.get('pageUrl', '')}\n{draft.get('text') or draft.get('body', '')}",
+                brief=draft.get("imageBrief", ""),
+                style=pick_image_style(
+                    styles, f"{state['promote_run_id']}:{index}", draft.get("imageStyle", "")
+                ),
                 dest=art_dir / f"gen-{stem}-{index}.png",
                 providers=state["config"].image_providers,
                 log_dir=local_log_dir(state),

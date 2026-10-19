@@ -7,6 +7,7 @@ built-in fallbacks, so target repositories keep their own voice.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -346,6 +347,20 @@ def _clean_internal_note(value: Any) -> str:
     return note
 
 
+def _bluesky_draft(item: dict[str, Any]) -> dict[str, str]:
+    draft = {
+        "pageUrl": str(item.get("pageUrl", "")),
+        "text": str(item.get("text", "")),
+        "image": str(item.get("image", "")).strip(),
+    }
+    # Art direction only feeds image generation; keep it out of drafts that lack it.
+    for key in ("imageBrief", "imageStyle"):
+        value = str(item.get(key, "")).strip()
+        if value:
+            draft[key] = value
+    return draft
+
+
 def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
     """Validate a writer JSON payload; None when unusable."""
     if not isinstance(data, dict):
@@ -389,11 +404,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
             discussion_drafts.append(discussion)
     return WriterResult(
         bluesky=[
-            {
-                "pageUrl": str(item.get("pageUrl", "")),
-                "text": str(item.get("text", "")),
-                "image": str(item.get("image", "")).strip(),
-            }
+            _bluesky_draft(item)
             for item in bluesky
             if isinstance(item, dict) and str(item.get("text", "")).strip()
         ]
@@ -443,6 +454,7 @@ def derive_discord_from_bluesky(texts: list[str]) -> str:
 ASSET_CDN_BASE_URL = "https://assets.codexcryptica.com"
 ASSET_DB_RELATIVE_PATH = Path("docs/deployment/r2-asset-db.md")
 ASSET_DB_SECTION = "## `announcements/`"
+IMAGE_STYLES_RELATIVE_PATH = Path(".social/image-styles.md")
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 IMAGE_PROMPT_TEMPLATE = """\
@@ -451,6 +463,12 @@ file to exactly this path: {dest}
 
 Post copy (subject matter, not text to render):
 {subject}
+
+Art direction (the scene to draw):
+{brief}
+
+Visual style (follow it closely):
+{style}
 
 Constraints:
 - PNG format, landscape orientation, around 1600x1000 pixels.
@@ -514,6 +532,34 @@ def load_asset_inventory(
         text,
     )
     return sorted(set(keys))
+
+
+def load_image_styles(
+    repo: Path, *, styles_relative_path: Path = IMAGE_STYLES_RELATIVE_PATH
+) -> list[str]:
+    """List the target checkout's art styles, one per ``- `` bullet (best effort)."""
+    try:
+        text = (repo / styles_relative_path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [
+        line[2:].strip()
+        for line in text.splitlines()
+        if line.startswith("- ") and line[2:].strip()
+    ]
+
+
+def pick_image_style(styles: list[str], seed: str, chosen: str = "") -> str:
+    """Use the writer's ``chosen`` style when it is listed, else pick from ``seed``.
+
+    The seeded fallback is deterministic so reruns redraw the same look.
+    """
+    if chosen.strip() in styles:
+        return chosen.strip()
+    if not styles:
+        return ""
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return styles[int.from_bytes(digest[:4], "big") % len(styles)]
 
 
 def verify_draft_images(
@@ -697,6 +743,8 @@ def generate_announcement_image(
     log_dir: Path,
     run_id: str,
     timeout_seconds: float,
+    brief: str = "",
+    style: str = "",
 ) -> Path | None:
     """Generate announcement art with the first provider that delivers a PNG.
 
@@ -705,7 +753,13 @@ def generate_announcement_image(
     destination path on success, None when every provider fails.
     """
     prompt = render_template(
-        IMAGE_PROMPT_TEMPLATE, {"dest": str(dest), "subject": subject.strip() or "(no subject)"}
+        IMAGE_PROMPT_TEMPLATE,
+        {
+            "dest": str(dest),
+            "subject": subject.strip() or "(no subject)",
+            "brief": brief.strip() or "(none; choose a scene that fits the post)",
+            "style": style.strip() or "(none; choose a fitting style)",
+        },
     )
     for index, provider in enumerate(providers):
         dest.unlink(missing_ok=True)
@@ -875,6 +929,8 @@ def run_shortform_writer_pass(
     context = _writer_context(evaluator, delta, recent_posts)
     known = load_asset_inventory(repo)
     context["known_assets"] = "\n".join(f"- {key}" for key in known) or "(none listed)"
+    styles = load_image_styles(repo)
+    context["image_styles"] = "\n".join(f"- {style}" for style in styles) or "(none listed)"
     prompt = render_template(load_skill_prompt("release-shortform"), context)
     output = _run_pass(
         repo=repo,

@@ -45,7 +45,13 @@ the built-in skills as a fallback:
   merge (skipped entirely when every asset resolves or the flag is off) and
   generates art in-provider order (`image_providers`, default
   `agy → codex → muse`; verified live: agy draws natively, codex draws at high
-  token cost, muse falls back to programmatic drawing). Output is magic-byte
+  token cost, muse falls back to programmatic drawing). The image prompt
+  carries the shortform writer's per-draft `imageBrief` (the scene to draw)
+  and `imageStyle`, which the writer picks to suit the subject from the target
+  checkout's `.social/image-styles.md` (one `- ` bullet per style). A style
+  that is missing or not copied exactly from the list falls back to a
+  deterministic pick from the run ID and draft index. Without that file, or
+  without a brief, the provider picks freely as before. Output is magic-byte
   verified and staged under `<log_dir>/images/`. During an approved live run,
   generated PNGs are uploaded to R2 under `announcements/` and the public URL
   is carried into both Bluesky and GitHub Discussion delivery. Dry runs only
