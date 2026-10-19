@@ -254,7 +254,8 @@ Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}:
 
 {_findings_markdown(report)}
 Dev-agents will fix these findings by default. An active external development process can
-claim this run within {claim_window_seconds} seconds by posting exactly:
+claim this run before the fixer starts (it waits at least {claim_window_seconds} seconds) by
+posting exactly:
 
 `/dev-agents claim {run_id}`
 

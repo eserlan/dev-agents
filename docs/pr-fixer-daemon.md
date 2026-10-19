@@ -93,13 +93,14 @@ the feedback-fix claim. This means a no-op run created while checks are pending 
 later `check_run.completed` attempt. After `gh pr merge --auto --squash`, the daemon verifies that
 GitHub set `autoMergeRequest` (or merged the PR) and records the result.
 
-After posting findings, dev-agents waits `review_claim_window_seconds` (default 60) before
-repairing them. An active external process can post `/dev-agents claim <run-id>` as a standalone
-PR comment during that window. Only owners, members and collaborators can claim work. The first
+After posting findings, dev-agents waits at least `review_claim_window_seconds` (default 60)
+before repairing them. An active external process can post `/dev-agents claim <run-id>` as a
+standalone PR comment any time after the findings, until the repair actually starts; reconciliation
+may start it well after the window closes, and a claim posted before then still counts. Only owners, members and collaborators can claim work. The first
 valid claim pauses repairs until 30 minutes after the claim. Repeated comments do not renew it.
 If the head advances, the new revision gets a fresh review; otherwise reconciliation resumes
 the saved audit's repairs when the claim expires. Waiting survives restarts and releases the
-worktree. Reconciliation may start repairs slightly after the deadline. Set the window to zero
+worktree. Set the window to zero
 for immediate repairs. The old attribution-based handoff settings no longer control repairs.
 
 With `review_without_copilot: true` (the default), an open, non-draft PR targeting the configured
@@ -271,6 +272,7 @@ writer and use Codex with `gpt-6-luna` when Muse exits unsuccessfully or times o
 - label: answer
   kind: answer
   provider: muse
+  model: muse-wonder-1.0
   fallback_provider: codex
   fallback_model: gpt-6-luna
 ```

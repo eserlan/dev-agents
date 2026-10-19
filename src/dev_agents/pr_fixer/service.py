@@ -480,8 +480,7 @@ class PrFixerService:
                 try:
                     pages = json.loads(_pkg._run(self.project.repo, "gh", "api", "--paginate",
                                                 "--slurp", f"repos/{slug}/issues/{number}/comments"))
-                    claim_info = repair_claim([c for page in pages for c in page], run_id,
-                                              opened, self.config.review_claim_window_seconds)
+                    claim_info = repair_claim([c for page in pages for c in page], run_id, opened)
                 except (RuntimeError, ValueError, TypeError):
                     # Cannot establish ownership: retry on reconciliation instead of racing.
                     return {"meta": meta, "keys": keys, "skip": True}
