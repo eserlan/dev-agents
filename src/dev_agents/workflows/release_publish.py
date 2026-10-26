@@ -963,6 +963,12 @@ def publish_release_drafts(
     if not batches and drafts.get("discord"):
         batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None, None))
 
+    # Destinations come from a file on disk; read them once per run, not per batch.
+    discord_destination_ids = (
+        [str(destination.get("id", "main-community")) for destination in _discord_config(project.repo)]
+        if "discord" in recommended_channels and batches
+        else []
+    )
     for draft, discussion, thread, instagram_draft in batches:
         page_url = str((draft or instagram_draft or thread or discussion or {}).get("pageUrl", ""))
         from .release_coverage import feature_ids, message_id
@@ -991,9 +997,9 @@ def publish_release_drafts(
             )
         if "discord" in recommended_channels and draft is not None:
             pending = pending or any(
-                publication_key("discord", str(destination.get("id", "main-community")), page_url, active_message_id)
+                publication_key("discord", destination_id, page_url, active_message_id)
                 not in already_published
-                for destination in _discord_config(project.repo)
+                for destination_id in discord_destination_ids
             )
         if draft is None and discussion is None and thread is None and instagram_draft is None:
             pending = "discord" in recommended_channels and bool(drafts.get("discord"))
@@ -1104,9 +1110,9 @@ def publish_release_drafts(
                         env=env,
                         dry_run=dry_run,
                         page_url=page_url,
-                        skip_destinations={str(destination.get("id", "main-community"))
-                            for destination in _discord_config(project.repo)
-                            if publication_key("discord", str(destination.get("id", "main-community")),
+                        skip_destinations={
+                            destination_id for destination_id in discord_destination_ids
+                            if publication_key("discord", destination_id,
                                                page_url, active_message_id) in already_published},
                         on_receipt=record_receipt,
                     ):

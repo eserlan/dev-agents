@@ -227,25 +227,60 @@ class PrFixerService:
         graph.add_edge("finalize", END)
         return graph.compile()
 
-    def _review_plan(self, number: int, head_sha: str) -> dict[str, Any] | None:
-        """Select one initial review or the single follow-up allowed for a fixed head."""
+    def _human_authored_head(self, meta: dict[str, Any]) -> bool:
+        """Whether the PR head's latest commit was written only by people, not agents."""
+        commits = meta.get("commits")
+        latest = commits[-1] if isinstance(commits, list) and commits else None
+        authors = latest.get("authors") if isinstance(latest, dict) else None
+        if not isinstance(authors, list) or not authors:
+            return False
+        agents = {
+            login.strip().lower()
+            for login in (*self.config.external_agent_logins, *self.config.review_handoff_logins)
+            if login.strip()
+        }
+        logins = [
+            str(author.get("login") or "").strip().lower()
+            for author in authors
+            if isinstance(author, dict)
+        ]
+        return bool(logins) and all(
+            login and login not in agents and not login.endswith("[bot]") for login in logins
+        )
+
+    def _review_plan(
+        self, number: int, head_sha: str, *, human_head: bool = False
+    ) -> dict[str, Any] | None:
+        """Select one initial review or the single follow-up allowed for a fixed head.
+
+        A halt needs human adjudication. It holds for every head until a person pushes a
+        new commit of their own; agent pushes, including this workflow's own repairs, never
+        lift it.
+        """
         runs = [
             run
             for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
             if run.metadata.get("pull_request") == number
         ]
+        fresh_plan = {
+            "round": 0,
+            "scope": "full",
+            "chain_id": f"pr-review-{number}-{head_sha}",
+            "parent_run_id": None,
+            "parent_sha": None,
+            "prior_report": None,
+        }
         if not runs:
-            return {
-                "round": 0,
-                "scope": "full",
-                "chain_id": f"pr-review-{number}-{head_sha}",
-                "parent_run_id": None,
-                "parent_sha": None,
-                "prior_report": None,
-            }
+            return fresh_plan
 
-        if any(run.metadata.get("review_halted") for run in runs):
-            return None
+        halted = [run for run in runs if run.metadata.get("review_halted")]
+        if halted:
+            own = {sha for run in halted for sha in run.metadata.get("own_commits") or []}
+            halted_heads = {str(run.metadata.get("head_sha", "")) for run in halted}
+            if head_sha in halted_heads or head_sha in own or not human_head:
+                return None
+            if str(runs[0].metadata.get("head_sha", "")) != head_sha:
+                return fresh_plan
         latest = runs[0]
         metadata = latest.metadata
         try:
@@ -456,7 +491,9 @@ class PrFixerService:
                 legacy_handled = candidate_handled
                 self.state.mark_feedback_processed("pr-fixer", str(number), legacy_handled)
         unseen = self.state.unprocessed_feedback("pr-fixer", str(number), keys)
-        review_plan = self._review_plan(number, head_sha)
+        review_plan = self._review_plan(
+            number, head_sha, human_head=self._human_authored_head(meta)
+        )
         review_only = (
             self.config.review_without_copilot
             and not keys
@@ -733,7 +770,7 @@ A follow-up comment will report the outcome.
             self.state.update_run(workflow, state["run_id"], metadata={
                 "review_halted": report["review_halted"],
                 "review_report": report.get("review_report"), "review_report_valid": False,
-                "repair_pending": False,
+                "repair_pending": False, "own_commits": report.get("own_commits") or [],
             })
             _pkg._publish_pr_run_comment(
                 self.project.repo, number, state["run_id"], "review-halted",
@@ -1525,8 +1562,15 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
         validated. Treat that explicit clean chain result as covering the
         current head too.
         """
-        if any(run.metadata.get("review_halted") for run in
-               self.state.list_runs("pr-review", limit=None, pull_request=number)):
+        halted = [
+            run
+            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
+            if run.metadata.get("review_halted")
+        ]
+        if any(
+            run.metadata.get("head_sha") == head_sha or head_sha in (run.metadata.get("own_commits") or [])
+            for run in halted
+        ):
             return False
         review_run = self.state.load_run("pr-review", f"pr-review-{number}-{head_sha}")
         if review_run is not None and review_run.status == "completed":

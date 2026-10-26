@@ -138,6 +138,13 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert service.state.get_run("pr-review", run_id).status == "completed"
         restarted = PrFixerService("demo", service.project, service.config)
         assert restarted._review_plan(42, "another-bot-head") is None
+        # Only a person's own push lifts the halt; the fixer's own commits never do.
+        human_plan = restarted._review_plan(42, "human-fix-head", human_head=True)
+        assert human_plan is not None and human_plan["scope"] == "full"
+        assert restarted._human_authored_head({"commits": [{"authors": [{"login": "eserlan"}]}]})
+        assert not restarted._human_authored_head(
+            {"commits": [{"authors": [{"login": "eserlan"}, {"login": "copilot[bot]"}]}]}
+        )
         assert "review-halted" in dict(comments)
         assert not service._has_completed_internal_review(42, head)
     if mode in {"findings", "claude_attributed"}:

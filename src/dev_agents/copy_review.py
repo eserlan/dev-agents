@@ -31,6 +31,9 @@ class EditorialFinding(BaseModel):
     evidence: str = Field(min_length=1, validation_alias=AliasChoices("evidence", "quoted_evidence"))
     reader_impact: str = Field(min_length=1)
     proposed_fix: str = Field(min_length=1, validation_alias=AliasChoices("proposed_fix", "actionable_fix"))
+    # Structured replacement for guessing from the free-text category; when the
+    # reviewer omits it the category heuristic below remains the fallback.
+    factual: bool | None = None
 
     @field_validator("evidence", mode="before")
     @classmethod
@@ -227,6 +230,8 @@ technical checks actually performed in checks_performed and inaccessible present
 Each findings entry must use exactly these fields: severity (blocking or suggestion), category,
 location (source path and passage), evidence (a string containing relevant quotations),
 reader_impact, and proposed_fix. All six fields are required and must be non-empty strings.
+Add an optional boolean factual: true when the finding is a factual, rules or product-accuracy
+error (capping the score at 7.0), false for any other kind of finding.
 {{"score":8.0,"verdict":"clean","overall_assessment":"Concise, realistic assessment",
 "what_works":["Strong concepts to preserve"],"most_important_improvement":"Largest useful change, or none",
 "findings":[],"checks_performed":["Actual checks and evidence"],"limitations":[],
@@ -288,9 +293,10 @@ def _parse_assessment(
         caps = [7.9]
         factual_terms = ("factual", "accuracy", "correctness", "product", "mechanic", "rules")
         if any(
-            term in finding.category.lower()
+            finding.factual
+            if finding.factual is not None
+            else any(term in finding.category.lower() for term in factual_terms)
             for finding in blockers
-            for term in factual_terms
         ):
             caps.append(7.0)
         if any(check.status == "blocking" for check in checks):
@@ -383,6 +389,8 @@ and existing_issue_url null: publication is the caller's decision, not yours.
 Each findings entry must use exactly these fields: severity (blocking or suggestion), category,
 location (source path and passage), evidence (a string containing relevant quotations),
 reader_impact, and proposed_fix. All six fields are required and must be non-empty strings.
+Add an optional boolean factual: true when the finding is a factual, rules or product-accuracy
+error (capping the score at 7.0), false for any other kind of finding.
 {{"score":8.0,"verdict":"clean","overall_assessment":"Concise, realistic assessment",
 "what_works":["Strong concepts to preserve"],"most_important_improvement":"Largest useful change, or none",
 "findings":[],"checks_performed":["Actual checks and evidence"],"limitations":[],

@@ -410,7 +410,7 @@ def test_pre_pr_loop_keeps_revising_below_threshold_until_the_gate_passes(
         "dev_agents.issue_fixer.run_agent",
         lambda *_a, **_k: revisions.append("ran") or AgentResult(0, False),
     )
-    rounds: list[tuple[int, float, str, int]] = []
+    rounds: list[tuple[int, float, str, int, bool]] = []
     kwargs = _review_kwargs(tmp_path)
     kwargs["on_round"] = lambda *args: rounds.append(args)  # type: ignore[assignment]
 
@@ -421,9 +421,9 @@ def test_pre_pr_loop_keeps_revising_below_threshold_until_the_gate_passes(
     assert "round 1: score 7.0/10" in note and "round 3: score 9.0/10" in note
     assert len(revisions) == 2
     assert rounds == [
-        (1, 7.0, "changes_required", 1),
-        (2, 8.0, "clean", 0),
-        (3, 9.0, "clean", 0),
+        (1, 7.0, "changes_required", 1, True),
+        (2, 8.0, "clean", 0, True),
+        (3, 9.0, "clean", 0, False),
     ]
 
 
@@ -698,3 +698,20 @@ def test_a_retry_does_not_repost_the_started_comment(
     comments.clear()
     service._remediate({**base, "attempt": 7})  # type: ignore[arg-type]
     assert comments == []
+
+
+def test_pre_pr_gate_requires_a_clean_verdict_even_without_blockers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path)
+    monkeypatch.setattr("dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts")
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.review_answer_draft",
+        lambda *_a, **_k: _assessment("needs_human_review", score=9.0),
+    )
+
+    note, still_fixed = service._pre_pr_answer_review(**_review_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "passed the score gate" not in note
+    assert "needs_human_review" in note

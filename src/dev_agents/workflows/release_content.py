@@ -1012,19 +1012,33 @@ def run_threads_adaptation_pass(
 
     # The adaptation may change wording, but it cannot invent, drop, or retarget
     # release links and artwork. Match every returned post to the source draft.
-    by_url = {item.get("pageUrl", ""): item for item in base_drafts}
+    def ids(draft: dict[str, str]) -> set[str]:
+        return {part for part in str(draft.get("featureIds", "")).split(",") if part}
+
     adapted: list[dict[str, str]] = []
+    used: set[int] = set()
     for index, item in enumerate(result.threads):
-        source = next((draft for draft in base_drafts if item.get("featureIds")
-                       and draft.get("featureIds") == item.get("featureIds")), None)
-        if source is None and any(draft.get("featureIds") for draft in base_drafts):
-            raise RuntimeError(f"Threads adaptation omitted or changed featureIds for run {run_id}")
-        if source is None:
-            source = by_url.get(item.get("pageUrl", ""))
-        if source is None and index < len(base_drafts):
-            source = base_drafts[index]
-        if source is None:
+        unused = [(n, draft) for n, draft in enumerate(base_drafts) if n not in used]
+        item_ids = ids(item)
+        # Exact featureIds first, then the best overlap, so a post that merged or
+        # added an id still reaches its source. Each source draft is used once.
+        match = next((pair for pair in unused if item_ids and ids(pair[1]) == item_ids), None)
+        if match is None and item_ids:
+            overlap = [(len(ids(pair[1]) & item_ids), pair) for pair in unused]
+            best = max(overlap, key=lambda entry: entry[0], default=(0, None))
+            match = best[1] if best[0] else None
+        if match is None and not item_ids:
+            match = next(
+                (pair for pair in unused if pair[1].get("pageUrl", "") == item.get("pageUrl", "")),
+                None,
+            )
+            if match is None and index < len(base_drafts) and index not in used:
+                match = (index, base_drafts[index])
+        if match is None:
+            # A duplicate or unattributable extra post is dropped, not fatal.
             continue
+        used.add(match[0])
+        source = match[1]
         post = dict(item)
         post["pageUrl"] = source.get("pageUrl", "")
         post.update(_attribution(source))

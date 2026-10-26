@@ -332,7 +332,6 @@ def _run_degodify_impl(
         fallow = summarize_fallow_inspect(inspected, candidate.relative_path) if inspected else None
         prompt = build_decomposition_prompt(candidate, branch, base_branch, worktree, fallow)
         configured_providers = providers or [provider]
-        deadline = time.monotonic() + timeout_seconds
         attempts = 0
 
         def committed_change() -> bool:
@@ -350,7 +349,9 @@ def _run_degodify_impl(
                     _install_dependencies(worktree)
             result = AgentResult(1, False)
             # One continuation per provider preserves partial edits and gives an
-            # inspection-only turn a chance to finish. All turns share one deadline.
+            # inspection-only turn a chance to finish. Each provider gets its own
+            # deadline so a slow primary cannot starve the fallback.
+            deadline = time.monotonic() + timeout_seconds
             for turn in range(2):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -365,7 +366,10 @@ plan is not completion. If blocked, give the exact failing command and actionabl
                 result = run_agent(
                     name, prompt + recovery, cwd=worktree,
                     log_path=log_path or repo / ".dev-agents" / "degodify.log",
-                    timeout_seconds=remaining, model=model, reasoning_effort=reasoning_effort,
+                    timeout_seconds=remaining,
+                    # The configured model and effort are Codex settings.
+                    model=model if name == "codex" else None,
+                    reasoning_effort=reasoning_effort if name == "codex" else None,
                 )
                 complete = result.returncode == 0 and not result.timed_out and committed_change()
                 if on_event:

@@ -770,7 +770,11 @@ class IssueFixerService:
                         )
                     if fixed and self.config.kind == "answer":
                         def report_round(
-                            round_number: int, score: float, verdict: str, blocking: int
+                            round_number: int,
+                            score: float,
+                            verdict: str,
+                            blocking: int,
+                            revising: bool,
                         ) -> None:
                             _publish_issue_comment(
                                 self.project.repo,
@@ -783,8 +787,8 @@ class IssueFixerService:
                                 f"verdict `{verdict}`, {blocking} blocking finding(s). "
                                 + (
                                     "Revising and re-reviewing."
-                                    if score < self.config.pre_pr_score_threshold or blocking
-                                    else "Score gate passed; opening the PR."
+                                    if revising
+                                    else "Opening the PR."
                                 ),
                             )
 
@@ -798,6 +802,7 @@ class IssueFixerService:
                             branch=state["branch"],
                             verify_pushed=verify_pushed,
                             initial_note=review_note,
+                            provider=used_provider,
                             on_round=report_round,
                         )
                         if not fixed:
@@ -847,13 +852,14 @@ class IssueFixerService:
         branch: str,
         verify_pushed: Callable[[AgentResult], tuple[bool, str]],
         initial_note: str,
-        on_round: Callable[[int, float, str, int], None] | None = None,
+        provider: str | None = None,
+        on_round: Callable[[int, float, str, int, bool], None] | None = None,
     ) -> tuple[str, bool]:
         """Fresh-eyes review loop for an Answer draft before its PR exists.
 
         Returns ``(note_for_pr_body, still_fixed)``. The loop revises until
-        the draft scores at least ``pre_pr_score_threshold`` with no blocking
-        findings, or ``pre_pr_max_revisions`` revisions have been spent; the
+        the draft scores at least ``pre_pr_score_threshold`` with a clean
+        verdict and no blocking findings, or ``pre_pr_max_revisions`` revisions have been spent; the
         cap keeps a nondeterministic reviewer from looping forever, and the
         outcome is always disclosed in the note. Each round is reported via
         ``on_round`` so the issue can show the loop is still working.
@@ -866,6 +872,8 @@ class IssueFixerService:
             return "\n\n".join(notes), True
         threshold = self.config.pre_pr_score_threshold
         max_revisions = self.config.pre_pr_max_revisions
+        # Revisions go to the provider that wrote the draft, not necessarily the primary.
+        provider = provider or self.config.provider
         review_log = log_path.with_name(f"{log_path.stem}-draft-review.log")
         try:
             changed = _run(
@@ -926,12 +934,24 @@ class IssueFixerService:
                 f"round={round_number} score={assessment.score} verdict={assessment.verdict} "
                 f"blocking={len(blockers)} threshold={threshold}"
             )
+            passed = (
+                assessment.score >= threshold
+                and not blockers
+                and assessment.verdict == "clean"
+            )
             if on_round is not None:
-                on_round(round_number, assessment.score, assessment.verdict, len(blockers))
-            if assessment.score >= threshold and not blockers:
+                on_round(
+                    round_number,
+                    assessment.score,
+                    assessment.verdict,
+                    len(blockers),
+                    not passed and revisions < max_revisions and bool(assessment.findings),
+                )
+            if passed:
                 notes.append(
                     f"Pre-PR quality loop passed the score gate in round {round_number}: "
-                    f"score {assessment.score}/10 (threshold {threshold}), no blocking findings. "
+                    f"score {assessment.score}/10 (threshold {threshold}), clean verdict, "
+                    "no blocking findings. "
                     f"Rounds: {'; '.join(history)}."
                 )
                 return "\n\n".join(notes), True
@@ -945,8 +965,9 @@ class IssueFixerService:
                     + (
                         f"Remaining blocking findings for human review: {remaining}."
                         if blockers
-                        else "No blocking findings remain; the score stayed below "
-                        f"{threshold}, with the reviewer's most important improvement: "
+                        else "No blocking findings remain; the score or verdict "
+                        f"(`{assessment.verdict}`) is still short of the {threshold} gate, "
+                        "with the reviewer's most important improvement: "
                         f"{assessment.most_important_improvement}."
                     )
                 )
@@ -954,7 +975,8 @@ class IssueFixerService:
             if not assessment.findings and not blockers:
                 notes.append(
                     f"Pre-PR quality loop stopped in round {round_number}: score "
-                    f"{assessment.score}/10 is below the {threshold} gate but the reviewer "
+                    f"{assessment.score}/10 (verdict `{assessment.verdict}`) did not clear the "
+                    f"{threshold} gate but the reviewer "
                     "gave no actionable findings to revise against. "
                     f"Rounds: {'; '.join(history)}."
                 )
@@ -970,25 +992,32 @@ class IssueFixerService:
                     worktree, issue, self.config.base_branch, branch, [], kind=self.config.kind
                 )
                 + f"\n\nA fresh editorial review (round {round_number}) scored your pushed "
-                f"draft {assessment.score}/10 against a gate of {threshold}/10 with no "
-                "blocking findings. Most important improvement: "
+                f"draft {assessment.score}/10 (verdict {assessment.verdict}, "
+                f"{len(blockers)} blocking finding(s)) against a gate of {threshold}/10 "
+                "with a clean verdict. Most important improvement: "
                 f"{assessment.most_important_improvement}\nRevise the article to resolve "
                 "these findings, re-run the target repository's validation, then commit "
                 "and push the same branch. State each corrected fact once; do not repeat "
                 "a correction across sections, and preserve the article's strengths:\n"
                 + findings_text
             )
+            revision_model = (
+                self.config.fallback_model
+                if provider == self.config.fallback_provider
+                and provider != self.config.provider
+                else self.config.model
+                or (self.pr_config.model if provider == "codex" else None)
+            )
             result = run_agent(
-                self.config.provider,
+                provider,
                 revision_prompt,
                 cwd=worktree,
                 log_path=log_path,
                 timeout_seconds=self.config.timeout_minutes * 60,
                 heartbeat_seconds=self.pr_config.heartbeat_seconds,
                 reasoning_effort=self.config.reasoning_effort or self.pr_config.reasoning_effort,
-                model=self.config.model
-                or (self.pr_config.model if self.config.provider == "codex" else None),
-                json_events=self.config.provider == "muse",
+                model=revision_model,
+                json_events=provider == "muse",
             )
             verified, _validation = verify_pushed(result)
             if not verified:

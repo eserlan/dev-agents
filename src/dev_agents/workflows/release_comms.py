@@ -996,10 +996,18 @@ def run_release_comms(
     def observe(event: str, payload: dict[str, Any]) -> None:
         if event == "feature_inventory":
             from .release_publish import _discord_config
-            payload["destinations"] = {"discord": [str(item.get("id", "main-community"))
-                                                   for item in _discord_config(project.repo)]}
+            # Coverage is observational: a bad destination file or coverage bug must not
+            # abort drafting, so failures are recorded on the payload instead.
+            try:
+                payload["destinations"] = {"discord": [str(item.get("id", "main-community"))
+                                                       for item in _discord_config(project.repo)]}
+            except Exception as error:  # noqa: BLE001
+                payload["destinations"] = {"discord": [], "error": str(error)}
             repository.update_run("release-comms", str(promote_run_id), metadata={"feature_inventory": payload})
-            refresh_coverage()
+            try:
+                refresh_coverage()
+            except Exception as error:  # noqa: BLE001
+                payload["coverage_error"] = str(error)
         repository.record_event(
             "release-comms", str(promote_run_id), event, event, metadata=payload
         )

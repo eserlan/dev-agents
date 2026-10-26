@@ -102,18 +102,19 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     git(repo, "config", "user.name", "Test")
     prompts: list[str] = []
     created: list[tuple[str, ...]] = []
-    budgets: list[float] = []
+    budgets: dict[str, list[float]] = {}
     from types import SimpleNamespace
     clock = iter(range(0, 10000, 10))
     monkeypatch.setattr(degodify, "time", SimpleNamespace(monotonic=lambda: next(clock)))
 
     def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
         prompts.append(prompt)
-        budgets.append(kwargs["timeout_seconds"])
-        assert kwargs["model"] == "decomposition-model"
-        assert kwargs["reasoning_effort"] == "high"
+        budgets.setdefault(_name, []).append(kwargs["timeout_seconds"])
+        # The configured model and effort are Codex settings and never reach other providers.
+        assert kwargs["model"] == ("decomposition-model" if _name == "codex" else None)
+        assert kwargs["reasoning_effort"] == ("high" if _name == "codex" else None)
         worktree = kwargs["cwd"]
-        if recovery == "exhausted" or (recovery == "fallback" and _name == "first"):
+        if recovery == "exhausted" or (recovery == "fallback" and _name == "codex"):
             return AgentResult(0, False)
         if recovery == "timeout":
             return AgentResult(1, True)
@@ -145,14 +146,18 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     events = []
     result = degodify._run_degodify_impl(
         repo, dry_run=False, supplied_candidate=candidate, log_path=tmp_path / "log",
-        providers=["first", "second"] if recovery == "fallback" else ["first"],
+        providers=["codex", "muse"] if recovery == "fallback" else ["codex"],
         model="decomposition-model", reasoning_effort="high",
         on_event=lambda event, payload: events.append((event, payload)),
     )
     assert all(event == "agent_attempt" for event, _ in events)
-    assert budgets == sorted(budgets, reverse=True)
+    for provider_budgets in budgets.values():
+        assert provider_budgets == sorted(provider_budgets, reverse=True)
+        if len(provider_budgets) > 1:
+            assert provider_budgets[-1] < provider_budgets[0]
     if len(budgets) > 1:
-        assert budgets[-1] < budgets[0]
+        # A fallback provider gets its own full budget, not what the primary left over.
+        assert budgets["muse"][0] > 0
     if recovery in {"exhausted", "timeout"}:
         assert not result.succeeded and not created
         assert len(prompts) == (1 if recovery == "timeout" else 2)
