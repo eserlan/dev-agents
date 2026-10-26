@@ -4,8 +4,9 @@ from datetime import datetime
 from typing import Any
 
 
-def repair_claim(comments: list[dict[str, Any]], run_id: str, opened_at: float,
-                 window_seconds: int) -> dict[str, Any] | None:
+def repair_claim(comments: list[dict[str, Any]], run_id: str,
+                 opened_at: float) -> dict[str, Any] | None:
+    """Earliest trusted claim posted after the findings; the caller only asks while repair is pending."""
     command = f"/dev-agents claim {run_id}"
     for comment in sorted(comments, key=lambda item: str(item.get("created_at", ""))):
         if comment.get("author_association") not in {"OWNER", "MEMBER", "COLLABORATOR"}:
@@ -16,7 +17,7 @@ def repair_claim(comments: list[dict[str, Any]], run_id: str, opened_at: float,
             created = datetime.fromisoformat(comment["created_at"]).timestamp()
         except (KeyError, TypeError, ValueError):
             continue
-        if opened_at <= created <= opened_at + window_seconds:
+        if created >= opened_at:
             return {"login": (comment.get("user") or {}).get("login"),
                     "comment_id": comment.get("id"), "expires_at": created + 1800}
     return None

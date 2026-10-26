@@ -227,23 +227,60 @@ class PrFixerService:
         graph.add_edge("finalize", END)
         return graph.compile()
 
-    def _review_plan(self, number: int, head_sha: str) -> dict[str, Any] | None:
-        """Select one initial review or the single follow-up allowed for a fixed head."""
+    def _human_authored_head(self, meta: dict[str, Any]) -> bool:
+        """Whether the PR head's latest commit was written only by people, not agents."""
+        commits = meta.get("commits")
+        latest = commits[-1] if isinstance(commits, list) and commits else None
+        authors = latest.get("authors") if isinstance(latest, dict) else None
+        if not isinstance(authors, list) or not authors:
+            return False
+        agents = {
+            login.strip().lower()
+            for login in (*self.config.external_agent_logins, *self.config.review_handoff_logins)
+            if login.strip()
+        }
+        logins = [
+            str(author.get("login") or "").strip().lower()
+            for author in authors
+            if isinstance(author, dict)
+        ]
+        return bool(logins) and all(
+            login and login not in agents and not login.endswith("[bot]") for login in logins
+        )
+
+    def _review_plan(
+        self, number: int, head_sha: str, *, human_head: bool = False
+    ) -> dict[str, Any] | None:
+        """Select one initial review or the single follow-up allowed for a fixed head.
+
+        A halt needs human adjudication. It holds for every head until a person pushes a
+        new commit of their own; agent pushes, including this workflow's own repairs, never
+        lift it.
+        """
         runs = [
             run
-            for run in self.state.list_runs("pr-review", limit=200)
+            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
             if run.metadata.get("pull_request") == number
         ]
+        fresh_plan = {
+            "round": 0,
+            "scope": "full",
+            "chain_id": f"pr-review-{number}-{head_sha}",
+            "parent_run_id": None,
+            "parent_sha": None,
+            "prior_report": None,
+        }
         if not runs:
-            return {
-                "round": 0,
-                "scope": "full",
-                "chain_id": f"pr-review-{number}-{head_sha}",
-                "parent_run_id": None,
-                "parent_sha": None,
-                "prior_report": None,
-            }
+            return fresh_plan
 
+        halted = [run for run in runs if run.metadata.get("review_halted")]
+        if halted:
+            own = {sha for run in halted for sha in run.metadata.get("own_commits") or []}
+            halted_heads = {str(run.metadata.get("head_sha", "")) for run in halted}
+            if head_sha in halted_heads or head_sha in own or not human_head:
+                return None
+            if str(runs[0].metadata.get("head_sha", "")) != head_sha:
+                return fresh_plan
         latest = runs[0]
         metadata = latest.metadata
         try:
@@ -454,7 +491,9 @@ class PrFixerService:
                 legacy_handled = candidate_handled
                 self.state.mark_feedback_processed("pr-fixer", str(number), legacy_handled)
         unseen = self.state.unprocessed_feedback("pr-fixer", str(number), keys)
-        review_plan = self._review_plan(number, head_sha)
+        review_plan = self._review_plan(
+            number, head_sha, human_head=self._human_authored_head(meta)
+        )
         review_only = (
             self.config.review_without_copilot
             and not keys
@@ -480,8 +519,7 @@ class PrFixerService:
                 try:
                     pages = json.loads(_pkg._run(self.project.repo, "gh", "api", "--paginate",
                                                 "--slurp", f"repos/{slug}/issues/{number}/comments"))
-                    claim_info = repair_claim([c for page in pages for c in page], run_id,
-                                              opened, self.config.review_claim_window_seconds)
+                    claim_info = repair_claim([c for page in pages for c in page], run_id, opened)
                 except (RuntimeError, ValueError, TypeError):
                     # Cannot establish ownership: retry on reconciliation instead of racing.
                     return {"meta": meta, "keys": keys, "skip": True}
@@ -727,6 +765,20 @@ A follow-up comment will report the outcome.
             return {"started": False}
         number = state["number"]
         workflow = state.get("workflow", "pr-fixer")
+        if state.get("review_only") and state.get("report", {}).get("review_halted"):
+            report = state["report"]
+            self.state.update_run(workflow, state["run_id"], metadata={
+                "review_halted": report["review_halted"],
+                "review_report": report.get("review_report"), "review_report_valid": False,
+                "repair_pending": False, "own_commits": report.get("own_commits") or [],
+            })
+            _pkg._publish_pr_run_comment(
+                self.project.repo, number, state["run_id"], "review-halted",
+                f"Automatic review repairs stopped: {report['review_halted']}. Human adjudication required.\n\n"
+                + json.dumps(report.get("review_report", {}), ensure_ascii=False),
+            )
+            self.state.complete_run(workflow, state["run_id"])
+            return {"started": False}
         if state.get("review_only") and state.get("report", {}).get("repair_pending"):
             self.state.update_run(workflow, state["run_id"], status="waiting",
                                     metadata={"repair_pending": True})
@@ -1117,6 +1169,14 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         resuming = bool(saved and saved.metadata.get("repair_pending"))
                         if resuming and saved:
                             audit_path.write_text(json.dumps(saved.metadata["audit_report"]))
+                            try:
+                                parse_audit_report(audit_path, initial=review_round == 0)
+                            except ValueError:
+                                # Legacy pending reports lack contract evidence. Re-audit
+                                # instead of retrying their invalid repair forever.
+                                resuming = False
+                                self.state.update_run("pr-review", saved.run_id, metadata={"repair_pending": False})
+                        if resuming:
                             audit_result = AgentResult(0, False)
                         else:
                             audit_result = run_agent(
@@ -1197,6 +1257,20 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             if latest_head and latest_head != original_head:
                                 superseded_by.append(latest_head)
                             return AgentResult(1, False)
+                        # Count writer starts across all heads/chains of this PR, including
+                        # failed attempts. Bot pushes and retries cannot reset the budget.
+                        repairs = sum(
+                            int(run.metadata.get("review_repair_attempts", bool(run.metadata.get("review_fix_pushed"))))
+                            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
+                            if run.metadata.get("pull_request") == number
+                        )
+                        if repairs >= 2 or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
+                            report["review_halted"] = "two repair attempts exhausted; unresolved findings retained"
+                            return AgentResult(1, False)
+                        current = self.state.get_run("pr-review", run_id) if run_id else None
+                        if current is not None and run_id is not None:
+                            attempts = int(current.metadata.get("review_repair_attempts", 0))
+                            self.state.update_run("pr-review", run_id, metadata={"review_repair_attempts": attempts + 1})
                         prompt = _review_fix_prompt(worktree, number, audit.model_dump(), base, conflicts)
                         _log(f"fixer-start pr={number} audited_findings={len(audit.findings)}")
                         fixer_started.append(True)
@@ -1242,6 +1316,10 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                     report.update(_agent_report(final_message if final_message.is_file() else log))
                     if review_only:
                         repair = report.get("review_report", {})
+                        if repair.get("verdict") == "disputed":
+                            repair["findings"] = audit.review_report()["findings"]
+                            report["review_halted"] = "fixer disputed audit: " + "; ".join(repair["validation"])
+                            return AgentResult(1, result.timed_out)
                         if not report.get("report_valid") or not repair.get("fixes"):
                             report.update(report_valid=False, report_error="fixer did not report repairs for audited findings")
                             return AgentResult(1, result.timed_out)
@@ -1484,6 +1562,16 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
         validated. Treat that explicit clean chain result as covering the
         current head too.
         """
+        halted = [
+            run
+            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
+            if run.metadata.get("review_halted")
+        ]
+        if any(
+            run.metadata.get("head_sha") == head_sha or head_sha in (run.metadata.get("own_commits") or [])
+            for run in halted
+        ):
+            return False
         review_run = self.state.load_run("pr-review", f"pr-review-{number}-{head_sha}")
         if review_run is not None and review_run.status == "completed":
             return True

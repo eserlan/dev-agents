@@ -56,6 +56,26 @@ daemon terminates that run's agent process, closes the old run as superseded, an
 restarts feedback collection against the latest head. Other webhook events do not cancel active
 work; reconciliation still avoids starting duplicate work for a PR already being handled.
 
+## Review stopping rules
+
+Blocking audit findings must cite an accepted requirement, a reachable failure trigger, and the
+changed code that introduced the failure. Hardening, missing tests alone, broader coverage and
+design suggestions are nonblocking limitations and do not trigger automatic repairs. Generated
+prose is checked for structural facts; semantic guarantees require an explicit product contract
+rather than increasingly elaborate word-matching heuristics.
+
+Post-fix reviews preserve the original acceptance criteria and inspect only unresolved findings
+and regressions caused by repairs. The final targeted review verifies only; it cannot start a
+third repair. Writer starts (including failed attempts) count toward a persistent two-attempt
+budget per PR across all heads and review chains. Historical pushed repairs count as attempts.
+
+A fixer may return `disputed` with source-backed reasons instead of editing. Disputes and exhausted
+budgets persist `review_halted` and the unresolved report in SQLite, post a review-halted comment,
+and stop automatic reviews and internal-review auto-merge eligibility for that PR, including after
+new pushes or daemon restarts. Human adjudication is required. There is no automatic reset; an
+operator must deliberately clear the halted metadata and repair-attempt history to authorize a
+fresh budget. Previously saved audits without the new required evidence fields must be re-audited.
+
 ## State database
 
 Workflow state is stored in the configured `pr_fixer.state_path` SQLite database. If it is omitted,
@@ -93,13 +113,14 @@ the feedback-fix claim. This means a no-op run created while checks are pending 
 later `check_run.completed` attempt. After `gh pr merge --auto --squash`, the daemon verifies that
 GitHub set `autoMergeRequest` (or merged the PR) and records the result.
 
-After posting findings, dev-agents waits `review_claim_window_seconds` (default 60) before
-repairing them. An active external process can post `/dev-agents claim <run-id>` as a standalone
-PR comment during that window. Only owners, members and collaborators can claim work. The first
+After posting findings, dev-agents waits at least `review_claim_window_seconds` (default 60)
+before repairing them. An active external process can post `/dev-agents claim <run-id>` as a
+standalone PR comment any time after the findings, until the repair actually starts; reconciliation
+may start it well after the window closes, and a claim posted before then still counts. Only owners, members and collaborators can claim work. The first
 valid claim pauses repairs until 30 minutes after the claim. Repeated comments do not renew it.
 If the head advances, the new revision gets a fresh review; otherwise reconciliation resumes
 the saved audit's repairs when the claim expires. Waiting survives restarts and releases the
-worktree. Reconciliation may start repairs slightly after the deadline. Set the window to zero
+worktree. Set the window to zero
 for immediate repairs. The old attribution-based handoff settings no longer control repairs.
 
 With `review_without_copilot: true` (the default), an open, non-draft PR targeting the configured
@@ -271,6 +292,7 @@ writer and use Codex with `gpt-6-luna` when Muse exits unsuccessfully or times o
 - label: answer
   kind: answer
   provider: muse
+  model: muse-wonder-1.0
   fallback_provider: codex
   fallback_model: gpt-6-luna
 ```

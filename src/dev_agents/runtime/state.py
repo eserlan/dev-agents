@@ -80,6 +80,7 @@ class PublicationRecord:
     error: str | None
     published_at: str
     metadata: dict[str, Any]
+    message_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,7 @@ class StateRepository:
     configured log directory and store only metadata and the log path in ``metadata``.
     """
 
-    CURRENT_SCHEMA_VERSION = 5
+    CURRENT_SCHEMA_VERSION = 6
     BUSY_TIMEOUT_MS = 30_000
     STALE_RUN_SECONDS = 60 * 60
 
@@ -237,6 +238,9 @@ class StateRepository:
             if version < 5:
                 self._migrate_to_v5(connection)
                 connection.execute("UPDATE schema_version SET version = 5")
+            if version < 6:
+                self._migrate_to_v6(connection)
+                connection.execute("UPDATE schema_version SET version = 6")
             connection.commit()
         except sqlite3.DatabaseError:
             if connection is not None:
@@ -368,6 +372,30 @@ class StateRepository:
                 ON publications(project_name, workflow, run_id, published_at);
             """
         )
+
+    @staticmethod
+    def _migrate_to_v6(connection: sqlite3.Connection) -> None:
+        # Legacy receipts remain unattributed; never guess which feature was posted.
+        statements = """
+            ALTER TABLE publications RENAME TO publications_legacy;
+            DROP INDEX publications_lookup_idx;
+            CREATE TABLE publications (
+                project_name TEXT NOT NULL, workflow TEXT NOT NULL, run_id TEXT NOT NULL,
+                channel TEXT NOT NULL, destination TEXT NOT NULL DEFAULT '',
+                page_url TEXT NOT NULL DEFAULT '', public_url TEXT, external_id TEXT,
+                status TEXT NOT NULL, error TEXT, published_at TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}', message_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(project_name,workflow,run_id,channel,destination,page_url,message_id),
+                FOREIGN KEY(project_name,workflow,run_id) REFERENCES runs(project_name,workflow,run_id)
+            );
+            INSERT INTO publications SELECT *, '' FROM publications_legacy;
+            DROP TABLE publications_legacy;
+            CREATE INDEX publications_lookup_idx
+                ON publications(project_name,workflow,run_id,published_at);
+        """
+        for statement in statements.split(";"):
+            if statement.strip():
+                connection.execute(statement)
 
     @staticmethod
     def _migrate_to_v5(connection: sqlite3.Connection) -> None:
@@ -558,15 +586,23 @@ class StateRepository:
         """Load one run record."""
         return self.get_run(workflow, run_id)
 
-    def list_runs(self, workflow: str | None = None, limit: int = 100) -> list[RunRecord]:
+    def list_runs(
+        self, workflow: str | None = None, limit: int | None = 100,
+        *, pull_request: int | None = None,
+    ) -> list[RunRecord]:
         """Load recent runs for the configured project."""
         query = "SELECT * FROM runs WHERE project_name = ?"
         parameters: list[Any] = [self.project_name]
         if workflow is not None:
             query += " AND workflow = ?"
             parameters.append(workflow)
-        query += " ORDER BY started_at DESC LIMIT ?"
-        parameters.append(max(1, limit))
+        if pull_request is not None:
+            query += " AND json_extract(metadata, '$.pull_request') = ?"
+            parameters.append(pull_request)
+        query += " ORDER BY started_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(max(1, limit))
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [self._run_record(row) for row in rows]
@@ -661,6 +697,7 @@ class StateRepository:
             error=str(row["error"]) if row["error"] is not None else None,
             published_at=str(row["published_at"]),
             metadata=metadata if isinstance(metadata, dict) else {},
+            message_id=str(row["message_id"]),
         )
 
     def list_run_publications(self, workflow: str, run_id: str) -> list[PublicationRecord]:
@@ -699,6 +736,17 @@ class StateRepository:
             rows = connection.execute(query, params).fetchall()
         return [self._publication_record(row) for row in rows]
 
+    def list_feature_publications(self, feature_id: str) -> list[PublicationRecord]:
+        """Find receipts explicitly attributed to a feature, across release runs."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM publications WHERE project_name = ? AND workflow = 'release-comms'
+                   AND EXISTS (SELECT 1 FROM json_each(publications.metadata, '$.feature_ids')
+                               WHERE value = ?) ORDER BY published_at""",
+                (self.project_name, feature_id),
+            ).fetchall()
+        return [self._publication_record(row) for row in rows]
+
     def record_publication(
         self,
         workflow: str,
@@ -712,6 +760,7 @@ class StateRepository:
         status: str = "published",
         error: str | None = None,
         metadata: dict[str, Any] | None = None,
+        message_id: str = "",
     ) -> PublicationRecord:
         """Upsert a compact external-publication receipt."""
         now = _timestamp()
@@ -725,9 +774,9 @@ class StateRepository:
                 """
                 INSERT INTO publications(
                     project_name, workflow, run_id, channel, destination, page_url,
-                    public_url, external_id, status, error, published_at, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_name, workflow, run_id, channel, destination, page_url)
+                    public_url, external_id, status, error, published_at, metadata, message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_name, workflow, run_id, channel, destination, page_url, message_id)
                 DO UPDATE SET
                     public_url = excluded.public_url,
                     external_id = excluded.external_id,
@@ -749,13 +798,14 @@ class StateRepository:
                     error,
                     now,
                     json.dumps(metadata or {}, sort_keys=True),
+                    message_id,
                 ),
             )
             row = connection.execute(
                 """
                 SELECT * FROM publications
                 WHERE project_name = ? AND workflow = ? AND run_id = ?
-                  AND channel = ? AND destination = ? AND page_url = ?
+                  AND channel = ? AND destination = ? AND page_url = ? AND message_id = ?
                 """,
                 (
                     self.project_name,
@@ -764,6 +814,7 @@ class StateRepository:
                     channel,
                     destination_value,
                     page_url_value,
+                    message_id,
                 ),
             ).fetchone()
             if row is None:

@@ -726,7 +726,10 @@ def sync_reddit_status(
                 external_id=reddit_id,
                 status="published",
                 metadata=new_metadata,
+                message_id=pub.message_id,
             )
+            from dev_agents.workflows.release_coverage import refresh_coverage
+            refresh_coverage(repository, pub.run_id)
             repository.record_event(
                 "release-comms",
                 pub.run_id,

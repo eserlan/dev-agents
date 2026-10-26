@@ -347,6 +347,13 @@ def _clean_internal_note(value: Any) -> str:
     return note
 
 
+def _attribution(item: dict[str, Any]) -> dict[str, str]:
+    value = item.get("featureIds", "")
+    if isinstance(value, list):
+        value = ",".join(str(part) for part in value)
+    return {"featureIds": ",".join(sorted({part.strip() for part in str(value).split(",") if part.strip()}))} if value else {}
+
+
 def _bluesky_draft(item: dict[str, Any]) -> dict[str, str]:
     draft = {
         "pageUrl": str(item.get("pageUrl", "")),
@@ -358,6 +365,7 @@ def _bluesky_draft(item: dict[str, Any]) -> dict[str, str]:
         value = str(item.get(key, "")).strip()
         if value:
             draft[key] = value
+    draft.update(_attribution(item))
     return draft
 
 
@@ -384,6 +392,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
                 draft["image"] = image
             if topic_tag:
                 draft["topic_tag"] = topic_tag
+            draft.update(_attribution(item))
             thread_drafts.append(draft)
     discussion_drafts: list[dict[str, str]] = []
     if isinstance(discussions, list):
@@ -401,6 +410,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
                 discussion["pageUrl"] = page_url
             if image:
                 discussion["image"] = image
+            discussion.update(_attribution(item))
             discussion_drafts.append(discussion)
     return WriterResult(
         bluesky=[
@@ -905,9 +915,14 @@ def run_evaluator_pass(
 def _writer_context(
     evaluator: EvaluatorResult, delta: ReleaseDelta, recent_posts: str = "(none)"
 ) -> dict[str, str]:
+    from .release_coverage import feature_id
     features = "\n".join(
-        f"- {item.get('name', '')}: {item.get('why_users_care', '')}" for item in evaluator.features
+        f"- [{feature_id(item)}] {item.get('name', '')}: {item.get('why_users_care', '')}"
+        for item in evaluator.features
     )
+    features += ("\nEach draft must include featureIds: a comma-separated string of the exact "
+                 "feature IDs it actually describes. Do not claim unrelated features. "
+                 "Use the same IDs across channel variants; pageUrl is not a feature identity.")
     return {
         **_delta_context(delta),
         "reason": evaluator.reason,
@@ -963,7 +978,7 @@ def run_threads_adaptation_pass(
 ) -> list[dict[str, str]]:
     """Adapt release copy into Threads-native posts while retaining source URLs."""
     base = [
-        {"pageUrl": item.get("pageUrl", ""), "text": item.get("text", "")}
+        {"pageUrl": item.get("pageUrl", ""), "text": item.get("text", ""), **_attribution(item)}
         for item in base_drafts
         if item.get("text", "").strip()
     ]
@@ -981,6 +996,7 @@ def run_threads_adaptation_pass(
             "recent_posts": recent_posts,
         },
     )
+    prompt += "\nRetain each source draft's exact featureIds in its adapted post. Do not infer identity from pageUrl."
     output = _run_pass(
         repo=repo,
         prompt=prompt,
@@ -996,16 +1012,36 @@ def run_threads_adaptation_pass(
 
     # The adaptation may change wording, but it cannot invent, drop, or retarget
     # release links and artwork. Match every returned post to the source draft.
-    by_url = {item.get("pageUrl", ""): item for item in base_drafts}
+    def ids(draft: dict[str, str]) -> set[str]:
+        return {part for part in str(draft.get("featureIds", "")).split(",") if part}
+
     adapted: list[dict[str, str]] = []
+    used: set[int] = set()
     for index, item in enumerate(result.threads):
-        source = by_url.get(item.get("pageUrl", ""))
-        if source is None and index < len(base_drafts):
-            source = base_drafts[index]
-        if source is None:
+        unused = [(n, draft) for n, draft in enumerate(base_drafts) if n not in used]
+        item_ids = ids(item)
+        # Exact featureIds first, then the best overlap, so a post that merged or
+        # added an id still reaches its source. Each source draft is used once.
+        match = next((pair for pair in unused if item_ids and ids(pair[1]) == item_ids), None)
+        if match is None and item_ids:
+            overlap = [(len(ids(pair[1]) & item_ids), pair) for pair in unused]
+            best = max(overlap, key=lambda entry: entry[0], default=(0, None))
+            match = best[1] if best[0] else None
+        if match is None and not item_ids:
+            match = next(
+                (pair for pair in unused if pair[1].get("pageUrl", "") == item.get("pageUrl", "")),
+                None,
+            )
+            if match is None and index < len(base_drafts) and index not in used:
+                match = (index, base_drafts[index])
+        if match is None:
+            # A duplicate or unattributable extra post is dropped, not fatal.
             continue
+        used.add(match[0])
+        source = match[1]
         post = dict(item)
         post["pageUrl"] = source.get("pageUrl", "")
+        post.update(_attribution(source))
         if source.get("image"):
             post["image"] = source["image"]
         adapted.append(post)

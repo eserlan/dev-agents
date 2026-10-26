@@ -13,6 +13,7 @@ from dev_agents.copy_review import (
     _parse_assessment,
     _prompt,
     is_answer_merge,
+    review_answer_draft,
     review_merged_answer,
 )
 from dev_agents.runtime import StateRepository
@@ -57,6 +58,93 @@ new file mode 100644
 +article
 """
     assert _answer_page_paths(diff, ["answers/pages/*.ts"]) == ["answers/pages/new.ts"]
+
+
+def test_review_answer_draft_reads_worktree_and_parses_assessment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    page = tmp_path / "answers" / "pages" / "new.ts"
+    page.parent.mkdir(parents=True)
+    page.write_text("export const answer = {};\n", encoding="utf-8")
+    seen: dict[str, Any] = {}
+
+    def fake_run_agent(provider: str, prompt: str, **kwargs: Any) -> AgentResult:
+        seen.update(provider=provider, prompt=prompt, kwargs=kwargs)
+        kwargs["last_message_path"].write_text(json.dumps(assessment()), encoding="utf-8")
+        return AgentResult(0, False)
+
+    monkeypatch.setattr("dev_agents.copy_review.run_agent", fake_run_agent)
+    result = review_answer_draft(
+        ProjectConfig(repo=tmp_path),
+        CopyReviewConfig(),
+        worktree=tmp_path,
+        page_paths=["answers/pages/new.ts"],
+        issue={"number": 7, "title": "Brief", "body": "Write it"},
+        log_path=tmp_path / "draft-review.log",
+    )
+
+    assert result.verdict == "clean"
+    assert seen["provider"] == "codex"
+    assert "export const answer" in seen["prompt"]
+    assert "unpublished Answer draft" in seen["prompt"]
+    assert "8.5: publish-ready" in seen["prompt"]
+
+
+def test_review_answer_draft_rejects_pages_outside_the_worktree(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="inside the worktree"):
+        review_answer_draft(
+            ProjectConfig(repo=tmp_path),
+            CopyReviewConfig(),
+            worktree=tmp_path,
+            page_paths=["../outside.ts"],
+            issue={"number": 7},
+            log_path=tmp_path / "draft-review.log",
+        )
+
+
+def _blocking_finding(category: str) -> dict[str, Any]:
+    return {
+        "severity": "blocking", "category": category,
+        "location": "article.ts: opening", "evidence": "Quoted problem",
+        "reader_impact": "Readers are misled", "proposed_fix": "Correct it",
+    }
+
+
+def test_score_is_capped_by_a_blocking_factual_finding() -> None:
+    report = assessment(
+        score=9.5, verdict="changes_required",
+        findings=[_blocking_finding("Product accuracy")],
+        issue_title="Fix the claim", issue_body="Correct the opening advice",
+    )
+    assert _parse_assessment(json.dumps(report)).score == 7.0
+
+
+def test_score_is_capped_by_a_blocking_coherence_check() -> None:
+    report = assessment(
+        score=9.5, verdict="changes_required",
+        findings=[_blocking_finding("examples")],
+        coherence_checks=[
+            {"scope": "repetition", "status": "pass", "evidence": "Checked"},
+            {"scope": "examples", "status": "blocking", "evidence": "Contradictory example"},
+            {"scope": "flow", "status": "pass", "evidence": "Checked"},
+        ],
+        issue_title="Fix the example", issue_body="Correct the example",
+    )
+    assert _parse_assessment(json.dumps(report), require_coherence=True).score == 7.5
+
+
+def test_score_is_uncapped_without_blocking_findings() -> None:
+    assert _parse_assessment(json.dumps(assessment(score=9.5))).score == 9.5
+
+
+def test_prompt_defines_the_scoring_bands_and_caps() -> None:
+    prompt = _prompt(
+        1, "https://example.com/pr/1", "article",
+        instructions="Use British English.", merge_sha="abc",
+        pr_body="", original_issue=None, existing_issues=[],
+    )
+    assert "8.5: publish-ready" in prompt
+    assert "caps the score at 7.0" in prompt
 
 
 def test_parses_saved_reviewer_finding_names() -> None:

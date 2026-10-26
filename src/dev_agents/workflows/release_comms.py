@@ -485,6 +485,8 @@ def build_release_comms_workflow() -> Any:
             injected = align_discussion_images(injected)
             eval_res = with_derived_channels(eval_res, injected, state["config"].destinations)
             _emit(state, "drafted", _draft_counts(injected))
+            _emit(state, "feature_inventory", {"features": eval_res.features,
+                  "drafts": asdict(injected), "channels": eval_res.recommended_channels})
             return {"writer_result": injected, "evaluator_result": eval_res}
         bluesky = state.get("short_drafts") or []
         discussions = state.get("long_drafts") or []
@@ -517,6 +519,8 @@ def build_release_comms_workflow() -> Any:
             internal_note=eval_res.internal_note,
         )
         _emit(state, "drafted", _draft_counts(writer_res))
+        _emit(state, "feature_inventory", {"features": updated.features,
+              "drafts": asdict(writer_res), "channels": updated.recommended_channels})
         image_drafts = [*writer_res.bluesky, *writer_res.github_discussions]
         statuses = verify_draft_images(image_drafts)
         added = sync_asset_db(state["repo"], statuses, f"release {state['new_sha'][:7]}")
@@ -679,6 +683,11 @@ def build_release_comms_workflow() -> Any:
         writer_res = state.get("writer_result")
         drafts_dict = asdict(writer_res) if writer_res is not None else None
         postworthy = bool(state["evaluator_result"] and state["evaluator_result"].postworthy)
+        _emit(state, "feature_inventory", {
+            "features": state["evaluator_result"].features if state["evaluator_result"] else [],
+            "drafts": drafts_dict or {},
+            "channels": state["evaluator_result"].recommended_channels if state["evaluator_result"] else [],
+        })
         # Backstop for the evaluator's repeat rule: refuse channels that already carried a
         # page with the same slug in an earlier run, even if the URL prefix has since changed.
         draft_urls = [
@@ -689,6 +698,18 @@ def build_release_comms_workflow() -> Any:
         repeated_keys, repeated_runs = repeated_publication_keys(
             state.get("recent_announcements", []), draft_urls
         )
+        from .release_coverage import feature_ids, message_id
+        for channel in ("bluesky", "threads", "github_discussions", "instagram"):
+            for draft in (drafts_dict or {}).get(channel) or []:
+                if not feature_ids(draft):
+                    continue
+                identity = message_id(draft)
+                for announcement in state.get("recent_announcements", []):
+                    for record in announcement.records:
+                        if record.message_id == identity:
+                            repeated_keys.add(publication_key(record.channel, record.destination,
+                                                              str(draft.get("pageUrl", "")), identity))
+                            repeated_runs.add(record.run_id)
         if repeated_keys:
             _emit(
                 state,
@@ -753,12 +774,12 @@ def build_release_comms_workflow() -> Any:
         evaluation = state.get("evaluator_result")
         recommended_channels = evaluation.recommended_channels if evaluation is not None else []
         already_published = {
-            publication_key(record.channel, record.destination, record.page_url)
+            publication_key(record.channel, record.destination, record.page_url, record.message_id)
             for record in state.get("existing_publications", [])
             if record.status in ("published", "staged")
         } | repeated_keys
         pending_provider_ids = {
-            (record.channel, record.page_url): record.external_id
+            (record.channel, record.message_id or record.page_url): record.external_id
             for record in state.get("existing_publications", [])
             if record.status == "pending" and record.channel == "threads" and record.external_id
         }
@@ -949,6 +970,11 @@ def run_release_comms(
             writer_result = parse_writer_result(resume_metadata.get("writer_result"))
         pinned_new_sha = resume_metadata.get("new_sha") or pinned_new_sha
         pinned_previous_sha = resume_metadata.get("previous_sha") or pinned_previous_sha
+    if existing is not None and not existing.metadata.get("feature_identity_version") and writer_result:
+        for channel in (writer_result.bluesky, writer_result.github_discussions,
+                        writer_result.threads, writer_result.instagram):
+            for draft in channel:
+                draft["legacyIdentity"] = "true"
     claim = repository.claim_run(
         "release-comms",
         str(promote_run_id),
@@ -957,12 +983,31 @@ def run_release_comms(
             **existing_metadata,
             "promote_run_id": str(promote_run_id),
             "dry_run": dry_run,
+            "feature_identity_version": existing.metadata.get("feature_identity_version", 0) if existing else 1,
         },
     )
     if not claim.claimed:
         raise DuplicateRunError(f"release-comms run {promote_run_id} was already claimed")
 
+    def refresh_coverage() -> None:
+        from .release_coverage import refresh_coverage as refresh
+        refresh(repository, str(promote_run_id))
+
     def observe(event: str, payload: dict[str, Any]) -> None:
+        if event == "feature_inventory":
+            from .release_publish import _discord_config
+            # Coverage is observational: a bad destination file or coverage bug must not
+            # abort drafting, so failures are recorded on the payload instead.
+            try:
+                payload["destinations"] = {"discord": [str(item.get("id", "main-community"))
+                                                       for item in _discord_config(project.repo)]}
+            except Exception as error:  # noqa: BLE001
+                payload["destinations"] = {"discord": [], "error": str(error)}
+            repository.update_run("release-comms", str(promote_run_id), metadata={"feature_inventory": payload})
+            try:
+                refresh_coverage()
+            except Exception as error:  # noqa: BLE001
+                payload["coverage_error"] = str(error)
         repository.record_event(
             "release-comms", str(promote_run_id), event, event, metadata=payload
         )
@@ -975,7 +1020,7 @@ def run_release_comms(
             "pending"
             if receipt_status == "pending"
             else "staged"
-            if receipt_status == "staged_to_r2"
+            if receipt_status in {"staged_to_r2", "staged_to_github"}
             else "published"
         )
         repository.record_publication(
@@ -988,7 +1033,9 @@ def run_release_comms(
             external_id=receipt.external_id,
             status=status,
             metadata=receipt.metadata or {"publisher": "dev-agents"},
+            message_id=receipt.message_id,
         )
+        refresh_coverage()
 
     try:
         from dev_agents.workflows.reddit import sync_reddit_status
@@ -1033,6 +1080,9 @@ def run_release_comms(
         }
         final_state = app.invoke(initial_state)
         result = cast(ReleaseCommsRunResult, final_state["result"])
+        refresh_coverage()
+        covered_run = repository.get_run("release-comms", str(promote_run_id))
+        observe("feature_coverage", {"features": covered_run.metadata.get("feature_coverage", []) if covered_run else []})
     except Exception as error:
         repository.complete_run("release-comms", str(promote_run_id), status="failed", error=str(error))
         from dev_agents.visualize import schedule_report_refresh

@@ -90,11 +90,17 @@ def provider_command(
     provider: str,
     prompt: str,
     timeout_seconds: float = 1200,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str | None = None,
     model: str | None = None,
     read_only: bool = False,
+    json_events: bool = False,
 ) -> list[str]:
-    """Build the command line for a configured provider."""
+    """Build the command line for a configured provider.
+
+    ``reasoning_effort=None`` means the caller did not choose an effort:
+    Codex falls back to medium, while Muse is left on its model's own
+    default rather than silently inheriting the Codex-oriented default.
+    """
     if provider == "codex":
         permissions = (
             ["--sandbox", "read-only", "--ignore-user-config", "-c", 'approval_policy="never"']
@@ -107,7 +113,7 @@ def provider_command(
             "-m",
             model or CODEX_MODEL,
             "-c",
-            f'model_reasoning_effort="{reasoning_effort}"',
+            f'model_reasoning_effort="{reasoning_effort or "medium"}"',
             "-",
         ]
     if provider == "claude":
@@ -136,8 +142,10 @@ def provider_command(
         return [
             "muse",
             "exec",
+            *(["--json"] if json_events else []),
             "--model",
-            "muse-spark-1.2",
+            model or "muse-spark-1.2",
+            *(["--reasoning-effort", reasoning_effort] if reasoning_effort else []),
             "--yolo",
             prompt,
         ]
@@ -222,8 +230,9 @@ def run_agent(
     log_path: Path,
     timeout_seconds: float,
     heartbeat_seconds: float = 30.0,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str | None = None,
     model: str | None = None,
+    json_events: bool = False,
     last_message_path: Path | None = None,
     on_progress: Callable[[int], None] | None = None,
     progress_interval_seconds: float = 600.0,
@@ -251,7 +260,12 @@ def run_agent(
             prompt_stream.write(prompt)
             prompt_stream.seek(0)
         try:
-            command = provider_command(provider, prompt, timeout_seconds, reasoning_effort, model)
+            if json_events and provider != "muse":
+                raise ValueError("json_events requires the Muse provider")
+            command = provider_command(
+                provider, prompt, timeout_seconds, reasoning_effort, model,
+                **({"json_events": True} if json_events else {}),
+            )
             if read_only:
                 if provider != "codex":
                     raise ValueError("read_only auditing requires the Codex provider")

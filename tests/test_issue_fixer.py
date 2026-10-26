@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from dev_agents.config import IssueFixerConfig, PrFixerConfig, ProjectConfig
+from dev_agents.config import CopyReviewConfig, IssueFixerConfig, PrFixerConfig, ProjectConfig
+from dev_agents.copy_review import AnswerQualityAssessment, CoherenceCheck, EditorialFinding
 from dev_agents.issue_fixer import (
     IssueFixerService,
     _existing_issue_pr,
@@ -16,8 +17,10 @@ from dev_agents.issue_fixer import (
     _pr_result_body,
     _prompt,
     _publish_issue_comment,
+    _reset_worktree_for_fallback,
 )
 from dev_agents.runtime import StateRepository
+from dev_agents.runtime.agent import AgentResult
 
 
 def test_issue_reads_latest_reopen_across_event_pages(monkeypatch, tmp_path):
@@ -229,9 +232,260 @@ def test_prompt_uses_enhancement_framing_for_gui_fix_kind(tmp_path: Path) -> Non
     assert "what was fixed" not in prompt
 
 
+def test_answer_prompt_gives_orchestrator_precedence_over_skill_pr_steps(tmp_path: Path) -> None:
+    prompt = _prompt(
+        tmp_path,
+        {"number": 42, "title": "How do I run a heist?", "url": "https://x/42", "body": "Brief"},
+        "staging",
+        "dev-agents/answer-42",
+        [],
+        kind="answer",
+    )
+    assert "Orchestrator ownership" in prompt
+    assert "Do not create branches or pull" in prompt
+    # The shared pr-fix skill assumes an existing PR; it must not be inlined here.
+    assert "Inspect the PR metadata" not in prompt
+    # A word the target skill bans in articles must not be recommended by the prompt.
+    assert "cornerstone" not in prompt
+
+
 def test_issue_fixer_config_kind_defaults_to_fix() -> None:
     assert IssueFixerConfig().kind == "fix"
     assert IssueFixerConfig(label="gui-fix", kind="enhancement").kind == "enhancement"
+    # Effort is inherited from the PR fixer unless a queue pins its own.
+    assert IssueFixerConfig().reasoning_effort is None
+    assert IssueFixerConfig(kind="answer", reasoning_effort="high").reasoning_effort == "high"
+    # The pre-PR quality loop defaults to an 8.5 gate with a bounded revision cap.
+    assert IssueFixerConfig(kind="answer").pre_pr_score_threshold == 8.5
+    assert IssueFixerConfig(kind="answer").pre_pr_max_revisions == 3
+
+
+def _assessment(
+    verdict: str, *, blocking: bool = False, score: float = 8.0, suggestion: bool = False
+) -> AnswerQualityAssessment:
+    findings = (
+        [
+            EditorialFinding(
+                severity="blocking",
+                category="examples",
+                location="pages/new.ts: example",
+                evidence="The weak approach fails for an unrelated reason.",
+                reader_impact="Readers learn the wrong lesson.",
+                proposed_fix="Give the weak approach one demonstrated failure mode.",
+            )
+        ]
+        if blocking
+        else []
+    )
+    if suggestion:
+        findings = [
+            EditorialFinding(
+                severity="suggestion",
+                category="clarity",
+                location="pages/new.ts: opening",
+                evidence="The opening repeats the heading.",
+                reader_impact="Readers skim past the answer.",
+                proposed_fix="Cut the repeated sentence.",
+            )
+        ]
+    return AnswerQualityAssessment(
+        score=score,
+        verdict=verdict,  # type: ignore[arg-type]
+        overall_assessment="Assessment",
+        what_works=["Clear structure"],
+        most_important_improvement="Fix the example" if blocking else "none",
+        findings=findings,
+        checks_performed=["Read the draft"],
+        limitations=[],
+        coherence_checks=[
+            CoherenceCheck(scope=scope, status="pass", evidence="Checked")  # type: ignore[arg-type]
+            for scope in ("repetition", "examples", "flow")
+        ],
+    )
+
+
+def _answer_service(tmp_path: Path, **config_kwargs: object) -> IssueFixerService:
+    project = ProjectConfig(
+        repo=tmp_path, copy_review=CopyReviewConfig(page_globs=["pages/*.ts"])
+    )
+    state = StateRepository(tmp_path / "state.db", "proj", tmp_path)
+    return IssueFixerService(
+        "proj",
+        project,
+        IssueFixerConfig(
+            kind="answer", provider="muse", model="muse-wonder-1.0", **config_kwargs  # type: ignore[arg-type]
+        ),
+        PrFixerConfig(),
+        state,
+    )
+
+
+def _review_kwargs(tmp_path: Path) -> dict[str, object]:
+    return {
+        "worktree": tmp_path,
+        "issue": {"number": 9, "title": "Brief", "body": "Write it"},
+        "number": 9,
+        "run_id": "issue-fix-9-abc",
+        "log_path": tmp_path / "issue-9.log",
+        "base_sha": "base",
+        "branch": "dev-agents/answer-9",
+        "verify_pushed": lambda _result: (True, "ok"),
+        "initial_note": "",
+    }
+
+
+def test_pre_pr_review_passes_a_clean_draft_without_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path)
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts"
+    )
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.review_answer_draft",
+        lambda *_a, **_k: _assessment("clean", score=9.0),
+    )
+    revisions: list[str] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.run_agent",
+        lambda *_a, **_k: revisions.append("ran") or AgentResult(0, False),
+    )
+
+    note, still_fixed = service._pre_pr_answer_review(**_review_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "passed the score gate in round 1" in note
+    assert "score 9.0/10" in note
+    assert revisions == []
+
+
+def test_pre_pr_review_revises_once_then_reports_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path)
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts"
+    )
+    reviews = iter(
+        [_assessment("changes_required", blocking=True), _assessment("clean", score=9.0)]
+    )
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.review_answer_draft", lambda *_a, **_k: next(reviews)
+    )
+    revision_prompts: list[str] = []
+
+    def fake_run_agent(provider: str, prompt: str, **kwargs: object) -> AgentResult:
+        revision_prompts.append(prompt)
+        assert kwargs["json_events"] is True
+        return AgentResult(0, False)
+
+    monkeypatch.setattr("dev_agents.issue_fixer.run_agent", fake_run_agent)
+
+    note, still_fixed = service._pre_pr_answer_review(**_review_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "passed the score gate in round 2" in note
+    assert len(revision_prompts) == 1
+    assert "one demonstrated failure mode" in revision_prompts[0]
+    assert "State each corrected fact once" in revision_prompts[0]
+
+
+def test_pre_pr_loop_keeps_revising_below_threshold_until_the_gate_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path)
+    monkeypatch.setattr("dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts")
+    reviews = iter(
+        [
+            _assessment("changes_required", blocking=True, score=7.0),
+            _assessment("clean", score=8.0, suggestion=True),
+            _assessment("clean", score=9.0),
+        ]
+    )
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.review_answer_draft", lambda *_a, **_k: next(reviews)
+    )
+    revisions: list[str] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.run_agent",
+        lambda *_a, **_k: revisions.append("ran") or AgentResult(0, False),
+    )
+    rounds: list[tuple[int, float, str, int, bool]] = []
+    kwargs = _review_kwargs(tmp_path)
+    kwargs["on_round"] = lambda *args: rounds.append(args)  # type: ignore[assignment]
+
+    note, still_fixed = service._pre_pr_answer_review(**kwargs)  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "passed the score gate in round 3" in note
+    assert "round 1: score 7.0/10" in note and "round 3: score 9.0/10" in note
+    assert len(revisions) == 2
+    assert rounds == [
+        (1, 7.0, "changes_required", 1, True),
+        (2, 8.0, "clean", 0, True),
+        (3, 9.0, "clean", 0, False),
+    ]
+
+
+def test_pre_pr_loop_stops_at_the_revision_cap_and_discloses_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path, pre_pr_max_revisions=1)
+    monkeypatch.setattr("dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts")
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.review_answer_draft",
+        lambda *_a, **_k: _assessment("changes_required", blocking=True, score=7.0),
+    )
+    revisions: list[str] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.run_agent",
+        lambda *_a, **_k: revisions.append("ran") or AgentResult(0, False),
+    )
+
+    note, still_fixed = service._pre_pr_answer_review(**_review_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "reached the revision cap (1)" in note
+    assert "Remaining blocking findings for human review" in note
+    assert len(revisions) == 1
+
+
+def test_pre_pr_review_failure_is_disclosed_not_treated_as_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path)
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts"
+    )
+
+    def broken_reviewer(*_args: object, **_kwargs: object) -> AnswerQualityAssessment:
+        raise RuntimeError("reviewer unavailable")
+
+    monkeypatch.setattr("dev_agents.issue_fixer.review_answer_draft", broken_reviewer)
+
+    note, still_fixed = service._pre_pr_answer_review(**_review_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "unavailable" in note
+    assert "post-merge copy review remains" in note
+
+
+def test_fallback_reset_discards_partial_edits_and_pushed_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._run",
+        lambda _repo, *args, **_kwargs: commands.append(args) or "",
+    )
+
+    _reset_worktree_for_fallback(tmp_path, "staging", "dev-agents/answer-9")
+
+    assert commands == [
+        ("git", "reset", "--hard", "origin/staging"),
+        ("git", "clean", "-fd"),
+        ("git", "push", "origin", "--delete", "dev-agents/answer-9"),
+    ]
 
 
 def test_collect_issue_claims_labeled_open_issue(
@@ -444,3 +698,20 @@ def test_a_retry_does_not_repost_the_started_comment(
     comments.clear()
     service._remediate({**base, "attempt": 7})  # type: ignore[arg-type]
     assert comments == []
+
+
+def test_pre_pr_gate_requires_a_clean_verdict_even_without_blockers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service = _answer_service(tmp_path)
+    monkeypatch.setattr("dev_agents.issue_fixer._run", lambda *_a, **_k: "pages/new.ts")
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer.review_answer_draft",
+        lambda *_a, **_k: _assessment("needs_human_review", score=9.0),
+    )
+
+    note, still_fixed = service._pre_pr_answer_review(**_review_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert still_fixed is True
+    assert "passed the score gate" not in note
+    assert "needs_human_review" in note

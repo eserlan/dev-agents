@@ -290,3 +290,25 @@ projects:
       webhook_secret_env: RELEASE_COMMS_WEBHOOK_SECRET
       recent_posts_days: 14   # lookback for the repeat-announcement checks
 ```
+
+## Per-feature coverage
+
+New release runs give each evaluated feature a stable ID derived from its name and user-facing
+benefit. Writer drafts carry `featureIds`, a comma-separated string of the exact IDs they cover.
+Grouped announcements can reference several IDs; channel variants use the same IDs. Missing
+attribution is shown as uncovered rather than inferred from similar prose or a shared page URL.
+
+Publication receipts retain a separate message identity alongside the real page URL. Two features
+may share a URL or omit it without overwriting each other's receipts or suppressing the next post.
+IDs and receipts survive scheduled batches and retries. Receipt-backed coverage can also refer to
+an explicit matching feature announcement from an earlier run.
+
+Each run persists `feature_inventory` before publishing and refreshes `feature_coverage` after
+receipts. The report's run details show a Feature coverage table with status, missing channels and
+receipt links. Statuses distinguish uncovered, drafted, pending, staged, partially published and
+published. A completed workflow does not by itself prove that all evaluated features were covered.
+Reddit candidate staging is shown as staged until reconciliation finds the live post.
+
+The database migration preserves historical receipts without guessing feature attribution.
+Existing queued runs retain their legacy identity rules; this change does not replay old
+announcements, backfill historical coverage or change release triggers.

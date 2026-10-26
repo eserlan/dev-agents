@@ -101,3 +101,23 @@ def test_a_lens_merely_mentioned_inside_another_category_does_not_count(tmp_path
 
     with pytest.raises(ValueError, match="all adversarial lenses"):
         parse_audit_report(path, initial=True)
+
+
+@pytest.mark.parametrize("missing", ["requirement", "trigger", "introduced_by"])
+def test_blocking_findings_require_contract_and_regression_evidence(tmp_path: Path, missing: str) -> None:
+    finding = {
+        "severity": "medium", "confidence": "high", "category": "correctness",
+        "location": "input.ts:4", "requirement": "spec.md:8 rejects invalid IDs",
+        "trigger": "An unknown ID", "introduced_by": "New unchecked lookup at input.ts:4",
+        "evidence": "Lookup returns undefined", "impact": "Request crashes",
+        "remediation": "Check ID before lookup",
+    }
+    value = payload()
+    value.update(verdict="findings", findings=[finding])
+    path = tmp_path / "audit.json"
+    path.write_text(json.dumps(value))
+    assert parse_audit_report(path, initial=True).findings[0].requirement
+    del finding[missing]
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError):
+        parse_audit_report(path, initial=True)

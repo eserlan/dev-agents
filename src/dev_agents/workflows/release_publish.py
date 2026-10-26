@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -45,6 +45,7 @@ class PublicationReceipt:
     public_url: str | None = None
     external_id: str | None = None
     metadata: dict[str, Any] | None = None
+    message_id: str = ""
 
 
 class PublicationError(RuntimeError):
@@ -80,8 +81,10 @@ class SocialPublishingProvider(Protocol):
     ) -> PublicationReceipt: ...
 
 
-def publication_key(channel: str, destination: str, page_url: str) -> tuple[str, str]:
+def publication_key(channel: str, destination: str, page_url: str, message_id: str = "") -> tuple[str, str]:
     """Return the durable deduplication key for one channel publication."""
+    if message_id:
+        return channel, f"{destination}\nmessage:{message_id}"
     if channel == "discord":
         return channel, f"{destination}\n{page_url}"
     return channel, page_url or destination
@@ -421,14 +424,20 @@ def publish_discord(
     between_delay_min_seconds: float = 0.0,
     between_delay_max_seconds: float = 0.0,
     max_publications: int | None = None,
+    skip_destinations: set[str] | None = None,
+    on_receipt: Callable[[PublicationReceipt], None] | None = None,
 ) -> list[PublicationReceipt]:
     receipts: list[PublicationReceipt] = []
     for index, destination in enumerate(_discord_config(repo)):
         destination_id = str(destination.get("id", "main-community"))
+        if destination_id in (skip_destinations or set()):
+            continue
         variable = str(destination.get("webhookEnvVar", "DISCORD_WEBHOOK_URL"))
         webhook = env.get(variable) or env.get(f"DISCORD_WEBHOOK_URL_{re.sub(r'[^A-Za-z0-9]', '_', destination_id.upper())}") or env.get("DISCORD_WEBHOOK_URL")
         if dry_run:
             receipts.append(PublicationReceipt("discord", destination_id, page_url, f"dry-run://discord/{destination_id}"))
+            if on_receipt:
+                on_receipt(receipts[-1])
             continue
         if not webhook:
             raise PublicationError(f"no webhook configured for Discord destination {destination_id}")
@@ -455,6 +464,8 @@ def publish_discord(
             # Do not put the webhook token into SQLite or journal logs.
             raise PublicationError("Discord webhook execution failed") from error
         receipts.append(PublicationReceipt("discord", destination_id, page_url, None))
+        if on_receipt:
+            on_receipt(receipts[-1])
         if max_publications is not None and len(receipts) >= max_publications:
             break
     return receipts
@@ -837,13 +848,24 @@ def publish_release_drafts(
             "reddit",
         )
     }
+    from .release_coverage import prepare_messages
+    prepare_messages(drafts)
     errors: list[str] = []
     message_batches_published = 0
 
+    active_message_id = ""
+    active_feature_ids: list[str] = []
+
+    def attributed(receipt: PublicationReceipt) -> PublicationReceipt:
+        return replace(receipt, message_id=active_message_id, metadata={
+            **(receipt.metadata or {}), "feature_ids": active_feature_ids,
+        })
+
     def record_receipt(receipt: PublicationReceipt) -> None:
+        receipt = attributed(receipt)
         on_receipt(receipt)
         already_published.add(
-            publication_key(receipt.channel, receipt.destination, receipt.page_url)
+            publication_key(receipt.channel, receipt.destination, receipt.page_url, receipt.message_id)
         )
 
     def batch_limit_reached() -> bool:
@@ -886,10 +908,10 @@ def publish_release_drafts(
                 candidate
                 for candidate, discussion in enumerate(discussion_drafts)
                 if candidate not in used_discussions
-                and str(discussion.get("pageUrl", "")) == page_url
-                and page_url
+                and ((draft.get("featureIds") and discussion.get("featureIds") == draft.get("featureIds"))
+                     or (not draft.get("featureIds") and str(discussion.get("pageUrl", "")) == page_url and page_url))
             ),
-            index if index < len(discussion_drafts) and index not in used_discussions else None,
+            index if not draft.get("featureIds") and index < len(discussion_drafts) and index not in used_discussions else None,
         )
         discussion = None
         if discussion_index is not None and discussion_index < len(discussion_drafts):
@@ -900,10 +922,10 @@ def publish_release_drafts(
                 candidate
                 for candidate, thread in enumerate(threads_drafts)
                 if candidate not in used_threads
-                and str(thread.get("pageUrl", "")) == page_url
-                and page_url
+                and ((draft.get("featureIds") and thread.get("featureIds") == draft.get("featureIds"))
+                     or (not draft.get("featureIds") and str(thread.get("pageUrl", "")) == page_url and page_url))
             ),
-            index if index < len(threads_drafts) and index not in used_threads else None,
+            index if not draft.get("featureIds") and index < len(threads_drafts) and index not in used_threads else None,
         )
         thread = None
         if thread_index is not None and thread_index < len(threads_drafts):
@@ -919,8 +941,8 @@ def publish_release_drafts(
                     candidate
                     for candidate, thread in enumerate(threads_drafts)
                     if candidate not in used_threads
-                    and str(thread.get("pageUrl", "")) == page_url
-                    and page_url
+                    and ((discussion.get("featureIds") and thread.get("featureIds") == discussion.get("featureIds"))
+                         or (not discussion.get("featureIds") and str(thread.get("pageUrl", "")) == page_url and page_url))
                 ),
                 None,
             )
@@ -941,35 +963,43 @@ def publish_release_drafts(
     if not batches and drafts.get("discord"):
         batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None, None))
 
+    # Destinations come from a file on disk; read them once per run, not per batch.
+    discord_destination_ids = (
+        [str(destination.get("id", "main-community")) for destination in _discord_config(project.repo)]
+        if "discord" in recommended_channels and batches
+        else []
+    )
     for draft, discussion, thread, instagram_draft in batches:
         page_url = str((draft or instagram_draft or thread or discussion or {}).get("pageUrl", ""))
+        from .release_coverage import feature_ids, message_id
+        identity_draft = draft or instagram_draft or thread or discussion or {}
+        active_message_id = message_id(identity_draft)
+        active_feature_ids = feature_ids(identity_draft)
         draft_text = str((draft or {}).get("text", ""))
         pending = False
         if draft is not None:
             pending = any(
                 channel in recommended_channels
-                and publication_key(channel, channel, page_url) not in already_published
+                and publication_key(channel, channel, page_url, active_message_id) not in already_published
                 for channel in ("bluesky", "instagram", "x", "pinterest")
             )
         if instagram_draft is not None and "instagram" in recommended_channels:
-            pending = pending or publication_key("instagram", "instagram", page_url) not in already_published
+            pending = pending or publication_key("instagram", "instagram", page_url, active_message_id) not in already_published
         if discussion is not None and "github_discussions" in recommended_channels:
             pending = pending or publication_key(
-                "github_discussions", "github_discussions", page_url
-            ) not in already_published
+                "github_discussions", "github_discussions", page_url, active_message_id) not in already_published
         if discussion is not None and "reddit" in recommended_channels:
             pending = pending or publication_key(
-                "reddit", "reddit", page_url
-            ) not in already_published
+                "reddit", "reddit", page_url, active_message_id) not in already_published
         if thread is not None and "threads" in recommended_channels:
             pending = (
-                pending or publication_key("threads", "threads", page_url) not in already_published
+                pending or publication_key("threads", "threads", page_url, active_message_id) not in already_published
             )
         if "discord" in recommended_channels and draft is not None:
             pending = pending or any(
-                publication_key("discord", str(destination.get("id", "main-community")), page_url)
+                publication_key("discord", destination_id, page_url, active_message_id)
                 not in already_published
-                for destination in _discord_config(project.repo)
+                for destination_id in discord_destination_ids
             )
         if draft is None and discussion is None and thread is None and instagram_draft is None:
             pending = "discord" in recommended_channels and bool(drafts.get("discord"))
@@ -989,7 +1019,7 @@ def publish_release_drafts(
         if (
             thread is not None
             and "threads" in recommended_channels
-            and publication_key("threads", "threads", page_url) not in already_published
+            and publication_key("threads", "threads", page_url, active_message_id) not in already_published
         ):
             try:
                 thread_image_url = ""
@@ -1001,7 +1031,7 @@ def publish_release_drafts(
                 def checkpoint_external_id(
                     container_id: str, metadata: dict[str, Any], *, source_url: str = page_url
                 ) -> None:
-                    on_receipt(
+                    on_receipt(attributed(
                         PublicationReceipt(
                             "threads",
                             "threads",
@@ -1009,7 +1039,7 @@ def publish_release_drafts(
                             external_id=container_id,
                             metadata={**metadata, "source_id": source_id, "status": "pending"},
                         )
-                    )
+                    ))
 
                 receipt = provider.publish(
                     SocialPost(
@@ -1027,7 +1057,7 @@ def publish_release_drafts(
                     ),
                     env=env,
                     dry_run=dry_run,
-                    pending_external_id=(pending_provider_ids or {}).get(("threads", page_url)),
+                    pending_external_id=(pending_provider_ids or {}).get(("threads", active_message_id or page_url)),
                     on_checkpoint=checkpoint_external_id,
                 )
                 record_receipt(receipt)
@@ -1036,14 +1066,14 @@ def publish_release_drafts(
                 errors.append(f"threads {page_url}: {error}")
 
         if (draft is not None or instagram_draft is not None) and image_url:
-            if draft is not None and "bluesky" in recommended_channels and publication_key("bluesky", "bluesky", page_url) not in already_published:
+            if draft is not None and "bluesky" in recommended_channels and publication_key("bluesky", "bluesky", page_url, active_message_id) not in already_published:
                 try:
                     receipt = publish_bluesky(text=draft_text, page_url=page_url, image_url=image_url, image_alt=image_alt, env=env, dry_run=dry_run)
                     record_receipt(receipt)
                     result["bluesky"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"bluesky {page_url}: {error}")
-            if "instagram" in recommended_channels and publication_key("instagram", "instagram", page_url) not in already_published:
+            if "instagram" in recommended_channels and publication_key("instagram", "instagram", page_url, active_message_id) not in already_published:
                 try:
                     caption_source = str((instagram_draft or draft or {}).get("text", ""))
                     caption = (
@@ -1057,14 +1087,14 @@ def publish_release_drafts(
                     result["instagram"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"instagram {page_url}: {error}")
-            if draft is not None and "x" in recommended_channels and publication_key("x", "x", page_url) not in already_published:
+            if draft is not None and "x" in recommended_channels and publication_key("x", "x", page_url, active_message_id) not in already_published:
                 try:
                     receipt = publish_x(text=prepare_bluesky_text(draft_text, page_url), page_url=page_url, env=env, dry_run=dry_run)
                     record_receipt(receipt)
                     result["x"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"x {page_url}: {error}")
-            if draft is not None and "pinterest" in recommended_channels and publication_key("pinterest", "pinterest", page_url) not in already_published:
+            if draft is not None and "pinterest" in recommended_channels and publication_key("pinterest", "pinterest", page_url, active_message_id) not in already_published:
                 try:
                     pin_title = str((discussion or {}).get("title", "")) or draft_text.strip().split(".")[0][:100]
                     receipt = publish_pinterest(title=pin_title, description=prepare_bluesky_text(draft_text, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
@@ -1080,16 +1110,19 @@ def publish_release_drafts(
                         env=env,
                         dry_run=dry_run,
                         page_url=page_url,
+                        skip_destinations={
+                            destination_id for destination_id in discord_destination_ids
+                            if publication_key("discord", destination_id,
+                                               page_url, active_message_id) in already_published},
+                        on_receipt=record_receipt,
                     ):
-                        key = publication_key("discord", receipt.destination, page_url)
-                        if key in already_published:
-                            continue
-                        record_receipt(receipt)
+                        if publication_key("discord", receipt.destination, page_url, active_message_id) not in already_published:
+                            record_receipt(receipt)
                         result["discord"].append(receipt.__dict__)
                 except Exception as error:  # noqa: BLE001
                     errors.append(f"discord {page_url}: {error}")
 
-        if discussion is not None and "github_discussions" in recommended_channels and publication_key("github_discussions", "github_discussions", page_url) not in already_published:
+        if discussion is not None and "github_discussions" in recommended_channels and publication_key("github_discussions", "github_discussions", page_url, active_message_id) not in already_published:
             try:
                 discussion_image, discussion_alt = resolve_image(discussion, image_overrides)
                 body = f"{discussion.get('body', '').strip()}\n\n![{discussion_alt}]({discussion_image})"
@@ -1099,7 +1132,7 @@ def publish_release_drafts(
             except Exception as error:  # noqa: BLE001
                 errors.append(f"github_discussions {page_url}: {error}")
 
-        if discussion is not None and "reddit" in recommended_channels and publication_key("reddit", "reddit", page_url) not in already_published:
+        if discussion is not None and "reddit" in recommended_channels and publication_key("reddit", "reddit", page_url, active_message_id) not in already_published:
             try:
                 from dev_agents.workflows.reddit import (
                     format_reddit_post,
@@ -1144,46 +1177,53 @@ def pending_publication_count(
     already_published: set[tuple[str, str]],
 ) -> int:
     """Count external writes still needed for a release run."""
+    from .release_coverage import message_id, prepare_messages
+    prepare_messages(drafts)
     count = 0
     if "instagram" in recommended_channels:
         for draft in drafts.get("instagram") or []:
             if not isinstance(draft, dict):
                 continue
             page_url = str(draft.get("pageUrl", ""))
-            if publication_key("instagram", "instagram", page_url) not in already_published:
+            active_message_id = message_id(draft)
+            if publication_key("instagram", "instagram", page_url, active_message_id) not in already_published:
                 count += 1
     for draft in drafts.get("bluesky") or []:
         if not isinstance(draft, dict):
             continue
         page_url = str(draft.get("pageUrl", ""))
+        active_message_id = message_id(draft)
         for channel in ("bluesky", "instagram", "x", "pinterest"):
-            if channel in recommended_channels and publication_key(channel, channel, page_url) not in already_published:
+            if channel in recommended_channels and publication_key(channel, channel, page_url, active_message_id) not in already_published:
                 count += 1
         if "discord" in recommended_channels:
             count += sum(
                 1
                 for destination in _discord_config(repo)
                 if publication_key(
-                    "discord", str(destination.get("id", "main-community")), page_url
+                    "discord", str(destination.get("id", "main-community")), page_url, active_message_id
                 )
                 not in already_published
             )
     for draft in drafts.get("threads") or []:
         if isinstance(draft, dict) and "threads" in recommended_channels:
             page_url = str(draft.get("pageUrl", ""))
-            if publication_key("threads", "threads", page_url) not in already_published:
+            active_message_id = message_id(draft)
+            if publication_key("threads", "threads", page_url, active_message_id) not in already_published:
                 count += 1
     if "github_discussions" in recommended_channels:
         for draft in drafts.get("github_discussions") or []:
             if isinstance(draft, dict):
                 page_url = str(draft.get("pageUrl", ""))
-                if publication_key("github_discussions", "github_discussions", page_url) not in already_published:
+                active_message_id = message_id(draft)
+                if publication_key("github_discussions", "github_discussions", page_url, active_message_id) not in already_published:
                     count += 1
     if "reddit" in recommended_channels:
         for draft in drafts.get("github_discussions") or []:
             if isinstance(draft, dict):
                 page_url = str(draft.get("pageUrl", ""))
-                if publication_key("reddit", "reddit", page_url) not in already_published:
+                active_message_id = message_id(draft)
+                if publication_key("reddit", "reddit", page_url, active_message_id) not in already_published:
                     count += 1
     if "discord" in recommended_channels and not drafts.get("bluesky") and drafts.get("discord"):
         count += sum(

@@ -441,7 +441,10 @@ def test_progress_events_trace_phases(monkeypatch: pytest.MonkeyPatch, tmp_path:
         "evaluated",
         "routed",
         "drafted",
+        "feature_inventory",
+        "feature_inventory",
         "published",
+        "feature_coverage",
     ]
     by_name = dict(events)
     assert by_name["resolved"] == {"new_sha": "newsha", "previous_sha": "prevsha"}
@@ -451,6 +454,8 @@ def test_progress_events_trace_phases(monkeypatch: pytest.MonkeyPatch, tmp_path:
         "bluesky": 1,
         "github_discussions": 0,
         "discord": True,
+        "instagram": 0,
+        "threads": 0,
     }
     assert by_name["published"] == {"completed": True, "postworthy": True}
 
@@ -480,5 +485,7 @@ def test_progress_events_skip_drafts_when_not_postworthy(
         "evaluated",
         "routed",
         "drafts_skipped",
+        "feature_inventory",
         "published",
+        "feature_coverage",
     ]

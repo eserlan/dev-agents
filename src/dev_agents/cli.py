@@ -10,6 +10,7 @@ from pathlib import Path
 from dev_agents.config import (
     ConfigError,
     ContentQueueConfig,
+    PrFixerConfig,
     ReleaseCommsConfig,
     load_projects_config,
     select_project,
@@ -162,11 +163,15 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "degodify" and arguments.degodify_command == "run":
         try:
             project = select_project(load_projects_config(arguments.config), arguments.project)
+            degodify_config = project.pr_fixer or PrFixerConfig()
             result = run_degodify(
                 project.repo,
                 base_branch=arguments.base,
                 provider=arguments.provider,
                 dry_run=not arguments.execute,
+                timeout_seconds=degodify_config.degodify_timeout_minutes * 60,
+                model=degodify_config.degodify_model,
+                reasoning_effort=degodify_config.reasoning_effort,
             )
             from dev_agents.visualize import schedule_report_refresh
 
