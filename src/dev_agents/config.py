@@ -205,6 +205,7 @@ class PrFixerConfig(BaseModel):
     # A full decomposition (dependency install, several extractions, tests, lint and a fallow
     # audit) needs far longer than the single extraction degodify used to make.
     degodify_timeout_minutes: int = 60
+    degodify_model: str = "gpt-6.1-sol"
     # After this many consecutive failed attempts at the same run_id (e.g. a
     # provider quota outage), auto-apply the "paused" label instead of letting
     # reconcile retry-and-comment on it forever.

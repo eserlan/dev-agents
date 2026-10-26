@@ -71,7 +71,7 @@ def _one_line(text: str) -> str:
     return collapsed[: SUMMARY_CHARS - 1].rstrip() + "…"
 
 
-def _draft_summary(drafts: Any, page_url: str) -> str:
+def _draft_summary(drafts: Any, page_url: str, identity: str = "") -> str:
     """Return the text of the draft that announced ``page_url`` in an earlier run."""
     if not isinstance(drafts, dict):
         return ""
@@ -81,6 +81,9 @@ def _draft_summary(drafts: Any, page_url: str) -> str:
             continue
         for item in items:
             if isinstance(item, dict) and str(item.get("pageUrl", "")).strip() == page_url:
+                from .release_coverage import message_id
+                if identity and message_id(item) != identity:
+                    continue
                 text = str(item.get(field) or item.get("body") or "")
                 if text.strip():
                     return _one_line(text)
@@ -96,21 +99,21 @@ def recent_announcements(
 ) -> list[Announcement]:
     """Return pages announced by other release-comms runs in the last ``days`` days."""
     cutoff = (now or datetime.now(UTC)) - timedelta(days=days)
-    grouped: dict[tuple[str, str], list[PublicationRecord]] = {}
+    grouped: dict[tuple[str, str, str], list[PublicationRecord]] = {}
     for record in repository.list_publications("release-comms", limit=_HISTORY_LIMIT):
         if record.run_id == exclude_run_id or record.status not in ("published", "staged"):
             continue
         published_at = _parse_time(record.published_at)
         if published_at is None or published_at < cutoff:
             continue
-        grouped.setdefault((record.run_id, record.page_url), []).append(record)
+        grouped.setdefault((record.run_id, record.page_url, record.message_id), []).append(record)
 
     drafts_by_run: dict[str, Any] = {}
     announcements: list[Announcement] = []
-    for (run_id, page_url), records in grouped.items():
+    for (run_id, page_url, identity), records in grouped.items():
         if run_id not in drafts_by_run:
             run = repository.get_run("release-comms", run_id)
-            drafts_by_run[run_id] = run.metadata.get("drafts") if run is not None else None
+            drafts_by_run[run_id] = (run.metadata.get("drafts") or run.metadata.get("feature_inventory", {}).get("drafts")) if run is not None else None
         published_at = max(
             time for record in records if (time := _parse_time(record.published_at)) is not None
         )
@@ -119,7 +122,7 @@ def recent_announcements(
                 run_id=run_id,
                 published_at=published_at,
                 page_url=page_url,
-                summary=_draft_summary(drafts_by_run[run_id], page_url),
+                summary=_draft_summary(drafts_by_run[run_id], page_url, identity),
                 records=tuple(records),
             )
         )

@@ -231,7 +231,7 @@ class PrFixerService:
         """Select one initial review or the single follow-up allowed for a fixed head."""
         runs = [
             run
-            for run in self.state.list_runs("pr-review", limit=200)
+            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
             if run.metadata.get("pull_request") == number
         ]
         if not runs:
@@ -244,6 +244,8 @@ class PrFixerService:
                 "prior_report": None,
             }
 
+        if any(run.metadata.get("review_halted") for run in runs):
+            return None
         latest = runs[0]
         metadata = latest.metadata
         try:
@@ -726,6 +728,20 @@ A follow-up comment will report the outcome.
             return {"started": False}
         number = state["number"]
         workflow = state.get("workflow", "pr-fixer")
+        if state.get("review_only") and state.get("report", {}).get("review_halted"):
+            report = state["report"]
+            self.state.update_run(workflow, state["run_id"], metadata={
+                "review_halted": report["review_halted"],
+                "review_report": report.get("review_report"), "review_report_valid": False,
+                "repair_pending": False,
+            })
+            _pkg._publish_pr_run_comment(
+                self.project.repo, number, state["run_id"], "review-halted",
+                f"Automatic review repairs stopped: {report['review_halted']}. Human adjudication required.\n\n"
+                + json.dumps(report.get("review_report", {}), ensure_ascii=False),
+            )
+            self.state.complete_run(workflow, state["run_id"])
+            return {"started": False}
         if state.get("review_only") and state.get("report", {}).get("repair_pending"):
             self.state.update_run(workflow, state["run_id"], status="waiting",
                                     metadata={"repair_pending": True})
@@ -1116,6 +1132,14 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         resuming = bool(saved and saved.metadata.get("repair_pending"))
                         if resuming and saved:
                             audit_path.write_text(json.dumps(saved.metadata["audit_report"]))
+                            try:
+                                parse_audit_report(audit_path, initial=review_round == 0)
+                            except ValueError:
+                                # Legacy pending reports lack contract evidence. Re-audit
+                                # instead of retrying their invalid repair forever.
+                                resuming = False
+                                self.state.update_run("pr-review", saved.run_id, metadata={"repair_pending": False})
+                        if resuming:
                             audit_result = AgentResult(0, False)
                         else:
                             audit_result = run_agent(
@@ -1196,6 +1220,20 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             if latest_head and latest_head != original_head:
                                 superseded_by.append(latest_head)
                             return AgentResult(1, False)
+                        # Count writer starts across all heads/chains of this PR, including
+                        # failed attempts. Bot pushes and retries cannot reset the budget.
+                        repairs = sum(
+                            int(run.metadata.get("review_repair_attempts", bool(run.metadata.get("review_fix_pushed"))))
+                            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
+                            if run.metadata.get("pull_request") == number
+                        )
+                        if repairs >= 2 or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
+                            report["review_halted"] = "two repair attempts exhausted; unresolved findings retained"
+                            return AgentResult(1, False)
+                        current = self.state.get_run("pr-review", run_id) if run_id else None
+                        if current is not None and run_id is not None:
+                            attempts = int(current.metadata.get("review_repair_attempts", 0))
+                            self.state.update_run("pr-review", run_id, metadata={"review_repair_attempts": attempts + 1})
                         prompt = _review_fix_prompt(worktree, number, audit.model_dump(), base, conflicts)
                         _log(f"fixer-start pr={number} audited_findings={len(audit.findings)}")
                         fixer_started.append(True)
@@ -1241,6 +1279,10 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                     report.update(_agent_report(final_message if final_message.is_file() else log))
                     if review_only:
                         repair = report.get("review_report", {})
+                        if repair.get("verdict") == "disputed":
+                            repair["findings"] = audit.review_report()["findings"]
+                            report["review_halted"] = "fixer disputed audit: " + "; ".join(repair["validation"])
+                            return AgentResult(1, result.timed_out)
                         if not report.get("report_valid") or not repair.get("fixes"):
                             report.update(report_valid=False, report_error="fixer did not report repairs for audited findings")
                             return AgentResult(1, result.timed_out)
@@ -1483,6 +1525,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
         validated. Treat that explicit clean chain result as covering the
         current head too.
         """
+        if any(run.metadata.get("review_halted") for run in
+               self.state.list_runs("pr-review", limit=None, pull_request=number)):
+            return False
         review_run = self.state.load_run("pr-review", f"pr-review-{number}-{head_sha}")
         if review_run is not None and review_run.status == "completed":
             return True

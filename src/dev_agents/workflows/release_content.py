@@ -347,6 +347,13 @@ def _clean_internal_note(value: Any) -> str:
     return note
 
 
+def _attribution(item: dict[str, Any]) -> dict[str, str]:
+    value = item.get("featureIds", "")
+    if isinstance(value, list):
+        value = ",".join(str(part) for part in value)
+    return {"featureIds": ",".join(sorted({part.strip() for part in str(value).split(",") if part.strip()}))} if value else {}
+
+
 def _bluesky_draft(item: dict[str, Any]) -> dict[str, str]:
     draft = {
         "pageUrl": str(item.get("pageUrl", "")),
@@ -358,6 +365,7 @@ def _bluesky_draft(item: dict[str, Any]) -> dict[str, str]:
         value = str(item.get(key, "")).strip()
         if value:
             draft[key] = value
+    draft.update(_attribution(item))
     return draft
 
 
@@ -384,6 +392,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
                 draft["image"] = image
             if topic_tag:
                 draft["topic_tag"] = topic_tag
+            draft.update(_attribution(item))
             thread_drafts.append(draft)
     discussion_drafts: list[dict[str, str]] = []
     if isinstance(discussions, list):
@@ -401,6 +410,7 @@ def parse_writer_result(data: dict[str, Any] | None) -> WriterResult | None:
                 discussion["pageUrl"] = page_url
             if image:
                 discussion["image"] = image
+            discussion.update(_attribution(item))
             discussion_drafts.append(discussion)
     return WriterResult(
         bluesky=[
@@ -905,9 +915,14 @@ def run_evaluator_pass(
 def _writer_context(
     evaluator: EvaluatorResult, delta: ReleaseDelta, recent_posts: str = "(none)"
 ) -> dict[str, str]:
+    from .release_coverage import feature_id
     features = "\n".join(
-        f"- {item.get('name', '')}: {item.get('why_users_care', '')}" for item in evaluator.features
+        f"- [{feature_id(item)}] {item.get('name', '')}: {item.get('why_users_care', '')}"
+        for item in evaluator.features
     )
+    features += ("\nEach draft must include featureIds: a comma-separated string of the exact "
+                 "feature IDs it actually describes. Do not claim unrelated features. "
+                 "Use the same IDs across channel variants; pageUrl is not a feature identity.")
     return {
         **_delta_context(delta),
         "reason": evaluator.reason,
@@ -963,7 +978,7 @@ def run_threads_adaptation_pass(
 ) -> list[dict[str, str]]:
     """Adapt release copy into Threads-native posts while retaining source URLs."""
     base = [
-        {"pageUrl": item.get("pageUrl", ""), "text": item.get("text", "")}
+        {"pageUrl": item.get("pageUrl", ""), "text": item.get("text", ""), **_attribution(item)}
         for item in base_drafts
         if item.get("text", "").strip()
     ]
@@ -981,6 +996,7 @@ def run_threads_adaptation_pass(
             "recent_posts": recent_posts,
         },
     )
+    prompt += "\nRetain each source draft's exact featureIds in its adapted post. Do not infer identity from pageUrl."
     output = _run_pass(
         repo=repo,
         prompt=prompt,
@@ -999,13 +1015,19 @@ def run_threads_adaptation_pass(
     by_url = {item.get("pageUrl", ""): item for item in base_drafts}
     adapted: list[dict[str, str]] = []
     for index, item in enumerate(result.threads):
-        source = by_url.get(item.get("pageUrl", ""))
+        source = next((draft for draft in base_drafts if item.get("featureIds")
+                       and draft.get("featureIds") == item.get("featureIds")), None)
+        if source is None and any(draft.get("featureIds") for draft in base_drafts):
+            raise RuntimeError(f"Threads adaptation omitted or changed featureIds for run {run_id}")
+        if source is None:
+            source = by_url.get(item.get("pageUrl", ""))
         if source is None and index < len(base_drafts):
             source = base_drafts[index]
         if source is None:
             continue
         post = dict(item)
         post["pageUrl"] = source.get("pageUrl", "")
+        post.update(_attribution(source))
         if source.get("image"):
             post["image"] = source["image"]
         adapted.append(post)

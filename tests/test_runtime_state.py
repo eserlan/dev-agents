@@ -72,7 +72,7 @@ def test_state_repository_migrates_schema_and_enables_wal(tmp_path):
     assert record.metadata["_worker_identity"]["pid"] > 0
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
     assert connection.execute("SELECT status FROM delivery_claims").fetchone()[0] == "completed"
     events = store.list_run_events("workflow", "run-1")
     assert [event.event for event in events] == ["run_started", "run_completed"]

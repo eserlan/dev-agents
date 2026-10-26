@@ -56,6 +56,26 @@ daemon terminates that run's agent process, closes the old run as superseded, an
 restarts feedback collection against the latest head. Other webhook events do not cancel active
 work; reconciliation still avoids starting duplicate work for a PR already being handled.
 
+## Review stopping rules
+
+Blocking audit findings must cite an accepted requirement, a reachable failure trigger, and the
+changed code that introduced the failure. Hardening, missing tests alone, broader coverage and
+design suggestions are nonblocking limitations and do not trigger automatic repairs. Generated
+prose is checked for structural facts; semantic guarantees require an explicit product contract
+rather than increasingly elaborate word-matching heuristics.
+
+Post-fix reviews preserve the original acceptance criteria and inspect only unresolved findings
+and regressions caused by repairs. The final targeted review verifies only; it cannot start a
+third repair. Writer starts (including failed attempts) count toward a persistent two-attempt
+budget per PR across all heads and review chains. Historical pushed repairs count as attempts.
+
+A fixer may return `disputed` with source-backed reasons instead of editing. Disputes and exhausted
+budgets persist `review_halted` and the unresolved report in SQLite, post a review-halted comment,
+and stop automatic reviews and internal-review auto-merge eligibility for that PR, including after
+new pushes or daemon restarts. Human adjudication is required. There is no automatic reset; an
+operator must deliberately clear the halted metadata and repair-attempt history to authorize a
+fresh budget. Previously saved audits without the new required evidence fields must be re-audited.
+
 ## State database
 
 Workflow state is stored in the configured `pr_fixer.state_path` SQLite database. If it is omitted,

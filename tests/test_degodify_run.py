@@ -82,8 +82,9 @@ def git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=repo, text=True, stderr=subprocess.DEVNULL).strip()
 
 
+@pytest.mark.parametrize("recovery", ["immediate", "noop", "dirty", "fallback", "exhausted", "timeout"])
 @pytest.mark.parametrize("kept_lines, expect_pr", [(200, True), (900, False)])
-def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kept_lines: int, expect_pr: bool) -> None:
+def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kept_lines: int, expect_pr: bool, recovery: str) -> None:
     origin = tmp_path / "origin"
     origin.mkdir()
     git(origin, "init", "-b", "staging")
@@ -101,10 +102,29 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     git(repo, "config", "user.name", "Test")
     prompts: list[str] = []
     created: list[tuple[str, ...]] = []
+    budgets: list[float] = []
+    from types import SimpleNamespace
+    clock = iter(range(0, 10000, 10))
+    monkeypatch.setattr(degodify, "time", SimpleNamespace(monotonic=lambda: next(clock)))
 
     def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
         prompts.append(prompt)
+        budgets.append(kwargs["timeout_seconds"])
+        assert kwargs["model"] == "decomposition-model"
+        assert kwargs["reasoning_effort"] == "high"
         worktree = kwargs["cwd"]
+        if recovery == "exhausted" or (recovery == "fallback" and _name == "first"):
+            return AgentResult(0, False)
+        if recovery == "timeout":
+            return AgentResult(1, True)
+        if len(prompts) == 1 and recovery in {"noop", "dirty"}:
+            if recovery == "dirty":
+                (worktree / "partial.txt").write_text("preserve me")
+            return AgentResult(0, False)
+        if recovery in {"noop", "dirty"}:
+            assert "Continue in this same worktree" in prompt
+        if recovery == "dirty":
+            assert (worktree / "partial.txt").read_text() == "preserve me"
         lines = (worktree / TARGET).read_text().splitlines()
         (worktree / TARGET).write_text("\n".join(lines[:kept_lines]) + "\n")
         (worktree / "src/theme.ts").write_text("\n".join(lines[kept_lines:]) + "\n")
@@ -122,7 +142,24 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     monkeypatch.setattr(degodify, "_gh", lambda _repo, *args, **_kwargs: created.append(args) or "https://example.test/pr/1")
     candidate = degodify.DegodifyFile(TARGET, 1000, 1000, "Utility / Module", "CRITICAL")
 
-    result = degodify._run_degodify_impl(repo, dry_run=False, supplied_candidate=candidate, log_path=tmp_path / "log")
+    events = []
+    result = degodify._run_degodify_impl(
+        repo, dry_run=False, supplied_candidate=candidate, log_path=tmp_path / "log",
+        providers=["first", "second"] if recovery == "fallback" else ["first"],
+        model="decomposition-model", reasoning_effort="high",
+        on_event=lambda event, payload: events.append((event, payload)),
+    )
+    assert all(event == "agent_attempt" for event, _ in events)
+    assert budgets == sorted(budgets, reverse=True)
+    if len(budgets) > 1:
+        assert budgets[-1] < budgets[0]
+    if recovery in {"exhausted", "timeout"}:
+        assert not result.succeeded and not created
+        assert len(prompts) == (1 if recovery == "timeout" else 2)
+        assert "no clean committed change" in result.reason
+        return
+    assert len(prompts) == {"immediate": 1, "noop": 2, "dirty": 2, "fallback": 3}[recovery]
+    assert events[-1][1]["committed_change"] is True
 
     assert "- huge at line 40" in prompts[0]
     assert result.succeeded is expect_pr
@@ -191,3 +228,4 @@ def test_degodify_timeout_defaults_to_an_hour() -> None:
     from dev_agents.config import PrFixerConfig
 
     assert PrFixerConfig().degodify_timeout_minutes == 60
+    assert PrFixerConfig().degodify_model == "gpt-6.1-sol"

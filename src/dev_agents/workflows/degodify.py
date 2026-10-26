@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -83,6 +84,8 @@ class DegodifyState(TypedDict, total=False):
     base_branch: str
     provider: str
     providers: list[str]
+    model: str | None
+    reasoning_effort: str
     log_path: Path | None
     timeout_seconds: float
     dry_run: bool
@@ -299,8 +302,11 @@ def _run_degodify_impl(
     providers: list[str] | None = None,
     log_path: Path | None = None,
     timeout_seconds: float = 25 * 60,
+    model: str | None = None,
+    reasoning_effort: str = "high",
     dry_run: bool = True,
     supplied_candidate: DegodifyFile | None = None,
+    on_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> DegodifyRunResult:
     """Run one bounded decomposition, with mutation disabled by default."""
     candidate = supplied_candidate or plan_degodify(repo).candidate
@@ -326,17 +332,59 @@ def _run_degodify_impl(
         fallow = summarize_fallow_inspect(inspected, candidate.relative_path) if inspected else None
         prompt = build_decomposition_prompt(candidate, branch, base_branch, worktree, fallow)
         configured_providers = providers or [provider]
+        deadline = time.monotonic() + timeout_seconds
+        attempts = 0
+
+        def committed_change() -> bool:
+            return (
+                _git(worktree, "status", "--porcelain") == ""
+                and _git(worktree, "rev-parse", "HEAD") != _git(worktree, "rev-parse", f"origin/{base_branch}")
+            )
+
         def run_provider(name: str) -> AgentResult:
+            nonlocal attempts
             if name != configured_providers[0]:
                 _git(worktree, "reset", "--hard", f"origin/{base_branch}")
                 _git(worktree, "clean", "-fdx")
-            return run_agent(name, prompt, cwd=worktree, log_path=log_path or repo / ".dev-agents" / "degodify.log", timeout_seconds=timeout_seconds)
-        accepted = run_with_fallback(configured_providers, run_provider)
-        result = accepted[1] if accepted else None
-        clean = _git(worktree, "status", "--porcelain") == ""
-        changed = _git(worktree, "rev-parse", "HEAD") != _git(worktree, "rev-parse", f"origin/{base_branch}")
-        if result is None or not clean or not changed:
-            return DegodifyRunResult(candidate, branch, None, False, False, "agent did not leave a clean, committed change")
+                if use_fallow:
+                    _install_dependencies(worktree)
+            result = AgentResult(1, False)
+            # One continuation per provider preserves partial edits and gives an
+            # inspection-only turn a chance to finish. All turns share one deadline.
+            for turn in range(2):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return AgentResult(1, True)
+                attempts += 1
+                recovery = "" if turn == 0 else """
+The previous attempt did not leave a clean committed change. Continue in this same worktree;
+inspect git status and the existing edits before doing anything else. Preserve partial work.
+Implement the decomposition now, run focused validation, and commit. An inspection summary or
+plan is not completion. If blocked, give the exact failing command and actionable blocker.
+"""
+                result = run_agent(
+                    name, prompt + recovery, cwd=worktree,
+                    log_path=log_path or repo / ".dev-agents" / "degodify.log",
+                    timeout_seconds=remaining, model=model, reasoning_effort=reasoning_effort,
+                )
+                complete = result.returncode == 0 and not result.timed_out and committed_change()
+                if on_event:
+                    on_event("agent_attempt", {
+                        "provider": name, "attempt": attempts, "continuation": bool(turn),
+                        "returncode": result.returncode, "timed_out": result.timed_out,
+                        "committed_change": complete,
+                    })
+                if complete or result.timed_out:
+                    break
+            return result
+
+        accepted = run_with_fallback(
+            configured_providers, run_provider,
+            lambda _name, result: result.returncode == 0 and not result.timed_out and committed_change(),
+        )
+        if accepted is None:
+            return DegodifyRunResult(candidate, branch, None, False, False,
+                                     f"no clean committed change after {attempts} agent attempts; see agent_attempt events and log")
         after_lines = _line_count(worktree / candidate.relative_path)
         # A fallback provider's reset runs `git clean -fdx`, which also removes node_modules.
         audit = (
@@ -394,8 +442,10 @@ def build_degodify_workflow() -> Any:
             providers=state.get("providers"),
             log_path=state.get("log_path"),
             timeout_seconds=state.get("timeout_seconds", 25 * 60),
+            model=state.get("model"), reasoning_effort=state.get("reasoning_effort", "high"),
             dry_run=state.get("dry_run", True),
             supplied_candidate=state.get("candidate"),
+            on_event=state.get("on_event"),
         )
         _emit(state, "execute_decomposition", {"succeeded": result.succeeded})
         return {"result": result}
@@ -426,6 +476,8 @@ def run_degodify(
     providers: list[str] | None = None,
     log_path: Path | None = None,
     timeout_seconds: float = 25 * 60,
+    model: str | None = None,
+    reasoning_effort: str = "high",
     dry_run: bool = True,
     supplied_candidate: DegodifyFile | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
@@ -438,6 +490,7 @@ def run_degodify(
         "providers": providers,
         "log_path": log_path,
         "timeout_seconds": timeout_seconds,
+        "model": model, "reasoning_effort": reasoning_effort,
         "dry_run": dry_run,
         "supplied_candidate": supplied_candidate,
         "on_event": on_event,
@@ -508,6 +561,11 @@ def build_decomposition_prompt(
 
 TARGET FILE: {file.relative_path} ({file.total_lines} lines, {file.code_lines} code lines, type: {file.file_type})
 CURRENT BRANCH: {branch} (branched from {base_branch})
+
+This is an execution task. Start implementing after enough inspection to identify the seams;
+do not finish with a plan or an explanation that the task needs multiple extractions. Work in
+small validated steps in this worktree until the requested decomposition is complete. If the
+evidence lists no dead code, skip that step. Report an exact blocker only if execution fails.
 
 Decompose this file thoroughly. One surgical extraction is not enough: move every separable
 responsibility into focused sibling modules until the file is at most {target} lines. Keep the

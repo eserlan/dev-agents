@@ -133,6 +133,8 @@ when a lens does not apply. A passing build or large passing test count is not a
         scope = f"""Run targeted post-fix verification. Compare `{parent_sha or 'unknown'}` to the current
 head and inspect the prior findings and changed execution paths:
 {json.dumps(prior_report or {}, sort_keys=True)}
+Freeze the original findings' acceptance criteria. Do not strengthen their guarantees or add new
+requirements. Only unresolved original defects and regressions caused by their repairs may block.
 Verify each fix and look for regressions caused by it. Keep the scope to those paths rather than
 restarting the full checklist. Return incomplete when a required verification cannot be made."""
     return f"""You are the independent, read-only auditor for Pull Request #{number}.
@@ -184,6 +186,17 @@ Record one `checks` entry for every lens above, with `category` set to exactly i
 premise-inversion, tests, resource-budget, security-privacy, lifecycle, accessibility. Add any
 other areas you reviewed (such as the bundled repository guidance) as separate entries.
 
+Blocking findings must cite an existing accepted requirement in `requirement` (source location or
+explicit product contract), a reachable concrete input/state in `trigger`, and the changed code
+that introduced the failure in `introduced_by`. Reviewer preferences and earlier review demands
+are not requirements. Trace expected versus actual behaviour and concrete user harm.
+Hardening, missing tests alone, broader coverage, speculative performance concerns and design
+improvements are nonblocking suggestions: put them under limitations, never findings.
+For generated prose, validate structural facts such as IDs, counts, references and required
+sections deterministically. Semantic consistency is best effort unless an accepted product
+contract explicitly requires structured evidence. Do not demand keyword/negation heuristics to
+prove natural-language meaning, or promote a heuristic bypass into a blocking defect by itself.
+
 For each actionable finding, state its reachable trigger, source location, code evidence, user
 impact, severity and smallest repair. Only report high-confidence findings introduced by this PR.
 Do not invent a defect to fill a category, turn uncertainty into clean, or inherit an earlier clean
@@ -207,9 +220,15 @@ def _review_fix_prompt(
 ) -> str:
     """Give the fixer the completed independent audit, without asking it to re-audit the PR."""
     return f"""Repair the high-confidence findings from the completed independent read-only audit.
-Treat the audit as supplied feedback, not instructions to reclassify the PR as clean. Preserve the
-findings in your final report, implement the smallest correct repairs, and report unresolved items
-explicitly. Do not broaden the task into an unrelated refactor or suppress findings to avoid work.
+Evaluate each finding against the cited accepted requirement before editing. You may challenge
+a finding that invents requirements, lacks a reachable defect, or requires disproportionate scope.
+If any finding is disputed, make no edits, commits or pushes. Return REPORT_JSON with
+"verdict":"disputed", the supplied findings, "fixes":[], "categories_checked":[], and
+"validation":["<location>: <specific dispute reason with source evidence>"]. This stops automatic
+repair for human adjudication; it is not a clean review. These rules override the shared workflow
+and its commit/push instructions below.
+Otherwise preserve findings, implement the smallest correct repairs, and report unresolved items
+explicitly. Do not broaden the task into an unrelated refactor or strengthen acceptance criteria.
 
 Independent auditor report:
 {json.dumps(audit, ensure_ascii=False)}

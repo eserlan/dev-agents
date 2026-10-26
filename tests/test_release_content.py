@@ -634,9 +634,12 @@ def test_merge_generates_art_for_missing_images(
         "evaluated",
         "routed",
         "drafted",
+        "feature_inventory",
         "images",
         "generated",
+        "feature_inventory",
         "published",
+        "feature_coverage",
     ]
 
 

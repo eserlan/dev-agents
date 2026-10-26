@@ -152,7 +152,7 @@ def _coerce_finding_aliases(item: dict[str, Any]) -> dict[str, Any]:
 
 def _normalise_review_report(value: Any) -> dict[str, Any] | None:
     """Validate the review JSON without retaining unbounded agent output."""
-    if not isinstance(value, dict) or value.get("verdict") not in {"clean", "findings"}:
+    if not isinstance(value, dict) or value.get("verdict") not in {"clean", "findings", "disputed"}:
         return None
     findings = value.get("findings")
     categories = value.get("categories_checked")
@@ -181,6 +181,8 @@ def _normalise_review_report(value: Any) -> dict[str, Any] | None:
         and isinstance(item.get("summary"), str)
         for item in fixes
     ):
+        return None
+    if value["verdict"] == "disputed" and (fixes or not validation or not findings):
         return None
     return {
         "verdict": value["verdict"],

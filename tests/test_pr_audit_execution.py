@@ -36,7 +36,7 @@ def setup_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return origin, repo, head
 
 
-@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "claude_attributed", "claim_wait"])
+@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "claude_attributed", "claim_wait", "disputed", "budget", "verification_only"])
 def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     origin, repo, head = setup_repository(tmp_path)
     service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
@@ -65,6 +65,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
                 return AgentResult(0, False)
             findings = [] if mode in {"clean", "mutation", "incomplete"} else [{
                 "severity": "high", "confidence": "high", "category": "security-privacy",
+                "requirement": "base.txt:1 requires input validation",
+                "trigger": "Invalid input enters the new branch",
+                "introduced_by": "feature.txt:1 bypasses validation",
                 "location": "feature.txt:1", "evidence": "The new branch bypasses validation",
                 "impact": "Invalid input reaches the sensitive sink", "remediation": "Validate before use",
             }]
@@ -91,13 +94,18 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
             calls.append("fixer")
             assert "Independent auditor report" in prompt and "feature.txt:1" in prompt
             fixes = []
-            if mode != "fix_noop":
+            if mode not in {"fix_noop", "disputed"}:
                 (worktree / "feature.txt").write_text("fixed")
                 git(worktree, "add", ".")
                 git(worktree, "commit", "-m", "fix")
                 git(worktree, "push", "origin", "HEAD:feature")
                 fixes = [{"location": "feature.txt:1", "summary": "Validated before use"}]
             repair = {"verdict": "clean", "findings": [], "fixes": fixes, "categories_checked": [], "validation": ["focused check"]}
+            if mode == "disputed":
+                repair.update(verdict="disputed", findings=[{
+                    "severity": "high", "category": "security-privacy", "location": "feature.txt:1",
+                    "impact": "Disputed", "remediation": "Human adjudication",
+                }], validation=["base.txt:1 does not require the proposed guarantee"])
             output.write_text("DEV_AGENTS_REVIEW_REPORT_BEGIN\nFINDINGS: repaired\nFIXES: repaired\nREPORT_JSON: " + json.dumps(repair) + "\nDEV_AGENTS_REVIEW_REPORT_END\n")
         return AgentResult(0, False)
 
@@ -108,9 +116,30 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
             {"authors": [{"login": "eserlan"}, {"login": "claude"}]},
             {"authors": [{"login": "eserlan"}]},
         ])
-    succeeded, report = service._fix(42, "feature", [], review_only=True, meta=meta, run_id=run_id)
+    if mode == "budget":
+        for index in range(2):
+            previous = f"previous-chain-{index}"
+            service.state.claim_run("pr-review", previous, metadata={
+                "pull_request": 42, "head_sha": f"old-bot-head-{index}",
+                "review_repair_attempts": 1,
+            })
+            service.state.complete_run("pr-review", previous)
+    service.state.claim_run("pr-review", "unrelated-pr", metadata={
+        "pull_request": 99, "review_repair_attempts": 10,
+    })
+    succeeded, report = service._fix(42, "feature", [], review_only=True, meta=meta, run_id=run_id, review_round=2 if mode == "verification_only" else 0)
     assert succeeded == (mode in {"clean", "findings", "incomplete_findings", "claude_attributed", "claim_wait"})
-    assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop", "claude_attributed"} else ["auditor"])
+    assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop", "claude_attributed", "disputed"} else ["auditor"])
+    if mode in {"disputed", "budget", "verification_only"}:
+        assert report["review_halted"]
+        assert git(origin, "rev-parse", "feature") == head
+        service._finalize({"number": 42, "claimed": True, "workflow": "pr-review",
+                           "run_id": run_id, "review_only": True, "report": report})
+        assert service.state.get_run("pr-review", run_id).status == "completed"
+        restarted = PrFixerService("demo", service.project, service.config)
+        assert restarted._review_plan(42, "another-bot-head") is None
+        assert "review-halted" in dict(comments)
+        assert not service._has_completed_internal_review(42, head)
     if mode in {"findings", "claude_attributed"}:
         assert "handoff_agent" not in report
         assert report["review_report"]["verdict"] == "findings"

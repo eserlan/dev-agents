@@ -19,6 +19,9 @@ class AuditFinding(BaseModel):
     confidence: Literal["high"]
     category: str = Field(min_length=1)
     location: str = Field(min_length=1)
+    requirement: str = Field(min_length=1)
+    trigger: str = Field(min_length=1)
+    introduced_by: str = Field(min_length=1)
     evidence: str = Field(min_length=1)
     impact: str = Field(min_length=1)
     remediation: str = Field(min_length=1)
