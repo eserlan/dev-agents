@@ -213,6 +213,26 @@ def test_codex_final_message_is_separate_from_echoed_log(
     assert "Echoed prompt" in (tmp_path / "agent.log").read_text()
 
 
+def test_muse_provider_command_accepts_queue_model() -> None:
+    command = provider_command("muse", "write an answer", model="muse-wonder-1.0")
+    assert command[command.index("--model") + 1] == "muse-wonder-1.0"
+
+
+def test_muse_provider_command_forwards_reasoning_effort_when_set() -> None:
+    command = provider_command(
+        "muse", "write an answer", model="muse-wonder-1.0", reasoning_effort="high"
+    )
+    assert command[command.index("--reasoning-effort") + 1] == "high"
+    # No effort requested: leave the model's own default in charge.
+    assert "--reasoning-effort" not in provider_command("muse", "write an answer")
+
+
+def test_muse_provider_command_can_emit_json_events() -> None:
+    command = provider_command("muse", "write an answer", json_events=True)
+    assert "--json" in command
+    assert "--json" not in provider_command("muse", "write an answer")
+
+
 @pytest.fixture(autouse=True)
 def disable_systemd_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("dev_agents.runtime.agent._user_systemd_available", lambda: False)

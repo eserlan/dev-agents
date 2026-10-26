@@ -25,6 +25,16 @@ class IssueFixerConfig(BaseModel):
     # use the same isolated branch, validation, and review pipeline.
     kind: Literal["fix", "enhancement", "copy", "agent", "answer", "help"] = "fix"
     provider: Literal["codex", "muse"] = "codex"
+    model: str | None = None
+    # None inherits the PR fixer's reasoning effort; set explicitly to pin
+    # the writing effort for this queue (for example the answer queue).
+    reasoning_effort: str | None = None
+    # Answer queues only: run the copy reviewer on the draft before the PR
+    # is opened and revise until it clears the score gate or the revision
+    # cap is reached (the cap keeps a stuck draft from looping forever).
+    pre_pr_review: bool = True
+    pre_pr_score_threshold: float = Field(default=8.5, ge=0, le=10)
+    pre_pr_max_revisions: int = Field(default=3, ge=0, le=10)
     fallback_provider: Literal["codex", "muse"] | None = None
     fallback_model: str | None = None
     base_branch: str = "main"

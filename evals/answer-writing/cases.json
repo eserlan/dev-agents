@@ -1,0 +1,23 @@
+[
+  {
+    "name": "dice-notation-reference",
+    "title": "What does 2d6 mean in tabletop RPG dice notation?",
+    "brief": "Write a concise reference Answer for a new player who has seen dice notation such as 2d6, 1d8 and 3d4 in a rulebook and wants to read it correctly. Define the notation, show how a modifier applies, and state the boundary: the notation describes the dice, it does not decide whether a roll is needed or what the total means. Audience: first-time player. No worked scene is required beyond a small numeric example.",
+    "expected_slug": "what-does-2d6-mean",
+    "expected_verdict": "clean"
+  },
+  {
+    "name": "ferry-town-worldbuilding",
+    "title": "How can a ferry crossing shape a fictional town?",
+    "brief": "Write a worldbuilding Answer teaching a compact cause-and-effect technique: start from who needs a crossing and what makes passage unreliable, then derive the institution that provides it, who pays, and who bears the cost when it fails. Use one runnable fictional example (a river town is fine) and show a visible detail players could encounter. Audience: GM building a settlement. Avoid inventing the town's whole history.",
+    "expected_slug": "how-can-a-ferry-crossing-shape-a-fictional-town",
+    "expected_verdict": "clean"
+  },
+  {
+    "name": "heist-session-advice",
+    "title": "How do you run a heist in a tabletop RPG?",
+    "brief": "Write GM advice for running a one-session heist: planning that rewards player choices, a complication that follows from the fiction rather than a script, and what to do when the plan collapses early. Show a short worked example where a player decision changes the outcome. Distinguish advice that works in most systems from techniques that depend on specific mechanics (name the mechanic if you cite a system). Audience: GM with some experience running published adventures.",
+    "expected_slug": "how-do-you-run-a-heist-in-a-tabletop-rpg",
+    "expected_verdict": "clean"
+  }
+]

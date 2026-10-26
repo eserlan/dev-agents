@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, Thread
@@ -17,6 +18,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from dev_agents.config import IssueFixerConfig, PrFixerConfig, ProjectConfig
+from dev_agents.copy_review import review_answer_draft
 from dev_agents.pr_fixer import _log
 from dev_agents.runtime import (
     StateRepository,
@@ -267,8 +269,11 @@ Apply this additional dev-agents editorial standard while drafting:
   repeated explanations, empty reassurance, misleading micro-copy, and examples that narrate rather
   than teach. Keep useful distinctions and practical detail; do not chase an arbitrary length.
 - Select related Answers, tools, and product references by the reader's likely next task. Prefer a
-  relevant cornerstone or neighbour, and omit a tool or Codex Cryptica mention when it does not
+  relevant, well-connected neighbour, and omit a tool or Codex Cryptica mention when it does not
   help answer this question. Keep product claims accurate, restrained, and optional.
+- The add-answer skill's required example and checklist blocks are schema requirements, not
+  optional extras: include them, shape them to this question, and do not add a second generic
+  example or checklist alongside them.
 - Treat the existing post-merge `copy-fix` review as a safety net, not a drafting stage or a score to
   game. Resolve material quality problems you find now, while remaining open to valid editorial
   corrections later; the goal is a useful Answer, not zero review findings.
@@ -306,7 +311,17 @@ def _prompt(
     kind: str = "fix",
 ) -> str:
     framing = _KIND_FRAMING.get(kind, _KIND_FRAMING["fix"])
-    shared_skill = SHARED_PR_FIX_SKILL.read_text(encoding="utf-8") if SHARED_PR_FIX_SKILL.is_file() else ""
+    if kind == "answer":
+        # The pr-fix skill assumes an existing PR under review; an Answer run
+        # starts from an issue, and the orchestrator owns the branch and PR.
+        shared_skill = """Orchestrator ownership (takes precedence over any conflicting step in
+repository skills, including the add-answer skill's branch/PR step):
+- Work only on the branch named below, in this worktree. Do not create branches or pull
+  requests, and do not merge anything; the orchestrator opens the PR after you push.
+- Commit and push that branch when the article is complete. Do not bypass failing
+  validation hooks to get a push through; fix the failure or report it as a blocker."""
+    else:
+        shared_skill = SHARED_PR_FIX_SKILL.read_text(encoding="utf-8") if SHARED_PR_FIX_SKILL.is_file() else ""
     title = str(issue.get("title", "Untitled issue"))
     body = str(issue.get("body") or "(issue has no body)")[:30_000]
     conflict_text = "\n".join(f"- {path}" for path in conflicts) or "None"
@@ -329,7 +344,7 @@ Issue body:
 {body}
 {discussion}
 
-Shared dev-agents PR-fix workflow:
+{"Orchestrator workflow:" if kind == "answer" else "Shared dev-agents PR-fix workflow:"}
 {shared_skill}
 
 Branch: {branch} (based on {base_branch})
@@ -352,6 +367,17 @@ SUMMARY: <{framing['report_field']}>
 VALIDATION: <commands and results>
 ISSUE_FIX_REPORT_END
 """
+
+
+def _reset_worktree_for_fallback(worktree: Path, base_branch: str, branch: str) -> None:
+    """Discard a failed provider's partial edits before a fallback provider runs.
+
+    Also deletes any remote branch the failed provider managed to push, so the
+    fallback's own push is not rejected as a non-fast-forward.
+    """
+    _run(worktree, "git", "reset", "--hard", f"origin/{base_branch}")
+    _run(worktree, "git", "clean", "-fd")
+    _run(worktree, "git", "push", "origin", "--delete", branch, check=False)
 
 
 def _drop_empty_local_branch(repo: Path, branch: str, base_branch: str) -> None:
@@ -515,6 +541,7 @@ class IssueFixerRunState(TypedDict, total=False):
     pr_url: str | None
     summary: str
     validation: str
+    review_note: str
 
 
 class IssueFixerService:
@@ -629,6 +656,7 @@ class IssueFixerService:
         fixed = False
         summary = "Agent did not produce a clean pushed fix."
         validation = f"Agent log: {log_path}"
+        review_note = ""
         try:
             with _isolated_issue_worktree(
                 self.project.repo,
@@ -665,10 +693,22 @@ class IssueFixerService:
                     results: dict[str, AgentResult] = {}
 
                     def run_provider(provider: str) -> AgentResult:
+                        if results:
+                            # A fallback provider starts from the base branch, not
+                            # from the failed provider's partial edits.
+                            _reset_worktree_for_fallback(
+                                worktree, self.config.base_branch, state["branch"]
+                            )
+                            _log(
+                                f"issue-fixer issue={number} run_id={run_id} "
+                                f"fallback-reset provider={provider}"
+                            )
                         model = (
                             self.config.fallback_model
                             if provider == self.config.fallback_provider
-                            else self.pr_config.model
+                            else self.config.model or (
+                                self.pr_config.model if provider == "codex" else None
+                            )
                         )
                         result = run_agent(
                             provider,
@@ -677,8 +717,10 @@ class IssueFixerService:
                             log_path=log_path,
                             timeout_seconds=self.config.timeout_minutes * 60,
                             heartbeat_seconds=self.pr_config.heartbeat_seconds,
-                            reasoning_effort=self.pr_config.reasoning_effort,
+                            reasoning_effort=self.config.reasoning_effort
+                            or self.pr_config.reasoning_effort,
                             model=model,
+                            json_events=provider == "muse",
                         )
                         results[provider] = result
                         return result
@@ -690,28 +732,76 @@ class IssueFixerService:
                             f"issue-fixer issue={number} run_id={run_id} "
                             f"provider-fallback={self.config.provider}->{used_provider}"
                         )
-                    _run(
-                        worktree,
-                        "git",
-                        "fetch",
-                        "origin",
-                        f"refs/heads/{state['branch']}:refs/remotes/origin/{state['branch']}",
-                        check=False,
-                    )
-                    head = _run(worktree, "git", "rev-parse", "HEAD", check=False)
-                    remote = _run(
-                        worktree, "git", "rev-parse", f"origin/{state['branch']}", check=False
-                    )
-                    clean = _run(worktree, "git", "status", "--porcelain", check=False) == ""
-                    pushed_change = bool(head and head != base_sha and head == remote)
-                    fixed = result.returncode == 0 and not result.timed_out and clean and pushed_change
-                    validation = (
-                        f"exit={result.returncode} timed_out={result.timed_out} "
-                        f"clean={clean} head_matches_remote={head == remote} head_ahead_of_base={head != base_sha}; "
-                        f"log: {log_path}"
-                    )
+                    def verify_pushed(agent_result: AgentResult) -> tuple[bool, str]:
+                        _run(
+                            worktree,
+                            "git",
+                            "fetch",
+                            "origin",
+                            f"refs/heads/{state['branch']}:refs/remotes/origin/{state['branch']}",
+                            check=False,
+                        )
+                        head = _run(worktree, "git", "rev-parse", "HEAD", check=False)
+                        remote = _run(
+                            worktree, "git", "rev-parse", f"origin/{state['branch']}", check=False
+                        )
+                        clean = _run(worktree, "git", "status", "--porcelain", check=False) == ""
+                        pushed = bool(head and head != base_sha and head == remote)
+                        ok = (
+                            agent_result.returncode == 0
+                            and not agent_result.timed_out
+                            and clean
+                            and pushed
+                        )
+                        return ok, (
+                            f"exit={agent_result.returncode} timed_out={agent_result.timed_out} "
+                            f"clean={clean} head_matches_remote={head == remote} "
+                            f"head_ahead_of_base={head != base_sha}; log: {log_path}"
+                        )
+
+                    fixed, validation = verify_pushed(result)
                     if not fixed and result.timed_out:
                         summary = "Agent timed out before producing a verified pushed fix."
+                    if used_provider != self.config.provider:
+                        review_note = (
+                            f"Written by fallback provider {used_provider} "
+                            f"(primary {self.config.provider} did not produce an accepted run; "
+                            "the worktree was reset to the base branch before the fallback started)."
+                        )
+                    if fixed and self.config.kind == "answer":
+                        def report_round(
+                            round_number: int, score: float, verdict: str, blocking: int
+                        ) -> None:
+                            _publish_issue_comment(
+                                self.project.repo,
+                                number,
+                                f"<!-- dev-agents:issue-fix issue={number} run={run_id} "
+                                f"round={round_number} -->\n"
+                                f"### 🤖 Pre-PR quality loop: round {round_number}\n\n"
+                                f"Reviewer score {score}/10 "
+                                f"(gate {self.config.pre_pr_score_threshold}/10), "
+                                f"verdict `{verdict}`, {blocking} blocking finding(s). "
+                                + (
+                                    "Revising and re-reviewing."
+                                    if score < self.config.pre_pr_score_threshold or blocking
+                                    else "Score gate passed; opening the PR."
+                                ),
+                            )
+
+                        review_note, fixed = self._pre_pr_answer_review(
+                            worktree=worktree,
+                            issue=issue,
+                            number=number,
+                            run_id=run_id,
+                            log_path=log_path,
+                            base_sha=base_sha,
+                            branch=state["branch"],
+                            verify_pushed=verify_pushed,
+                            initial_note=review_note,
+                            on_round=report_round,
+                        )
+                        if not fixed:
+                            summary = "Pre-PR review revision did not produce a verified pushed fix."
         except RuntimeError as error:
             return {"fixed": False, "summary": f"Issue fixer blocked: {error}", "validation": "none"}
 
@@ -732,7 +822,8 @@ class IssueFixerService:
                 f"{_KIND_FRAMING.get(self.config.kind, _KIND_FRAMING['fix'])['title_prefix']}: "
                 f"{str(issue.get('title', 'bug'))[:60]}",
                 "--body",
-                f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->\n\nFixes #{number}.\n\nCreated by the dev-agents issue fixer; the normal PR review and validation pipeline will run.",
+                f"<!-- dev-agents:issue-fix issue={number} run={run_id} -->\n\nFixes #{number}.\n\nCreated by the dev-agents issue fixer; the normal PR review and validation pipeline will run."
+                + (f"\n\n{review_note}" if review_note else ""),
             )
         except RuntimeError as error:
             return {"fixed": False, "summary": f"Fix was pushed but PR creation failed: {error}", "validation": f"log: {log_path}"}
@@ -741,7 +832,172 @@ class IssueFixerService:
             "pr_url": pr_url,
             "summary": "Implemented and pushed the issue fix.",
             "validation": f"Agent log: {log_path}",
+            "review_note": review_note,
         }
+
+    def _pre_pr_answer_review(
+        self,
+        *,
+        worktree: Path,
+        issue: dict[str, Any],
+        number: int,
+        run_id: str,
+        log_path: Path,
+        base_sha: str,
+        branch: str,
+        verify_pushed: Callable[[AgentResult], tuple[bool, str]],
+        initial_note: str,
+        on_round: Callable[[int, float, str, int], None] | None = None,
+    ) -> tuple[str, bool]:
+        """Fresh-eyes review loop for an Answer draft before its PR exists.
+
+        Returns ``(note_for_pr_body, still_fixed)``. The loop revises until
+        the draft scores at least ``pre_pr_score_threshold`` with no blocking
+        findings, or ``pre_pr_max_revisions`` revisions have been spent; the
+        cap keeps a nondeterministic reviewer from looping forever, and the
+        outcome is always disclosed in the note. Each round is reported via
+        ``on_round`` so the issue can show the loop is still working.
+        Reviewer failure never blocks the article; the post-merge copy
+        review remains the safety net.
+        """
+        notes = [initial_note] if initial_note else []
+        settings = self.project.copy_review
+        if not self.config.pre_pr_review or settings is None:
+            return "\n\n".join(notes), True
+        threshold = self.config.pre_pr_score_threshold
+        max_revisions = self.config.pre_pr_max_revisions
+        review_log = log_path.with_name(f"{log_path.stem}-draft-review.log")
+        try:
+            changed = _run(
+                worktree, "git", "diff", "--name-only", f"{base_sha}...HEAD", check=False
+            ).splitlines()
+            pages = [
+                path
+                for path in changed
+                if any(fnmatch.fnmatchcase(path, glob) for glob in settings.page_globs)
+            ]
+        except Exception as error:  # noqa: BLE001 - disclosed, post-merge review remains
+            _log(f"issue-fixer issue={number} run_id={run_id} pre-pr-review-failed error={error}")
+            notes.append(
+                f"Pre-PR editorial review unavailable ({error}); "
+                "the post-merge copy review remains the safety net."
+            )
+            return "\n\n".join(notes), True
+        if not pages:
+            notes.append(
+                "Pre-PR editorial review skipped: no changed Answer page matched "
+                "the configured page globs."
+            )
+            return "\n\n".join(notes), True
+
+        history: list[str] = []
+        revisions = 0
+        while True:
+            round_number = revisions + 1
+            try:
+                assessment = review_answer_draft(
+                    self.project,
+                    settings,
+                    worktree=worktree,
+                    page_paths=pages,
+                    issue=issue,
+                    log_path=review_log,
+                )
+            except Exception as error:  # noqa: BLE001 - disclosed, post-merge review remains
+                _log(
+                    f"issue-fixer issue={number} run_id={run_id} "
+                    f"pre-pr-review-failed round={round_number} error={error}"
+                )
+                notes.append(
+                    f"Pre-PR editorial review unavailable in round {round_number} ({error}); "
+                    "the post-merge copy review remains the safety net. "
+                    f"Rounds so far: {'; '.join(history) or 'none'}."
+                )
+                return "\n\n".join(notes), True
+            blockers = [
+                finding for finding in assessment.findings if finding.severity == "blocking"
+            ]
+            history.append(
+                f"round {round_number}: score {assessment.score}/10, "
+                f"verdict {assessment.verdict}, {len(blockers)} blocking"
+            )
+            _log(
+                f"issue-fixer issue={number} run_id={run_id} pre-pr-loop "
+                f"round={round_number} score={assessment.score} verdict={assessment.verdict} "
+                f"blocking={len(blockers)} threshold={threshold}"
+            )
+            if on_round is not None:
+                on_round(round_number, assessment.score, assessment.verdict, len(blockers))
+            if assessment.score >= threshold and not blockers:
+                notes.append(
+                    f"Pre-PR quality loop passed the score gate in round {round_number}: "
+                    f"score {assessment.score}/10 (threshold {threshold}), no blocking findings. "
+                    f"Rounds: {'; '.join(history)}."
+                )
+                return "\n\n".join(notes), True
+            if revisions >= max_revisions:
+                remaining = "; ".join(
+                    f"{finding.category} at {finding.location}" for finding in blockers
+                )
+                notes.append(
+                    f"Pre-PR quality loop reached the revision cap ({max_revisions}) without "
+                    f"clearing the score gate. Rounds: {'; '.join(history)}. "
+                    + (
+                        f"Remaining blocking findings for human review: {remaining}."
+                        if blockers
+                        else "No blocking findings remain; the score stayed below "
+                        f"{threshold}, with the reviewer's most important improvement: "
+                        f"{assessment.most_important_improvement}."
+                    )
+                )
+                return "\n\n".join(notes), True
+            if not assessment.findings and not blockers:
+                notes.append(
+                    f"Pre-PR quality loop stopped in round {round_number}: score "
+                    f"{assessment.score}/10 is below the {threshold} gate but the reviewer "
+                    "gave no actionable findings to revise against. "
+                    f"Rounds: {'; '.join(history)}."
+                )
+                return "\n\n".join(notes), True
+            findings_text = "\n".join(
+                f"- [{finding.severity}/{finding.category}] {finding.location}: "
+                f"{finding.reader_impact} Proposed fix: {finding.proposed_fix} "
+                f"Evidence: {finding.evidence}"
+                for finding in assessment.findings
+            )
+            revision_prompt = (
+                _prompt(
+                    worktree, issue, self.config.base_branch, branch, [], kind=self.config.kind
+                )
+                + f"\n\nA fresh editorial review (round {round_number}) scored your pushed "
+                f"draft {assessment.score}/10 against a gate of {threshold}/10 with no "
+                "blocking findings. Most important improvement: "
+                f"{assessment.most_important_improvement}\nRevise the article to resolve "
+                "these findings, re-run the target repository's validation, then commit "
+                "and push the same branch. State each corrected fact once; do not repeat "
+                "a correction across sections, and preserve the article's strengths:\n"
+                + findings_text
+            )
+            result = run_agent(
+                self.config.provider,
+                revision_prompt,
+                cwd=worktree,
+                log_path=log_path,
+                timeout_seconds=self.config.timeout_minutes * 60,
+                heartbeat_seconds=self.pr_config.heartbeat_seconds,
+                reasoning_effort=self.config.reasoning_effort or self.pr_config.reasoning_effort,
+                model=self.config.model
+                or (self.pr_config.model if self.config.provider == "codex" else None),
+                json_events=self.config.provider == "muse",
+            )
+            verified, _validation = verify_pushed(result)
+            if not verified:
+                notes.append(
+                    f"Pre-PR quality loop: revision {revisions + 1} did not produce a "
+                    f"verified pushed fix, so no PR was opened. Rounds: {'; '.join(history)}."
+                )
+                return "\n\n".join(notes), False
+            revisions += 1
 
     def _auto_pause_if_exhausted(
         self, number: int, run_id: str, attempt: int, reason: str

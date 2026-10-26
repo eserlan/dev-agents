@@ -58,6 +58,13 @@ projects:
       - label: answer
         kind: answer
         provider: muse
+        model: muse-wonder-1.0
+        # Pin the writing effort explicitly; omit to inherit the PR fixer's.
+        reasoning_effort: high
+        # Pre-PR quality loop: revise until the reviewer scores the draft at
+        # least this (with no blocking findings), up to the revision cap.
+        pre_pr_score_threshold: 8.5
+        pre_pr_max_revisions: 3
         fallback_provider: codex
         fallback_model: gpt-6-luna
         base_branch: staging
