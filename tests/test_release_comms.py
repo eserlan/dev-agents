@@ -384,6 +384,43 @@ def test_resolve_promote_shas_prefers_gh_over_git(
     assert resolve_promote_shas(tmp_path, "999") == ("newsha123", "prevsha000")
 
 
+def test_resolve_promote_shas_prefers_the_promoted_commit_over_the_dispatch_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run dispatched on main has the previous release as headSha; its artifact is the truth."""
+    deployed = {"999": "a" * 40, "123": "b" * 40}
+
+    def fake_run(args: list[str], **kwargs: Any) -> Any:
+        if args[:3] == ["gh", "run", "download"]:
+            sha = deployed.get(args[3])
+            if sha:
+                Path(args[args.index("--dir") + 1], "promoted-sha.txt").write_text(f"{sha}\n")
+            return _ok("")
+        if args[2] == "view":
+            return _ok("stale-dispatch-ref\n")
+        return _ok(json.dumps([{"databaseId": 999, "headSha": "x"}, {"databaseId": 123, "headSha": "y"}]))
+
+    monkeypatch.setattr("dev_agents.workflows.release_comms.subprocess.run", fake_run)
+    assert resolve_promote_shas(tmp_path, "999") == ("a" * 40, "b" * 40)
+
+
+@pytest.mark.parametrize("artifact", [None, "", "not-a-sha", "HEAD", "a" * 39, "A" * 40])
+def test_resolve_promote_shas_ignores_a_missing_or_malformed_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, artifact: str | None
+) -> None:
+    def fake_run(args: list[str], **kwargs: Any) -> Any:
+        if args[:3] == ["gh", "run", "download"]:
+            if artifact is not None:
+                Path(args[args.index("--dir") + 1], "promoted-sha.txt").write_text(artifact)
+            return SimpleNamespace(stdout=b"", returncode=0 if artifact is not None else 1)
+        if args[2] == "view":
+            return _ok("newsha123\n")
+        return _ok(json.dumps([{"databaseId": 123, "headSha": "prevsha000"}]))
+
+    monkeypatch.setattr("dev_agents.workflows.release_comms.subprocess.run", fake_run)
+    assert resolve_promote_shas(tmp_path, "999") == ("newsha123", "prevsha000")
+
+
 def test_resolve_promote_shas_timeout_falls_back_to_git(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

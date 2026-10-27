@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -143,11 +145,38 @@ def _capture(repo: Path, args: list[str], timeout: float) -> str:
     return proc.stdout.strip()
 
 
+PROMOTED_SHA_ARTIFACT = "promoted-sha"
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _promoted_sha(repo: Path, run_id: str, timeout_seconds: float) -> str:
+    """The commit a promote run deployed, from its ``promoted-sha`` artifact, or "".
+
+    A promote run's ``headSha`` is only the ref it was dispatched on. Dispatched on
+    ``main`` instead of ``staging``, it names the previous release, and the delta
+    comes out empty while the real release goes unannounced. Runs without the
+    artifact (older workflows, expired artifacts) fall back to ``headSha``.
+    """
+    with tempfile.TemporaryDirectory(prefix="promoted-sha-") as directory:
+        try:
+            subprocess.run(
+                ["gh", "run", "download", str(run_id), "--name", PROMOTED_SHA_ARTIFACT, "--dir", directory],
+                cwd=repo,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+            sha = (Path(directory) / "promoted-sha.txt").read_text(encoding="utf-8").strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    return sha if FULL_SHA.fullmatch(sha) else ""
+
+
 def resolve_promote_shas(
     repo: Path, promote_run_id: str, timeout_seconds: float = READONLY_TIMEOUT_SECONDS
 ) -> tuple[str, str | None]:
     """Resolve production new SHA and previous successful promote SHA."""
-    new_sha = _capture(
+    new_sha = _promoted_sha(repo, promote_run_id, timeout_seconds) or _capture(
         repo,
         ["gh", "run", "view", str(promote_run_id), "--json", "headSha", "--jq", ".headSha"],
         timeout_seconds,
@@ -179,7 +208,9 @@ def resolve_promote_shas(
         runs = json.loads(runs_raw)
         for r in runs:
             if str(r.get("databaseId")) != str(promote_run_id):
-                previous_sha = r.get("headSha")
+                previous_sha = _promoted_sha(repo, str(r.get("databaseId")), timeout_seconds) or r.get(
+                    "headSha"
+                )
                 break
     except (json.JSONDecodeError, TypeError):
         pass
