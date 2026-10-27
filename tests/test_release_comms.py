@@ -489,3 +489,58 @@ def test_progress_events_skip_drafts_when_not_postworthy(
         "published",
         "feature_coverage",
     ]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_answer_content_posts_reach_podcast_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    destinations = ["instagram", "podcast"] if enabled else ["instagram"]
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(
+            state_path=tmp_path / "release.db",
+            image_generation=False,
+            destinations=destinations,
+            publication_delay_min_seconds=0,
+            publication_delay_max_seconds=0,
+        ),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_publish.publish_instagram",
+        lambda **kwargs: PublicationReceipt("instagram", "instagram", str(kwargs["page_url"]), "https://ig.test/1"),
+    )
+    podcast_pages: list[str] = []
+
+    def fake_podcast(**kwargs: object) -> PublicationReceipt:
+        podcast_pages.append(str(kwargs["page_url"]))
+        return PublicationReceipt("podcast", "podcast", str(kwargs["page_url"]), "https://assets.codexcryptica.com/a.mp3")
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish.publish_podcast", fake_podcast)
+    answer = "https://codexcryptica.com/answers/shared-domains"
+    drafts = WriterResult(instagram=[
+        {"pageUrl": answer, "text": "Answer", "image": "https://assets.codexcryptica.com/og/a.jpg"},
+        {"pageUrl": "https://codexcryptica.com/blog/post", "text": "Blog",
+         "image": "https://assets.codexcryptica.com/og/b.jpg"},
+    ])
+
+    result = run_release_comms(
+        project, "demo", "release-1", dry_run=False, publish_approved=True,
+        evaluator_result=EvaluatorResult(postworthy=True, reason="new content image deployed"),
+        writer_result=drafts,
+    )
+
+    # One message batch per run: the answer goes first, the blog post is scheduled.
+    assert result.scheduled is True
+    assert podcast_pages == ([answer] if enabled else [])
+    assert [item["page_url"] for item in result.published["instagram"]] == [answer]

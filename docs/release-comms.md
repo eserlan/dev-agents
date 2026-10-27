@@ -206,6 +206,36 @@ recorded as "rejected" even though its note was posted. A failing Discord webhoo
 bumps, CI tweaks, formatting) get no note. A dry run reports the note in an `internal_note` event
 without sending it.
 
+## Podcast episodes for answers (Patreon sync)
+
+The opt-in `podcast` destination turns each newly deployed answer page into a narrated episode
+in a public RSS feed. Patreon's podcast sync imports that feed as posts. Patreon is a downstream
+channel only: dev-agents never calls Patreon, and Patreon pulls the feed on its own schedule.
+
+- **Source:** only answer pages (`https://codexcryptica.com/answers/<slug>`) among the content
+  posts that release-comms already discovers for Instagram. Blog and `/for/` pages, and release
+  announcements, are never sent. As with content posts, a run without a previous SHA does not
+  backfill.
+- **Approval:** an answer reaches production only through its reviewed, merged PR. The target
+  command builds the narration and show notes from the answer's own reviewed text (`question` and
+  `shortAnswer`), so no unreviewed copy is published, and the channel can run with `auto_publish`.
+- **Target command:** in the target checkout dev-agents runs `bun run podcast:publish <slug>`,
+  holding the lock `.dev-agents/podcast-publish.lock` so that concurrent runs never rewrite the
+  feed at the same time. The command owns TTS, encoding, R2 upload, the episode index and the feed.
+  Its final stdout line must be JSON:
+  `{"guid": "...", "audioUrl": "https://assets.codexcryptica.com/...", "status": "created" | "unchanged"}`.
+  A non-zero exit or any other output is a delivery error, and no receipt is recorded.
+- **Idempotency:** dev-agents skips a page already recorded for the current run. Across runs, the
+  target command is responsible: republishing an existing slug must report `unchanged` and leave
+  the feed as it was.
+- **Receipt:** `podcast` / `podcast` / page URL, with the GUID as the external ID and the audio URL
+  as the public URL. `metadata.patreon` is always `unconfirmed`: the receipt means "in the feed",
+  never "posted on Patreon".
+- **Dry run:** returns `dry-run://podcast/<slug>` without running the command.
+
+To stop new episodes, remove `podcast` from `destinations`, or pause sync in Patreon. Episodes
+that Patreon has already synced remain on Patreon until they are deleted there manually.
+
 ## Pinterest setup
 
 Pinterest is an opt-in destination (`publish_pinterest` in `release_publish.py`), wired the
