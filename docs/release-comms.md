@@ -219,9 +219,14 @@ channel only: dev-agents never calls Patreon, and Patreon pulls the feed on its 
 - **Approval:** an answer reaches production only through its reviewed, merged PR. The target
   command builds the narration and show notes from the answer's own reviewed text (`question` and
   `shortAnswer`), so no unreviewed copy is published, and the channel can run with `auto_publish`.
-- **Target command:** in the target checkout dev-agents runs `bun run podcast:publish <slug>`,
-  holding the lock `.dev-agents/podcast-publish.lock` so that concurrent runs never rewrite the
-  feed at the same time. The command owns TTS, encoding, R2 upload, the episode index and the feed.
+- **Target command:** dev-agents runs `bun run podcast:publish <slug>` in a throwaway detached
+  worktree of the released commit (under `~/.cache/dev-agents/podcast/`, after
+  `bun install --frozen-lockfile`), so the script and the answer are what shipped. The shared
+  checkout's working tree is never used or updated; it can trail production. Without the release
+  commit, or if it cannot be checked out, the episode fails rather than reading stale files. The
+  lock `.dev-agents/podcast-publish.lock` in the shared checkout keeps concurrent runs from
+  rewriting the feed at the same time. The command owns TTS, encoding, R2 upload, the episode
+  index and the feed.
   Its final stdout line must be JSON:
   `{"guid": "...", "audioUrl": "https://assets.codexcryptica.com/...", "status": "created" | "unchanged"}`.
   A non-zero exit or any other output is a delivery error, and no receipt is recorded.

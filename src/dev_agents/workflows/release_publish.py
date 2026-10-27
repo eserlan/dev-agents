@@ -14,6 +14,7 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +29,7 @@ import yaml
 
 from dev_agents.config import ProjectConfig
 from dev_agents.runtime.github import gh, gh_json
+from dev_agents.runtime.worktree import repo_git_lock
 from dev_agents.workflows.release_content import derive_discord_message
 
 ASSET_HOST = "assets.codexcryptica.com"
@@ -39,6 +41,8 @@ BLUESKY_LIMIT = 300
 BLUESKY_IMAGE_LIMIT = 1_000_000
 ANSWER_PAGE_URL = re.compile(r"https://codexcryptica\.com/answers/([a-z0-9]+(?:-[a-z0-9]+)*)")
 PODCAST_STATUSES = {"created", "unchanged"}
+PODCAST_WORKTREE_ROOT = Path.home() / ".cache/dev-agents/podcast"
+RELEASE_SHA = re.compile(r"[0-9a-f]{7,40}")
 
 
 @dataclass(frozen=True)
@@ -544,11 +548,71 @@ def _podcast_result(stdout: str) -> dict[str, Any]:
     return result
 
 
+@contextmanager
+def _release_checkout(repo: Path, sha: str, *, root: Path, timeout: float) -> Iterator[Path]:
+    """Yield a throwaway detached worktree of the released commit.
+
+    The daemon never updates the shared checkout's working tree, so it can trail
+    production by many commits; the episode must come from what actually shipped.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    worktree = Path(tempfile.mkdtemp(prefix="podcast-", dir=root))
+    lock = repo_git_lock(repo)
+    add = ["git", "worktree", "add", "--detach", str(worktree), sha]
+    try:
+        with lock:
+            try:
+                added = subprocess.run(add, cwd=repo, capture_output=True, text=True, timeout=timeout, check=False)
+                if added.returncode:
+                    subprocess.run(
+                        ["git", "fetch", "origin", sha], cwd=repo, capture_output=True, timeout=timeout, check=False
+                    )
+                    added = subprocess.run(add, cwd=repo, capture_output=True, text=True, timeout=timeout, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise PublicationError(f"could not check out release {sha[:12]}: {error}") from error
+        if added.returncode:
+            raise PublicationError(f"could not check out release {sha[:12]}: {added.stderr.strip()[-300:]}")
+        yield worktree
+    finally:
+        with lock:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(worktree)],
+                    cwd=repo, capture_output=True, timeout=timeout, check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        shutil.rmtree(worktree, ignore_errors=True)
+
+
+def _run_bun(bun: str, args: list[str], *, cwd: Path, env: Mapping[str, str], timeout: float, slug: str) -> str:
+    """Run one bun command for an episode, returning stdout or raising with its output tail."""
+    try:
+        completed = subprocess.run(
+            [bun, *args], cwd=cwd, env=dict(env), capture_output=True, text=True, check=False, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PublicationError(f"bun {args[0]} failed for {slug}: {error}") from error
+    if completed.returncode:
+        detail = completed.stderr.strip()[-500:] or completed.stdout.strip()[-500:] or "no output"
+        raise PublicationError(f"bun {' '.join(args[:2])} failed for {slug}: {detail}")
+    return completed.stdout
+
+
 def publish_podcast(
-    *, repo: Path, page_url: str, env: Mapping[str, str], dry_run: bool, timeout: float = 600
+    *,
+    repo: Path,
+    page_url: str,
+    release_sha: str,
+    env: Mapping[str, str],
+    dry_run: bool,
+    timeout: float = 600,
+    worktree_root: Path = PODCAST_WORKTREE_ROOT,
 ) -> PublicationReceipt:
     """Add one answer to the target repository's podcast feed via `bun run podcast:publish`.
 
+    The command runs in a worktree of ``release_sha``, so the script and the answer are the
+    released versions rather than whatever the shared checkout has on disk.
     The target command owns narration, audio, hosting and episode idempotency; republishing
     an existing slug reports ``unchanged``. The receipt means the episode is in the feed.
     Patreon pulls that feed on its own schedule, so it never confirms a Patreon post.
@@ -558,26 +622,16 @@ def publish_podcast(
         raise PublicationError(f"podcast episodes are only published for answer pages: {page_url}")
     if dry_run:
         return PublicationReceipt("podcast", "podcast", page_url, f"dry-run://podcast/{slug}")
+    if not RELEASE_SHA.fullmatch(release_sha):
+        raise PublicationError(f"podcast episodes need the released commit, got {release_sha!r}")
     bun = shutil.which("bun")
     if bun is None:
         raise PublicationError("bun is required to run podcast:publish")
-    with _podcast_publish_lock(repo):
-        try:
-            completed = subprocess.run(
-                [bun, "run", "podcast:publish", slug],
-                cwd=repo,
-                env=_cloudflare_env(repo, env),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise PublicationError(f"podcast:publish failed for {slug}: {error}") from error
-    if completed.returncode:
-        detail = completed.stderr.strip()[-500:] or completed.stdout.strip()[-500:] or "no output"
-        raise PublicationError(f"podcast:publish failed for {slug}: {detail}")
-    result = _podcast_result(completed.stdout)
+    command_env = _cloudflare_env(repo, env)
+    with _podcast_publish_lock(repo), _release_checkout(repo, release_sha, root=worktree_root, timeout=timeout) as tree:
+        _run_bun(bun, ["install", "--frozen-lockfile"], cwd=tree, env=command_env, timeout=timeout, slug=slug)
+        stdout = _run_bun(bun, ["run", "podcast:publish", slug], cwd=tree, env=command_env, timeout=timeout, slug=slug)
+    result = _podcast_result(stdout)
     return PublicationReceipt(
         "podcast",
         "podcast",
@@ -915,6 +969,7 @@ def publish_release_drafts(
     source_id: str = "",
     devvit_app_dir: Path | None = None,
     devvit_subreddit: str | None = None,
+    release_sha: str = "",
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     """Publish channel variants in message batches, checkpointing each receipt.
 
@@ -1259,7 +1314,9 @@ def publish_release_drafts(
             and publication_key("podcast", "podcast", page_url, active_message_id) not in already_published
         ):
             try:
-                receipt = publish_podcast(repo=project.repo, page_url=page_url, env=env, dry_run=dry_run)
+                receipt = publish_podcast(
+                    repo=project.repo, page_url=page_url, release_sha=release_sha, env=env, dry_run=dry_run
+                )
                 record_receipt(receipt)
                 result["podcast"].append(receipt.__dict__)
             except Exception as error:  # noqa: BLE001

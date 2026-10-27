@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from typing import Self
 
@@ -362,16 +363,49 @@ def test_channel_variants_share_a_batch_and_discord_uses_bluesky_copy(
     assert len(publications["discord"]) == 2
 
 
-def _fake_bun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str) -> Path:
-    """Put a `bun` shim on PATH that logs its argv and cwd, then runs `script`."""
+def _fake_bun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, install: str = "exit 0") -> Path:
+    """Put a `bun` shim on PATH that logs argv, cwd and the checked-out answer, then runs a script.
+
+    `install` runs for `bun install`; `script` runs for every other invocation.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "bun-calls.log"
     shim = bin_dir / "bun"
-    shim.write_text(f'#!/bin/sh\necho "$PWD $*" >> "{log}"\n{script}\n', encoding="utf-8")
+    shim.write_text(
+        f'#!/bin/sh\necho "$PWD $* [$(cat answer.txt 2>/dev/null)]" >> "{log}"\n'
+        f'if [ "$1" = install ]; then\n{install}\nfi\n{script}\n',
+        encoding="utf-8",
+    )
     shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
     return log
+
+
+def _release_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A repo whose released commit differs from what its working tree has since moved to."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+            cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    (repo / "answer.txt").write_text("released", encoding="utf-8")
+    git("add", "answer.txt")
+    git("commit", "-q", "-m", "release")
+    sha = git("rev-parse", "HEAD")
+    (repo / "answer.txt").write_text("later", encoding="utf-8")
+    git("commit", "-q", "-am", "after release")
+    return repo, sha
+
+
+def _worktrees(repo: Path) -> list[str]:
+    listing = subprocess.run(["git", "worktree", "list"], cwd=repo, check=True, capture_output=True, text=True)
+    return listing.stdout.strip().splitlines()
 
 
 ANSWER_URL = "https://codexcryptica.com/answers/does-an-rpg-party-need-balanced-roles"
@@ -392,18 +426,28 @@ def test_podcast_answer_slug_accepts_only_canonical_answer_pages() -> None:
     assert podcast_answer_slug("https://codexcryptica.com/answers/$(rm)") is None
 
 
-def test_publish_podcast_runs_target_command_and_returns_feed_receipt(
+def test_publish_podcast_runs_target_command_in_the_released_commit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from dev_agents.workflows.release_publish import publish_podcast
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo, sha = _release_repo(tmp_path)
+    root = tmp_path / "worktrees"
     log = _fake_bun(tmp_path, monkeypatch, f"echo 'encoding audio'\necho '{PODCAST_RESULT}'")
 
-    receipt = publish_podcast(repo=repo, page_url=ANSWER_URL, env={"PATH": "unused"}, dry_run=False)
+    receipt = publish_podcast(
+        repo=repo, page_url=ANSWER_URL, release_sha=sha, env={"PATH": "/usr/bin:/bin"}, dry_run=False, worktree_root=root
+    )
 
-    assert log.read_text().strip() == f"{repo} run podcast:publish does-an-rpg-party-need-balanced-roles"
+    install, run = log.read_text().strip().splitlines()
+    tree = install.split(" ", 1)[0]
+    # Locked dependencies, then the command, both in a worktree of the released commit,
+    # never in the shared checkout that has since moved on.
+    assert Path(tree).parent == root
+    assert install == f"{tree} install --frozen-lockfile [released]"
+    assert run == f"{tree} run podcast:publish does-an-rpg-party-need-balanced-roles [released]"
+    assert (repo / "answer.txt").read_text() == "later"
+    assert not Path(tree).exists() and len(_worktrees(repo)) == 1
     assert receipt.channel == "podcast"
     assert receipt.page_url == ANSWER_URL
     assert receipt.external_id == "codex-cryptica:answer:does-an-rpg-party-need-balanced-roles"
@@ -414,24 +458,48 @@ def test_publish_podcast_runs_target_command_and_returns_feed_receipt(
 
 
 @pytest.mark.parametrize(
-    "script, message",
+    "script, install, message",
     [
-        ("echo 'boom' >&2\nexit 3", "boom"),
-        ("echo 'not json'", "did not print a JSON result"),
+        ("echo 'boom' >&2\nexit 3", "exit 0", "run podcast:publish failed for .*boom"),
+        ("exit 0", "echo 'lockfile drift' >&2\nexit 1", "install --frozen-lockfile failed for .*lockfile drift"),
+        ("echo 'not json'", "exit 0", "did not print a JSON result"),
         ("""echo '{"guid": "g", "audioUrl": "https://evil.example/a.mp3", "status": "created"}'""",
-         "invalid result"),
+         "exit 0", "invalid result"),
         ("""echo '{"guid": "g", "audioUrl": "https://assets.codexcryptica.com/a.mp3", "status": "queued"}'""",
-         "invalid result"),
+         "exit 0", "invalid result"),
     ],
 )
 def test_publish_podcast_rejects_failed_or_malformed_results(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str, message: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str, install: str, message: str
 ) -> None:
     from dev_agents.workflows.release_publish import publish_podcast
 
-    _fake_bun(tmp_path, monkeypatch, script)
+    repo, sha = _release_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    _fake_bun(tmp_path, monkeypatch, script, install)
     with pytest.raises(PublicationError, match=message):
-        publish_podcast(repo=tmp_path, page_url=ANSWER_URL, env={}, dry_run=False)
+        publish_podcast(repo=repo, page_url=ANSWER_URL, release_sha=sha, env={}, dry_run=False, worktree_root=root)
+    # A failed episode never leaves a worktree behind.
+    assert list(root.iterdir()) == [] and len(_worktrees(repo)) == 1
+
+
+@pytest.mark.parametrize("release_sha", ["", "HEAD", "--orphan", "0" * 40])
+def test_publish_podcast_needs_a_checkout_of_the_released_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, release_sha: str
+) -> None:
+    from dev_agents.workflows.release_publish import publish_podcast
+
+    repo, _ = _release_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    log = _fake_bun(tmp_path, monkeypatch, f"echo '{PODCAST_RESULT}'")
+    # No release commit, a ref or option instead of a SHA, or a commit that cannot be
+    # fetched: never fall back to the shared checkout.
+    with pytest.raises(PublicationError, match="released commit|could not check out release"):
+        publish_podcast(
+            repo=repo, page_url=ANSWER_URL, release_sha=release_sha, env={}, dry_run=False, worktree_root=root
+        )
+    assert not log.exists()
+    assert not root.exists() or list(root.iterdir()) == []
 
 
 def test_publish_podcast_dry_run_and_non_answer_pages_never_run_the_command(
@@ -440,10 +508,12 @@ def test_publish_podcast_dry_run_and_non_answer_pages_never_run_the_command(
     from dev_agents.workflows.release_publish import publish_podcast
 
     log = _fake_bun(tmp_path, monkeypatch, "exit 1")
-    receipt = publish_podcast(repo=tmp_path, page_url=ANSWER_URL, env={}, dry_run=True)
+    receipt = publish_podcast(repo=tmp_path, page_url=ANSWER_URL, release_sha="", env={}, dry_run=True)
     assert receipt.public_url == "dry-run://podcast/does-an-rpg-party-need-balanced-roles"
     with pytest.raises(PublicationError, match="only published for answer pages"):
-        publish_podcast(repo=tmp_path, page_url="https://codexcryptica.com/blog/x", env={}, dry_run=False)
+        publish_podcast(
+            repo=tmp_path, page_url="https://codexcryptica.com/blog/x", release_sha="abc1234", env={}, dry_run=False
+        )
     assert not log.exists()
 
 
@@ -454,6 +524,8 @@ def test_podcast_channel_publishes_answer_content_posts_only_and_once(
 
     def fake_podcast(**kwargs: object) -> PublicationReceipt:
         calls.append(str(kwargs["page_url"]))
+        assert kwargs["release_sha"] == "abc1234def"
+
         return PublicationReceipt("podcast", "podcast", str(kwargs["page_url"]), "https://assets.codexcryptica.com/x.mp3")
 
     monkeypatch.setattr("dev_agents.workflows.release_publish.publish_podcast", fake_podcast)
@@ -478,6 +550,7 @@ def test_podcast_channel_publishes_answer_content_posts_only_and_once(
             publication_delay_min_seconds=0,
             publication_delay_max_seconds=0,
             on_receipt=receipts.append,
+            release_sha="abc1234def",
         )
 
     publications, errors = run()
