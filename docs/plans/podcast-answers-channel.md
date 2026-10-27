@@ -66,18 +66,22 @@ the shared checkout's `.env` when missing).
   Patreon cleanup.
 
 ### Codex Cryptica (separate issues)
-- [ ] CC-1 `scripts/podcast/publish.ts <slug>` and a `podcast:publish` package script, promoted from
+- [x] CC-1 `scripts/podcast/publish.ts <slug>` and a `podcast:publish` package script, promoted from
   the POC's `audio.ts`, `feed.ts`, `upload.ts` and `verify.ts`: input-hash audio keys, HEAD before
   TTS, episode index and feed regeneration, HEAD/Range verification, JSON result line.
-- [ ] CC-2 Tests: created, unchanged on rerun, TTS failure exits non-zero, non-public or invalid
-  links rejected, a CDATA `]]>` split.
+  (eserlan/Codex-Cryptica#4469, in production 2026-10-27.)
+- [x] CC-2 Tests: created, unchanged on rerun, TTS failure exits non-zero, non-public or invalid
+  links rejected, a CDATA `]]>` split. (Same PR.)
 
 ### Ops
-- [ ] OPS-1 Connect a **new** Patreon podcast to `podcast/answers/feed.xml` with auto-publish.
-  Delete the POC posts and the POC connection, because the POC used different GUIDs
-  (`codex-cryptica-release-poc:*`) and two answers would otherwise duplicate.
-- [ ] OPS-2 Add `podcast` to `destinations` and watch the first live episode: mobile rendering,
-  player, artwork, and whether patrons are notified.
+- [x] OPS-1 Connect a **new** Patreon podcast to `podcast/answers/feed.xml` with auto-publish.
+  (Connected 2026-10-27.)
+  - [ ] Delete the POC posts and the POC connection, because the POC used different GUIDs
+    (`codex-cryptica-release-poc:*`) and two answers would otherwise duplicate.
+- [x] OPS-2 Add `podcast` to `destinations`. (Enabled 2026-10-27, after #27 moved the command into
+  a worktree of the released commit; the first two episodes were published by hand.)
+  - [ ] Watch the first synced episodes: mobile rendering, player, artwork, and whether patrons
+    are notified.
 
 ## Kill switch
 
