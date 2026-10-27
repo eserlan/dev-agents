@@ -830,6 +830,7 @@ def build_release_comms_workflow() -> Any:
             source_id=str(state["promote_run_id"]),
             devvit_app_dir=(state["config"].devvit_app_dir),
             devvit_subreddit=(state["config"].devvit_subreddit or state["config"].subreddit),
+            release_sha=str(state.get("new_sha") or ""),
         )
         publications.update(published)
         completed = not errors

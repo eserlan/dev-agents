@@ -35,8 +35,9 @@ GitHub and Codex Cryptica remain the source of truth; Patreon is a downstream ch
 
 ## Target command contract
 
-`bun run podcast:publish <slug>`, run in the target checkout with the daemon's environment
-(plus `CLOUDFLARE_API_TOKEN` from the target `.env` when missing).
+`bun run podcast:publish <slug>`, run in a detached worktree of the released commit (after
+`bun install --frozen-lockfile`) with the daemon's environment (plus `CLOUDFLARE_API_TOKEN` from
+the shared checkout's `.env` when missing).
 
 - Final stdout line: `{"guid": str, "audioUrl": "https://assets.codexcryptica.com/...", "status": "created" | "unchanged"}`.
 - Exit non-zero on any failure, including a TTS failure. dev-agents then records no receipt.
@@ -47,9 +48,9 @@ GitHub and Codex Cryptica remain the source of truth; Patreon is a downstream ch
   HEAD-checked before calling TTS so retries cost nothing.
 - R2 layout: `podcast/answers/feed.xml` (newest 50), `podcast/answers/episodes.json` (index,
   rebuildable from the audio objects and the answer registry), `podcast/answers/audio/`.
-- **Assumption:** the command resolves `<slug>` from the target checkout, so the checkout must
-  contain the deployed answer. If it lags production, the command should fail rather than narrate
-  stale text.
+- The command resolves `<slug>` from its own checkout. The daemon never updates the shared
+  checkout's working tree, which can trail production by hundreds of commits, so dev-agents checks
+  out the release commit instead. A missing or unfetchable release commit fails the episode.
 
 ## Tasks
 
