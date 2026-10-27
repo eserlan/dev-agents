@@ -360,3 +360,153 @@ def test_channel_variants_share_a_batch_and_discord_uses_bluesky_copy(
     assert calls[7][2] == "B https://example.com/b"
     assert sleeps == [1234]
     assert len(publications["discord"]) == 2
+
+
+def _fake_bun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str) -> Path:
+    """Put a `bun` shim on PATH that logs its argv and cwd, then runs `script`."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "bun-calls.log"
+    shim = bin_dir / "bun"
+    shim.write_text(f'#!/bin/sh\necho "$PWD $*" >> "{log}"\n{script}\n', encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    return log
+
+
+ANSWER_URL = "https://codexcryptica.com/answers/does-an-rpg-party-need-balanced-roles"
+PODCAST_RESULT = (
+    '{"guid": "codex-cryptica:answer:does-an-rpg-party-need-balanced-roles", '
+    '"audioUrl": "https://assets.codexcryptica.com/podcast/answers/audio/a-0123456789ab.mp3", '
+    '"status": "created"}'
+)
+
+
+def test_podcast_answer_slug_accepts_only_canonical_answer_pages() -> None:
+    from dev_agents.workflows.release_publish import podcast_answer_slug
+
+    assert podcast_answer_slug(ANSWER_URL) == "does-an-rpg-party-need-balanced-roles"
+    assert podcast_answer_slug("https://codexcryptica.com/blog/a-post") is None
+    assert podcast_answer_slug("https://codexcryptica.com/answers/a/b") is None
+    assert podcast_answer_slug("https://example.com/answers/a") is None
+    assert podcast_answer_slug("https://codexcryptica.com/answers/$(rm)") is None
+
+
+def test_publish_podcast_runs_target_command_and_returns_feed_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from dev_agents.workflows.release_publish import publish_podcast
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    log = _fake_bun(tmp_path, monkeypatch, f"echo 'encoding audio'\necho '{PODCAST_RESULT}'")
+
+    receipt = publish_podcast(repo=repo, page_url=ANSWER_URL, env={"PATH": "unused"}, dry_run=False)
+
+    assert log.read_text().strip() == f"{repo} run podcast:publish does-an-rpg-party-need-balanced-roles"
+    assert receipt.channel == "podcast"
+    assert receipt.page_url == ANSWER_URL
+    assert receipt.external_id == "codex-cryptica:answer:does-an-rpg-party-need-balanced-roles"
+    assert receipt.public_url.endswith("a-0123456789ab.mp3")
+    # The receipt is a feed receipt: Patreon's own publication is never confirmed.
+    assert receipt.metadata == {"episode": "created", "patreon": "unconfirmed"}
+    assert (repo / ".dev-agents/podcast-publish.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "script, message",
+    [
+        ("echo 'boom' >&2\nexit 3", "boom"),
+        ("echo 'not json'", "did not print a JSON result"),
+        ("""echo '{"guid": "g", "audioUrl": "https://evil.example/a.mp3", "status": "created"}'""",
+         "invalid result"),
+        ("""echo '{"guid": "g", "audioUrl": "https://assets.codexcryptica.com/a.mp3", "status": "queued"}'""",
+         "invalid result"),
+    ],
+)
+def test_publish_podcast_rejects_failed_or_malformed_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str, message: str
+) -> None:
+    from dev_agents.workflows.release_publish import publish_podcast
+
+    _fake_bun(tmp_path, monkeypatch, script)
+    with pytest.raises(PublicationError, match=message):
+        publish_podcast(repo=tmp_path, page_url=ANSWER_URL, env={}, dry_run=False)
+
+
+def test_publish_podcast_dry_run_and_non_answer_pages_never_run_the_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from dev_agents.workflows.release_publish import publish_podcast
+
+    log = _fake_bun(tmp_path, monkeypatch, "exit 1")
+    receipt = publish_podcast(repo=tmp_path, page_url=ANSWER_URL, env={}, dry_run=True)
+    assert receipt.public_url == "dry-run://podcast/does-an-rpg-party-need-balanced-roles"
+    with pytest.raises(PublicationError, match="only published for answer pages"):
+        publish_podcast(repo=tmp_path, page_url="https://codexcryptica.com/blog/x", env={}, dry_run=False)
+    assert not log.exists()
+
+
+def test_podcast_channel_publishes_answer_content_posts_only_and_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+
+    def fake_podcast(**kwargs: object) -> PublicationReceipt:
+        calls.append(str(kwargs["page_url"]))
+        return PublicationReceipt("podcast", "podcast", str(kwargs["page_url"]), "https://assets.codexcryptica.com/x.mp3")
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish.publish_podcast", fake_podcast)
+    blog_url = "https://codexcryptica.com/blog/a-post"
+    drafts = {
+        "instagram": [
+            {"pageUrl": ANSWER_URL, "text": "Answer", "image": "https://assets.codexcryptica.com/og/a.jpg"},
+            {"pageUrl": blog_url, "text": "Blog", "image": "https://assets.codexcryptica.com/og/b.jpg"},
+        ],
+    }
+    receipts: list[PublicationReceipt] = []
+    published: set[tuple[str, str]] = set()
+
+    def run() -> tuple[dict[str, list[dict[str, object]]], list[str]]:
+        return publish_release_drafts(
+            project=ProjectConfig(repo=tmp_path, github="owner/repo"),
+            drafts=drafts,
+            recommended_channels=["podcast"],
+            env={},
+            dry_run=False,
+            already_published=published,
+            publication_delay_min_seconds=0,
+            publication_delay_max_seconds=0,
+            on_receipt=receipts.append,
+        )
+
+    publications, errors = run()
+    assert errors == []
+    assert calls == [ANSWER_URL]
+    assert [item["page_url"] for item in publications["podcast"]] == [ANSWER_URL]
+    # A retry within the run sees the checkpointed key and does not republish.
+    publications, errors = run()
+    assert errors == [] and calls == [ANSWER_URL] and publications["podcast"] == []
+    assert len(receipts) == 1
+
+
+def test_podcast_failure_is_reported_without_a_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def failing(**kwargs: object) -> PublicationReceipt:
+        raise PublicationError("tts failed")
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish.publish_podcast", failing)
+    receipts: list[PublicationReceipt] = []
+    publications, errors = publish_release_drafts(
+        project=ProjectConfig(repo=tmp_path, github="owner/repo"),
+        drafts={"instagram": [{"pageUrl": ANSWER_URL, "text": "Answer", "image": "og/a.jpg"}]},
+        recommended_channels=["podcast"],
+        env={},
+        dry_run=False,
+        already_published=set(),
+        on_receipt=receipts.append,
+    )
+
+    assert errors == [f"podcast {ANSWER_URL}: tts failed"]
+    assert receipts == [] and publications["podcast"] == []

@@ -109,6 +109,9 @@ projects:
       webhook_secret_env: RELEASE_COMMS_SECRET
       # Threads is opt-in; add it to destinations after Meta access is ready.
       # destinations: [bluesky, threads, discord, github_discussions]
+      # `podcast` is opt-in and turns new answer pages into podcast feed episodes via the
+      # target's `bun run podcast:publish <slug>`; see docs/release-comms.md.
+      # destinations: [bluesky, discord, github_discussions, instagram, podcast]
       # destination_options:
       #   threads:
       #     topic_tag: TTRPG

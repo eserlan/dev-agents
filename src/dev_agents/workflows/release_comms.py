@@ -53,6 +53,7 @@ from dev_agents.workflows.release_publish import (
     SocialPost,
     comment_tracking_issue,
     pending_publication_count,
+    podcast_answer_slug,
     publication_key,
     publish_internal_note,
     publish_release_drafts,
@@ -441,6 +442,14 @@ def build_release_comms_workflow() -> Any:
             discord=writer_res.discord,
         )
 
+    def has_podcast_answer(writer_res: WriterResult, enabled_destinations: list[str]) -> bool:
+        # Podcast episodes come only from newly deployed answers (the content-post drafts).
+        return "podcast" in enabled_destinations and any(
+            podcast_answer_slug(str(draft.get("pageUrl", "")))
+            for draft in writer_res.instagram
+            if isinstance(draft, dict)
+        )
+
     def with_derived_channels(
         evaluation: EvaluatorResult,
         writer_res: WriterResult,
@@ -457,6 +466,8 @@ def build_release_comms_workflow() -> Any:
             and "instagram" not in channels
         ):
             channels.append("instagram")
+        if has_podcast_answer(writer_res, enabled_destinations) and "podcast" not in channels:
+            channels.append("podcast")
         return EvaluatorResult(
             postworthy=evaluation.postworthy,
             reason=evaluation.reason,
@@ -510,6 +521,8 @@ def build_release_comms_workflow() -> Any:
             and "instagram" not in recommended_channels
         ):
             recommended_channels.append("instagram")
+        if has_podcast_answer(writer_res, enabled_destinations) and "podcast" not in recommended_channels:
+            recommended_channels.append("podcast")
         updated = EvaluatorResult(
             postworthy=eval_res.postworthy,
             reason=eval_res.reason,

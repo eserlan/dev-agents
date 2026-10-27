@@ -8,6 +8,7 @@ receipt immediately, making failed runs safe to retry.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import random
 import re
@@ -17,7 +18,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,6 +37,8 @@ SOCIAL_IMAGE_OPTIONS = (
 )
 BLUESKY_LIMIT = 300
 BLUESKY_IMAGE_LIMIT = 1_000_000
+ANSWER_PAGE_URL = re.compile(r"https://codexcryptica\.com/answers/([a-z0-9]+(?:-[a-z0-9]+)*)")
+PODCAST_STATUSES = {"created", "unchanged"}
 
 
 @dataclass(frozen=True)
@@ -502,6 +506,89 @@ def publish_instagram(*, caption: str, page_url: str, image_url: str, env: Mappi
     return PublicationReceipt("instagram", "instagram", page_url, str(permalink or media_id), media_id)
 
 
+def podcast_answer_slug(page_url: str) -> str | None:
+    """Return the answer slug for a podcast-eligible page, or None for any other page."""
+    match = ANSWER_PAGE_URL.fullmatch(page_url)
+    return match.group(1) if match else None
+
+
+@contextmanager
+def _podcast_publish_lock(repo: Path) -> Iterator[None]:
+    """Serialize feed rewrites; concurrent release runs would otherwise race on the index."""
+    lock_path = repo / ".dev-agents/podcast-publish.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _podcast_result(stdout: str) -> dict[str, Any]:
+    """Parse the target command's final JSON line: ``{guid, audioUrl, status}``."""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    try:
+        result = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        result = None
+    if not isinstance(result, dict):
+        raise PublicationError("podcast:publish did not print a JSON result")
+    audio_url = str(result.get("audioUrl", ""))
+    if (
+        not str(result.get("guid", "")).strip()
+        or result.get("status") not in PODCAST_STATUSES
+        or not audio_url.startswith(f"https://{ASSET_HOST}/")
+    ):
+        raise PublicationError(f"podcast:publish returned an invalid result: {lines[-1][:200]}")
+    return result
+
+
+def publish_podcast(
+    *, repo: Path, page_url: str, env: Mapping[str, str], dry_run: bool, timeout: float = 600
+) -> PublicationReceipt:
+    """Add one answer to the target repository's podcast feed via `bun run podcast:publish`.
+
+    The target command owns narration, audio, hosting and episode idempotency; republishing
+    an existing slug reports ``unchanged``. The receipt means the episode is in the feed.
+    Patreon pulls that feed on its own schedule, so it never confirms a Patreon post.
+    """
+    slug = podcast_answer_slug(page_url)
+    if slug is None:
+        raise PublicationError(f"podcast episodes are only published for answer pages: {page_url}")
+    if dry_run:
+        return PublicationReceipt("podcast", "podcast", page_url, f"dry-run://podcast/{slug}")
+    bun = shutil.which("bun")
+    if bun is None:
+        raise PublicationError("bun is required to run podcast:publish")
+    with _podcast_publish_lock(repo):
+        try:
+            completed = subprocess.run(
+                [bun, "run", "podcast:publish", slug],
+                cwd=repo,
+                env=_cloudflare_env(repo, env),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise PublicationError(f"podcast:publish failed for {slug}: {error}") from error
+    if completed.returncode:
+        detail = completed.stderr.strip()[-500:] or completed.stdout.strip()[-500:] or "no output"
+        raise PublicationError(f"podcast:publish failed for {slug}: {detail}")
+    result = _podcast_result(completed.stdout)
+    return PublicationReceipt(
+        "podcast",
+        "podcast",
+        page_url,
+        str(result["audioUrl"]),
+        str(result["guid"]),
+        # Not "status": that key drives the persisted publication status.
+        metadata={"episode": result["status"], "patreon": "unconfirmed"},
+    )
+
+
 def _form_json(url: str, body: bytes | None, *, method: str = "POST") -> dict[str, Any]:
     headers = {"Content-Type": "application/x-www-form-urlencoded"} if body is not None else {}
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -846,6 +933,7 @@ def publish_release_drafts(
             "pinterest",
             "discord",
             "reddit",
+            "podcast",
         )
     }
     from .release_coverage import prepare_messages
@@ -985,6 +1073,8 @@ def publish_release_drafts(
             )
         if instagram_draft is not None and "instagram" in recommended_channels:
             pending = pending or publication_key("instagram", "instagram", page_url, active_message_id) not in already_published
+        if instagram_draft is not None and "podcast" in recommended_channels and podcast_answer_slug(page_url):
+            pending = pending or publication_key("podcast", "podcast", page_url, active_message_id) not in already_published
         if discussion is not None and "github_discussions" in recommended_channels:
             pending = pending or publication_key(
                 "github_discussions", "github_discussions", page_url, active_message_id) not in already_published
@@ -1161,6 +1251,20 @@ def publish_release_drafts(
             except Exception as error:  # noqa: BLE001
                 errors.append(f"reddit {page_url}: {error}")
 
+        # Answer content posts become podcast episodes; the target command needs no image.
+        if (
+            instagram_draft is not None
+            and "podcast" in recommended_channels
+            and podcast_answer_slug(page_url)
+            and publication_key("podcast", "podcast", page_url, active_message_id) not in already_published
+        ):
+            try:
+                receipt = publish_podcast(repo=project.repo, page_url=page_url, env=env, dry_run=dry_run)
+                record_receipt(receipt)
+                result["podcast"].append(receipt.__dict__)
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"podcast {page_url}: {error}")
+
         if len(errors) > errors_before_batch:
             return result, errors
         message_batches_published += 1
@@ -1180,14 +1284,22 @@ def pending_publication_count(
     from .release_coverage import message_id, prepare_messages
     prepare_messages(drafts)
     count = 0
-    if "instagram" in recommended_channels:
-        for draft in drafts.get("instagram") or []:
-            if not isinstance(draft, dict):
-                continue
-            page_url = str(draft.get("pageUrl", ""))
-            active_message_id = message_id(draft)
-            if publication_key("instagram", "instagram", page_url, active_message_id) not in already_published:
-                count += 1
+    for draft in drafts.get("instagram") or []:
+        if not isinstance(draft, dict):
+            continue
+        page_url = str(draft.get("pageUrl", ""))
+        active_message_id = message_id(draft)
+        if (
+            "instagram" in recommended_channels
+            and publication_key("instagram", "instagram", page_url, active_message_id) not in already_published
+        ):
+            count += 1
+        if (
+            "podcast" in recommended_channels
+            and podcast_answer_slug(page_url)
+            and publication_key("podcast", "podcast", page_url, active_message_id) not in already_published
+        ):
+            count += 1
     for draft in drafts.get("bluesky") or []:
         if not isinstance(draft, dict):
             continue
