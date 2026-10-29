@@ -28,7 +28,7 @@ from dev_agents.runtime import (
     run_agent,
     run_with_fallback,
 )
-from dev_agents.runtime.agent import AgentResult
+from dev_agents.runtime.agent import CODEX_MODEL, AgentResult
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -346,7 +346,8 @@ instructions (AGENTS.md and similar files) as binding. Cover:
 4. Validation: the commands to run, in order.
 5. Risks: what could go wrong and how the steps guard against it.
 
-Your final message is the plan in Markdown and nothing else.
+Refer to files by repository-relative paths. Your final message is the plan in Markdown and
+nothing else.
 """
 
 
@@ -365,35 +366,93 @@ def _reported_line(output: str, field: str) -> str:
     return matches[-1].strip() if matches else ""
 
 
-def _implement_with_planning(
+CONTINUE_PROMPT = """You stopped before the work was finished: nothing is committed and pushed yet.
+Continue from where you stopped. Do not restart the investigation; keep going until the issue is
+implemented, validated, committed and pushed, then print the ISSUE_FIX_REPORT block. Only if a
+genuine blocker remains that further work cannot resolve, stop and begin SUMMARY with "BLOCKED:"."""
+
+
+def _handoff_section(previous_model: str) -> str:
+    return f"""Another agent ({previous_model}) started this issue in this worktree and stopped before
+finishing. Its work so far is here: check `git status`, `git diff` and `git log` before editing.
+Keep what is sound, fix what is not, and finish the implementation. Do not discard it and start
+over unless it is unsound."""
+
+
+def _session_id(output: str) -> str:
+    """The Codex session a run recorded, so a stopped run can be resumed."""
+    matches = re.findall(r"^session id: ([0-9a-f-]{8,})$", output, flags=re.MULTILINE)
+    return matches[-1] if matches else ""
+
+
+def _blocked(output: str) -> bool:
+    return _reported_line(output, "SUMMARY").upper().startswith("BLOCKED")
+
+
+def _implement(
     run: Callable[..., AgentResult],
     *,
-    prompt_for: Callable[[str | None], str],
-    planning_prompt: str,
+    prompt_for: Callable[[str | None, bool], str],
     log_path: Path,
-    plan_path: Path,
     effort: str | None,
-    planning_effort: str,
-    on_plan: Callable[[str, str], None],
+    is_done: Callable[[], bool],
+    planning: tuple[str, str, Path, Callable[[str, str], None]] | None = None,
+    continuations: int = 0,
+    handoff: tuple[str, str | None, str] | None = None,
+    clean_plan: Callable[[str], str] = str.strip,
 ) -> AgentResult:
-    """Implement directly, or plan first at higher effort when the run reports a comprehensive issue.
+    """Implement an issue, escalating only while the work is unfinished.
 
-    The implementation run decides; at most one planning pass happens per attempt.
+    1. With ``planning`` (planning prompt, effort, plan path, on_plan), a saved plan from an
+       earlier attempt is reused. Otherwise the run first assesses scope, and a comprehensive
+       issue gets one read-only planning pass before implementation starts.
+    2. A run that stops before pushing, without reporting a blocker, resumes its own session up
+       to ``continuations`` times.
+    3. ``handoff`` (model, effort, previous model) then takes over in the same worktree.
     """
-    result = run(prompt_for(None), effort=effort)
-    reason = _reported_line(_last_agent_output(log_path), PLAN_REQUIRED_FIELD)
-    if result.returncode != 0 or result.timed_out or not reason:
-        return result
-    plan_path.unlink(missing_ok=True)
-    planned = run(planning_prompt, effort=planning_effort, read_only=True, last_message_path=plan_path)
-    plan = plan_path.read_text(encoding="utf-8").strip() if plan_path.is_file() else ""
-    if planned.returncode != 0 or planned.timed_out or not plan:
-        return AgentResult(planned.returncode or 1, planned.timed_out)
-    on_plan(plan, reason)
-    return run(prompt_for(plan), effort=effort)
+    plan: str | None = None
+    if planning is not None:
+        planning_prompt, planning_effort, plan_path, on_plan = planning
+        plan = plan_path.read_text(encoding="utf-8").strip() if plan_path.is_file() else None
+    if plan:
+        result = run(prompt_for(plan, False), effort=effort)
+    else:
+        result = run(prompt_for(None, planning is not None), effort=effort)
+        reason = _reported_line(_last_agent_output(log_path), PLAN_REQUIRED_FIELD)
+        if planning is not None and reason and result.returncode == 0 and not result.timed_out:
+            raw = plan_path.with_suffix(".raw.md")
+            raw.unlink(missing_ok=True)
+            planned = run(planning_prompt, effort=planning_effort, read_only=True, last_message_path=raw)
+            plan = clean_plan(raw.read_text(encoding="utf-8")) if raw.is_file() else ""
+            if planned.returncode != 0 or planned.timed_out or not plan:
+                return AgentResult(planned.returncode or 1, planned.timed_out)
+            plan_path.write_text(plan, encoding="utf-8")
+            on_plan(plan, reason)
+            result = run(prompt_for(plan, False), effort=effort)
+
+    for _ in range(continuations):
+        output = _last_agent_output(log_path)
+        session = _session_id(output)
+        if result.returncode != 0 or result.timed_out or is_done() or _blocked(output) or not session:
+            break
+        result = run(CONTINUE_PROMPT, effort=effort, resume_session=session)
+
+    if handoff is not None and not result.timed_out and not is_done():
+        model, handoff_effort, previous_model = handoff
+        result = run(
+            prompt_for(plan, False) + "\n\n" + _handoff_section(previous_model),
+            effort=handoff_effort or effort,
+            model=model,
+        )
+    return result
 
 
-def _plan_comment_body(number: int, run_id: str, reason: str, plan: str, effort: str) -> str:
+def _plan_comment_body(
+    number: int, run_id: str, reason: str, plan: str, effort: str, blob_url: str = ""
+) -> str:
+    if blob_url:
+        # Link repository-relative Markdown targets to the base branch on GitHub.
+        plan = re.sub(r"\]\((?![a-z]+:|#|/)([^)\s]+)\)", lambda m: f"]({blob_url}/{m.group(1)})", plan)
     shown = plan if len(plan) <= MAX_POSTED_PLAN_CHARS else plan[:MAX_POSTED_PLAN_CHARS] + "\n\n…(truncated)"
     return f"""<!-- dev-agents:issue-fix issue={number} run={run_id} phase=plan -->
 ### 🤖 Dev-agents planning pass
@@ -471,7 +530,7 @@ optimized validation commands when available, and keep independent checks parall
 
 Commit the {framing['artifact']} and push the branch to origin. Do not merge or close the issue/PR.
 If the issue is not safely actionable from the repository, leave the tree clean and explain the
-blocker instead of inventing a solution.
+blocker instead of inventing a solution, beginning SUMMARY with "BLOCKED:".
 
 At the end, print exactly these fields as short plain-text lines:
 ISSUE_FIX_REPORT_BEGIN
@@ -838,33 +897,77 @@ class IssueFixerService:
                                 timeout_seconds=self.config.timeout_minutes * 60,
                                 heartbeat_seconds=self.pr_config.heartbeat_seconds,
                                 reasoning_effort=options.pop("effort", effort),
-                                model=model,
+                                model=options.pop("model", model),
                                 json_events=provider == "muse",
                                 **options,
                             )
 
+                        if provider != "codex":
+                            result = attempt(prompt)
+                            results[provider] = result
+                            return result
+
+                        def logged_attempt(agent_prompt: str, **options: Any) -> AgentResult:
+                            phase = (
+                                "planning" if options.get("read_only")
+                                else "continuing" if options.get("resume_session")
+                                else f"handoff model={options['model']}" if "model" in options
+                                else "implementing"
+                            )
+                            _log(f"issue-fixer issue={number} run_id={run_id} phase={phase}")
+                            return attempt(agent_prompt, **options)
+
+                        def branch_pushed() -> bool:
+                            _run(
+                                worktree, "git", "fetch", "origin",
+                                f"refs/heads/{state['branch']}:refs/remotes/origin/{state['branch']}",
+                                check=False,
+                            )
+                            head = _run(worktree, "git", "rev-parse", "HEAD", check=False)
+                            remote = _run(worktree, "git", "rev-parse", f"origin/{state['branch']}", check=False)
+                            clean = _run(worktree, "git", "status", "--porcelain", check=False) == ""
+                            return bool(head and head != base_sha and head == remote and clean)
+
+                        planning = None
                         planning_effort = self.config.planning_effort
-                        if planning_effort and provider == "codex":
+                        if planning_effort:
+                            blob_url = (
+                                f"https://github.com/{self.project.github}/blob/{self.config.base_branch}"
+                                if self.project.github else ""
+                            )
+
                             def on_plan(plan: str, reason: str) -> None:
                                 _log(f"issue-fixer issue={number} run_id={run_id} phase=planned")
                                 _publish_issue_comment(
                                     self.project.repo,
                                     number,
-                                    _plan_comment_body(number, run_id, reason, plan, planning_effort),
+                                    _plan_comment_body(
+                                        number, run_id, reason, plan, planning_effort, blob_url
+                                    ),
                                 )
 
-                            result = _implement_with_planning(
-                                attempt,
-                                prompt_for=lambda plan: prompt_for(plan, assess_scope=plan is None),
-                                planning_prompt=_planning_prompt(issue, self.config.base_branch),
-                                log_path=log_path,
-                                plan_path=log_path.with_suffix(".plan.md"),
-                                effort=effort,
-                                planning_effort=planning_effort,
-                                on_plan=on_plan,
+                            planning = (
+                                _planning_prompt(issue, self.config.base_branch),
+                                planning_effort,
+                                log_path.with_suffix(".plan.md"),
+                                on_plan,
                             )
-                        else:
-                            result = attempt(prompt)
+                        handoff = (
+                            (self.config.handoff_model, self.config.handoff_reasoning_effort, model or CODEX_MODEL)
+                            if self.config.handoff_model else None
+                        )
+                        result = _implement(
+                            logged_attempt,
+                            prompt_for=lambda plan, assess: prompt_for(plan, assess_scope=assess),
+                            log_path=log_path,
+                            effort=effort,
+                            is_done=branch_pushed,
+                            planning=planning,
+                            continuations=self.config.continuations,
+                            handoff=handoff,
+                            # Worktree paths change between attempts; the saved plan must not.
+                            clean_plan=lambda text: text.replace(f"{worktree}/", "").strip(),
+                        )
                         results[provider] = result
                         return result
 

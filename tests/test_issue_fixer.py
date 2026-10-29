@@ -7,9 +7,10 @@ import pytest
 from dev_agents.config import CopyReviewConfig, IssueFixerConfig, PrFixerConfig, ProjectConfig
 from dev_agents.copy_review import AnswerQualityAssessment, CoherenceCheck, EditorialFinding
 from dev_agents.issue_fixer import (
+    CONTINUE_PROMPT,
     IssueFixerService,
     _existing_issue_pr,
-    _implement_with_planning,
+    _implement,
     _isolated_issue_worktree,
     _issue,
     _issue_result_body,
@@ -721,78 +722,149 @@ def test_pre_pr_gate_requires_a_clean_verdict_even_without_blockers(
     assert "needs_human_review" in note
 
 
-def _planning_run(log_path: Path, outputs: list[str], plan: str = "1. Do it\n2. Test it"):
+def _fake_runs(log_path: Path, outputs: list[str], plan: str = "1. Do it\n2. Test it"):
     """A fake agent runner: each call appends a log segment; the read-only call writes the plan."""
     calls: list[dict[str, object]] = []
 
     def run(prompt: str, **options: object) -> AgentResult:
         calls.append({"prompt": prompt, **options})
+        output = outputs[len(calls) - 1]
         with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(f"=== agent started provider=codex ===\nuser\n{prompt}\n")
-            stream.write(outputs[len(calls) - 1] + "\n")
+            stream.write(f"=== agent started provider=codex ===\nsession id: 0000-000{len(calls)}\n")
+            stream.write(f"user\n{prompt}\n{output}\n")
         if options.get("read_only") and plan:
             Path(str(options["last_message_path"])).write_text(plan, encoding="utf-8")
-        return AgentResult(0, False)
+        return AgentResult(124 if output == "TIMEOUT" else 0, output == "TIMEOUT")
 
     return run, calls
 
 
-def _plan_kwargs(tmp_path: Path, plans: list[tuple[str, str]]) -> dict[str, object]:
+def _prompt_for(plan: str | None, assess: bool) -> str:
+    return f"IMPLEMENT plan={plan} assess={assess}" + (
+        "\nISSUE_FIX_PLAN_REQUIRED: <why this issue needs a plan, in one line>"
+        "\nSUMMARY: <what was implemented, or the concrete blocker>" if assess else ""
+    )
+
+
+def _implement_kwargs(tmp_path: Path, plans: list[tuple[str, str]], done: list[bool], **extra: object):
     return {
-        "prompt_for": lambda plan: f"IMPLEMENT plan={plan}" + (
-            "" if plan else "\nISSUE_FIX_PLAN_REQUIRED: <why this issue needs a plan, in one line>"
-        ),
-        "planning_prompt": "PLAN",
+        "prompt_for": _prompt_for,
         "log_path": tmp_path / "issue.log",
-        "plan_path": tmp_path / "issue.plan.md",
         "effort": "medium",
-        "planning_effort": "high",
-        "on_plan": lambda plan, reason: plans.append((plan, reason)),
+        "is_done": lambda: done[0],
+        "planning": ("PLAN", "high", tmp_path / "issue.plan.md", lambda plan, why: plans.append((plan, why))),
+        **extra,
     }
 
 
 def test_a_small_issue_is_implemented_without_planning(tmp_path: Path) -> None:
-    run, calls = _planning_run(tmp_path / "issue.log", ["SUMMARY: fixed it"])
+    run, calls = _fake_runs(tmp_path / "issue.log", ["SUMMARY: fixed it"])
     plans: list[tuple[str, str]] = []
 
-    result = _implement_with_planning(run, **_plan_kwargs(tmp_path, plans))  # type: ignore[arg-type]
+    result = _implement(run, **_implement_kwargs(tmp_path, plans, [True], continuations=3))  # type: ignore[arg-type]
 
     assert result.returncode == 0
-    assert [call["prompt"] for call in calls] == [
-        "IMPLEMENT plan=None\nISSUE_FIX_PLAN_REQUIRED: <why this issue needs a plan, in one line>"
+    assert [(call["prompt"].split("\n")[0], call["effort"]) for call in calls] == [
+        ("IMPLEMENT plan=None assess=True", "medium")
     ]
-    assert calls[0]["effort"] == "medium"
     assert plans == []
 
 
 def test_a_comprehensive_issue_is_planned_at_higher_effort_then_implemented(tmp_path: Path) -> None:
-    run, calls = _planning_run(
+    run, calls = _fake_runs(
         tmp_path / "issue.log",
         ["ISSUE_FIX_PLAN_REQUIRED: needs migrations, server and UI", "plan written", "SUMMARY: done"],
+        plan="1. Edit /wt/src/a.ts\n",
     )
     plans: list[tuple[str, str]] = []
 
-    result = _implement_with_planning(run, **_plan_kwargs(tmp_path, plans))  # type: ignore[arg-type]
+    _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, plans, [True], clean_plan=lambda text: text.replace("/wt/", "").strip(),
+    ))
 
-    assert result.returncode == 0
-    assert [call["prompt"] for call in calls][1:] == ["PLAN", "IMPLEMENT plan=1. Do it\n2. Test it"]
+    assert [call["prompt"] for call in calls][1:] == ["PLAN", "IMPLEMENT plan=1. Edit src/a.ts assess=False"]
     assert [call["effort"] for call in calls] == ["medium", "high", "medium"]
-    assert calls[1]["read_only"] is True and calls[1]["last_message_path"] == tmp_path / "issue.plan.md"
-    assert "read_only" not in calls[2]
-    assert plans == [("1. Do it\n2. Test it", "needs migrations, server and UI")]
+    assert calls[1]["read_only"] is True
+    assert (tmp_path / "issue.plan.md").read_text(encoding="utf-8") == "1. Edit src/a.ts"
+    assert plans == [("1. Edit src/a.ts", "needs migrations, server and UI")]
+
+
+def test_a_retry_reuses_the_saved_plan_without_planning_or_posting_again(tmp_path: Path) -> None:
+    (tmp_path / "issue.plan.md").write_text("1. Saved step", encoding="utf-8")
+    run, calls = _fake_runs(tmp_path / "issue.log", ["SUMMARY: done"])
+    plans: list[tuple[str, str]] = []
+
+    _implement(run, **_implement_kwargs(tmp_path, plans, [True]))  # type: ignore[arg-type]
+
+    assert [call["prompt"] for call in calls] == ["IMPLEMENT plan=1. Saved step assess=False"]
+    assert plans == []
 
 
 def test_a_failed_or_empty_plan_ends_the_attempt_without_implementing(tmp_path: Path) -> None:
-    run, calls = _planning_run(
-        tmp_path / "issue.log", ["ISSUE_FIX_PLAN_REQUIRED: big", "no plan"], plan=""
-    )
+    run, calls = _fake_runs(tmp_path / "issue.log", ["ISSUE_FIX_PLAN_REQUIRED: big", "no plan"], plan="")
     plans: list[tuple[str, str]] = []
 
-    result = _implement_with_planning(run, **_plan_kwargs(tmp_path, plans))  # type: ignore[arg-type]
+    result = _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, plans, [False], continuations=2, handoff=("gpt-6-luna", "high", "gpt-6.1-terra"),
+    ))
 
     assert result.returncode == 1
     assert len(calls) == 2
-    assert plans == []
+    assert not (tmp_path / "issue.plan.md").exists()
+
+
+def test_an_unfinished_run_resumes_its_session_until_it_pushes(tmp_path: Path) -> None:
+    done = [False]
+    run, calls = _fake_runs(tmp_path / "issue.log", ["SUMMARY: Not implemented yet", "working", "SUMMARY: done"])
+
+    def resuming(prompt: str, **options: object) -> AgentResult:
+        result = run(prompt, **options)
+        done[0] = len(calls) == 3
+        return result
+
+    _implement(resuming, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, [], done, planning=None, continuations=5, handoff=("gpt-6-luna", "high", "gpt-6.1-terra"),
+    ))
+
+    assert [call["prompt"] for call in calls][1:] == [CONTINUE_PROMPT, CONTINUE_PROMPT]
+    assert [call.get("resume_session") for call in calls] == [None, "0000-0001", "0000-0002"]
+    assert all("model" not in call for call in calls)
+
+
+def test_a_reported_blocker_skips_continuation_but_still_hands_off(tmp_path: Path) -> None:
+    run, calls = _fake_runs(tmp_path / "issue.log", ["SUMMARY: BLOCKED: needs a product decision", "SUMMARY: done"])
+
+    _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, [], [False], planning=None, continuations=3, handoff=("gpt-6-luna", "high", "gpt-6.1-terra"),
+    ))
+
+    assert len(calls) == 2
+    assert (calls[1]["model"], calls[1]["effort"]) == ("gpt-6-luna", "high")
+    assert "Another agent (gpt-6.1-terra) started this issue" in str(calls[1]["prompt"])
+    assert str(calls[1]["prompt"]).startswith("IMPLEMENT plan=None assess=False")
+
+
+def test_handoff_continues_the_plan_after_continuations_run_out(tmp_path: Path) -> None:
+    (tmp_path / "issue.plan.md").write_text("1. Step", encoding="utf-8")
+    run, calls = _fake_runs(tmp_path / "issue.log", ["SUMMARY: stopped", "SUMMARY: stopped again", "SUMMARY: done"])
+
+    _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, [], [False], continuations=1, handoff=("gpt-6-luna", None, "gpt-6.1-terra"),
+    ))
+
+    assert [call.get("resume_session") for call in calls] == [None, "0000-0001", None]
+    assert str(calls[2]["prompt"]).startswith("IMPLEMENT plan=1. Step assess=False")
+    assert (calls[2]["model"], calls[2]["effort"]) == ("gpt-6-luna", "medium")
+
+
+def test_a_timed_out_run_is_neither_continued_nor_handed_off(tmp_path: Path) -> None:
+    run, calls = _fake_runs(tmp_path / "issue.log", ["TIMEOUT"])
+
+    result = _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, [], [False], planning=None, continuations=3, handoff=("gpt-6-luna", "high", "gpt-6.1-terra"),
+    ))
+
+    assert result.timed_out and len(calls) == 1
 
 
 def test_report_fields_ignore_the_prompt_placeholders_and_earlier_runs(tmp_path: Path) -> None:
@@ -824,12 +896,26 @@ def test_prompt_adds_the_scope_assessment_or_the_plan(tmp_path: Path) -> None:
 
 
 def test_plan_comment_collapses_the_plan() -> None:
-    body = _plan_comment_body(7, "run-1", "needs migrations", "1. Step", "high")
+    plan = "1. Edit [a.ts](src/a.ts), see [docs](https://x.dev/d) and [below](#tests)"
+    body = _plan_comment_body(7, "run-1", "needs migrations", plan, "high", "https://github.com/o/r/blob/main")
 
     assert "<!-- dev-agents:issue-fix issue=7 run=run-1 phase=plan -->" in body
     assert "comprehensive: needs migrations" in body
-    assert "<summary>Implementation plan</summary>\n\n1. Step\n</details>" in body
+    assert "[a.ts](https://github.com/o/r/blob/main/src/a.ts)" in body
+    assert "[docs](https://x.dev/d)" in body and "[below](#tests)" in body
+    assert "<summary>Implementation plan</summary>" in body
 
 
-def test_planning_is_off_by_default() -> None:
-    assert IssueFixerConfig().planning_effort is None
+def test_planning_continuation_and_handoff_are_off_by_default() -> None:
+    config = IssueFixerConfig()
+
+    assert (config.planning_effort, config.continuations, config.handoff_model) == (None, 0, None)
+
+
+def test_codex_resume_command_continues_the_session() -> None:
+    from dev_agents.runtime.agent import provider_command
+
+    command = provider_command("codex", "x", reasoning_effort="high", model="m", resume_session="abc")
+
+    assert command[:3] == ["codex", "exec", "resume"]
+    assert command[-2:] == ["abc", "-"]

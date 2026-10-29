@@ -218,7 +218,11 @@ A Codex queue can plan comprehensive issues before implementing them:
 issue_fixers:
   - label: feature
     kind: enhancement
+    reasoning_effort: medium
     planning_effort: high
+    continuations: 4
+    handoff_model: gpt-6-luna
+    handoff_reasoning_effort: high
 ```
 
 With `planning_effort` set, the implementation run (at the queue's `reasoning_effort`) first
@@ -226,8 +230,16 @@ assesses the issue's scope. A small issue is implemented directly. For a compreh
 as migrations, server code and UI together, the run prints `ISSUE_FIX_PLAN_REQUIRED: <why>` and
 stops without editing. A read-only planning pass at `planning_effort` then writes the plan, which
 is posted to the issue in a collapsed section, and a second implementation run follows it. Each
-attempt gets at most one planning pass, and every run has the queue's full timeout. When an
-attempt fails, the issue comment carries the agent's own `SUMMARY` line instead of a generic one.
+attempt gets at most one planning pass, and a retry reuses the saved plan instead of planning
+and posting again. The posted plan links files to the base branch on GitHub.
+
+Two settings handle a model that stops before finishing. `continuations` resumes the same Codex
+session (`codex exec resume`) with an instruction to carry on, up to that many times, while the
+branch is not pushed and the agent has not reported a blocker (`SUMMARY: BLOCKED: …`). If the work
+is still not pushed after that, `handoff_model` (at `handoff_reasoning_effort`) takes over in the
+same worktree with the plan and the partial work. Every run has the queue's full timeout, and a
+timed-out run is neither continued nor handed off. When an attempt fails, the issue comment
+carries the agent's own `SUMMARY` line instead of a generic one.
 
 An optional reactive copy review runs after an Answer PR is merged to the configured branch:
 

@@ -94,8 +94,11 @@ def provider_command(
     model: str | None = None,
     read_only: bool = False,
     json_events: bool = False,
+    resume_session: str | None = None,
 ) -> list[str]:
     """Build the command line for a configured provider.
+
+    ``resume_session`` (Codex only) continues that recorded session with the prompt as its next turn.
 
     ``reasoning_effort=None`` means the caller did not choose an effort:
     Codex falls back to medium, while Muse is left on its model's own
@@ -109,11 +112,13 @@ def provider_command(
         return [
             "codex",
             "exec",
+            *(["resume"] if resume_session else []),
             *permissions,
             "-m",
             model or CODEX_MODEL,
             "-c",
             f'model_reasoning_effort="{reasoning_effort or "medium"}"',
+            *([resume_session] if resume_session else []),
             "-",
         ]
     if provider == "claude":
@@ -239,6 +244,7 @@ def run_agent(
     cancel_event: Event | None = None,
     read_only: bool = False,
     output_schema_path: Path | None = None,
+    resume_session: str | None = None,
 ) -> AgentResult:
     """Run a provider, forwarding output to a durable log and emitting heartbeats.
 
@@ -262,9 +268,12 @@ def run_agent(
         try:
             if json_events and provider != "muse":
                 raise ValueError("json_events requires the Muse provider")
+            if resume_session and provider != "codex":
+                raise ValueError("resume_session requires the Codex provider")
             command = provider_command(
                 provider, prompt, timeout_seconds, reasoning_effort, model,
                 **({"json_events": True} if json_events else {}),
+                **({"resume_session": resume_session} if resume_session else {}),
             )
             if read_only:
                 if provider != "codex":
