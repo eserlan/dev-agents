@@ -368,8 +368,10 @@ def _reported_line(output: str, field: str) -> str:
 
 CONTINUE_PROMPT = """You stopped before the work was finished: nothing is committed and pushed yet.
 Continue from where you stopped. Do not restart the investigation; keep going until the issue is
-implemented, validated, committed and pushed, then print the ISSUE_FIX_REPORT block. Only if a
-genuine blocker remains that further work cannot resolve, stop and begin SUMMARY with "BLOCKED:"."""
+implemented, validated, committed and pushed, then print the ISSUE_FIX_REPORT block. The size of
+the change, the number of layers it touches or the care it needs is not a blocker. Only if a
+genuine blocker remains that further work cannot resolve, such as a missing product decision or
+an unavailable service, stop and begin SUMMARY with "BLOCKED:"."""
 
 
 def _handoff_section(previous_model: str) -> str:
@@ -406,8 +408,9 @@ def _implement(
     1. With ``planning`` (planning prompt, effort, plan path, on_plan), a saved plan from an
        earlier attempt is reused. Otherwise the run first assesses scope, and a comprehensive
        issue gets one read-only planning pass before implementation starts.
-    2. A run that stops before pushing, without reporting a blocker, resumes its own session up
-       to ``continuations`` times.
+    2. A run that stops before pushing resumes its own session up to ``continuations`` times.
+       The first stop always resumes, since a model can label unfinished work as blocked; only a
+       blocker reported from a resumed session ends the continuations.
     3. ``handoff`` (model, effort, previous model) then takes over in the same worktree.
     """
     plan: str | None = None
@@ -430,10 +433,12 @@ def _implement(
             on_plan(plan, reason)
             result = run(prompt_for(plan, False), effort=effort)
 
-    for _ in range(continuations):
+    for resumed in range(continuations):
         output = _last_agent_output(log_path)
         session = _session_id(output)
-        if result.returncode != 0 or result.timed_out or is_done() or _blocked(output) or not session:
+        if result.returncode != 0 or result.timed_out or is_done() or not session:
+            break
+        if resumed and _blocked(output):
             break
         result = run(CONTINUE_PROMPT, effort=effort, resume_session=session)
 

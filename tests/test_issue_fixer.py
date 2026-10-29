@@ -831,17 +831,22 @@ def test_an_unfinished_run_resumes_its_session_until_it_pushes(tmp_path: Path) -
     assert all("model" not in call for call in calls)
 
 
-def test_a_reported_blocker_skips_continuation_but_still_hands_off(tmp_path: Path) -> None:
-    run, calls = _fake_runs(tmp_path / "issue.log", ["SUMMARY: BLOCKED: needs a product decision", "SUMMARY: done"])
+def test_a_first_blocked_report_is_still_resumed_once(tmp_path: Path) -> None:
+    """Terra labelled unfinished work on #483 as blocked; the first stop must not skip continuation."""
+    run, calls = _fake_runs(tmp_path / "issue.log", [
+        "SUMMARY: BLOCKED: needs coordinated changes I did not complete",
+        "SUMMARY: BLOCKED: needs a product decision",
+        "SUMMARY: done",
+    ])
 
     _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
         tmp_path, [], [False], planning=None, continuations=3, handoff=("gpt-6-luna", "high", "gpt-6.1-terra"),
     ))
 
-    assert len(calls) == 2
-    assert (calls[1]["model"], calls[1]["effort"]) == ("gpt-6-luna", "high")
-    assert "Another agent (gpt-6.1-terra) started this issue" in str(calls[1]["prompt"])
-    assert str(calls[1]["prompt"]).startswith("IMPLEMENT plan=None assess=False")
+    assert [call.get("resume_session") for call in calls] == [None, "0000-0001", None]
+    assert (calls[2]["model"], calls[2]["effort"]) == ("gpt-6-luna", "high")
+    assert "Another agent (gpt-6.1-terra) started this issue" in str(calls[2]["prompt"])
+    assert str(calls[2]["prompt"]).startswith("IMPLEMENT plan=None assess=False")
 
 
 def test_handoff_continues_the_plan_after_continuations_run_out(tmp_path: Path) -> None:
