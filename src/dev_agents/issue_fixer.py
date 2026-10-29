@@ -301,6 +301,115 @@ leave content unchanged and explain what needs clarification.""",
 }
 
 
+PLAN_REQUIRED_FIELD = "ISSUE_FIX_PLAN_REQUIRED"
+MAX_POSTED_PLAN_CHARS = 50_000
+
+_ASSESS_SCOPE = f"""Before editing anything, assess the issue's scope. If it is comprehensive, meaning it
+needs coordinated changes across several layers (for example database migrations or functions,
+server code and UI together) or a design decision spanning many files, do not start implementing.
+Leave the tree clean, print exactly one line and stop:
+{PLAN_REQUIRED_FIELD}: <why this issue needs a plan, in one line>
+A planning pass at higher reasoning effort then writes the plan, and you implement it in a new run.
+For a smaller issue, implement it directly and do not print that line."""
+
+
+def _plan_section(plan: str) -> str:
+    return f"""A planning pass assessed this issue as comprehensive and wrote the implementation plan
+below. Implement the whole plan in this run, in order, and validate it as the plan says. Where the
+code shows that a step is wrong, adapt it and say so in SUMMARY. A step being large or touching
+schema, finance or other sensitive logic is not a blocker: the plan exists to handle it.
+
+Implementation plan:
+{plan}"""
+
+
+def _planning_prompt(issue: dict[str, Any], base_branch: str) -> str:
+    """A read-only pass that plans a comprehensive issue for a lower-effort implementation run."""
+    title = str(issue.get("title", "Untitled issue"))
+    body = str(issue.get("body") or "(issue has no body)")[:30_000]
+    return f"""Plan the implementation of GitHub issue #{issue.get('number')} in this repository
+(based on {base_branch}). This is a read-only planning pass: inspect the code, but do not edit
+files, run migrations or commit. A separate implementation run at lower reasoning effort follows
+your plan, so make it concrete and complete.
+
+Issue title: {title}
+Issue URL: {issue.get('url', '')}
+Issue body:
+{body}
+
+Plan the whole issue, not a reduced version. Treat explicit acceptance criteria and repository
+instructions (AGENTS.md and similar files) as binding. Cover:
+1. Approach: the design in a few sentences and the existing code it builds on.
+2. Steps, in order: for each, the files to create or change and what changes, including
+   migrations, database functions, server code, UI and tests.
+3. Tests: which test proves each acceptance criterion.
+4. Validation: the commands to run, in order.
+5. Risks: what could go wrong and how the steps guard against it.
+
+Your final message is the plan in Markdown and nothing else.
+"""
+
+
+def _last_agent_output(log_path: Path) -> str:
+    """The latest agent run's part of an issue log, which appends one run after another."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text.rsplit("=== agent started", 1)[-1]
+
+
+def _reported_line(output: str, field: str) -> str:
+    """The agent's last value for a report field, ignoring the prompt's `<placeholder>` echo."""
+    matches = re.findall(rf"^{field}: (?!<)(.+)$", output, flags=re.MULTILINE)
+    return matches[-1].strip() if matches else ""
+
+
+def _implement_with_planning(
+    run: Callable[..., AgentResult],
+    *,
+    prompt_for: Callable[[str | None], str],
+    planning_prompt: str,
+    log_path: Path,
+    plan_path: Path,
+    effort: str | None,
+    planning_effort: str,
+    on_plan: Callable[[str, str], None],
+) -> AgentResult:
+    """Implement directly, or plan first at higher effort when the run reports a comprehensive issue.
+
+    The implementation run decides; at most one planning pass happens per attempt.
+    """
+    result = run(prompt_for(None), effort=effort)
+    reason = _reported_line(_last_agent_output(log_path), PLAN_REQUIRED_FIELD)
+    if result.returncode != 0 or result.timed_out or not reason:
+        return result
+    plan_path.unlink(missing_ok=True)
+    planned = run(planning_prompt, effort=planning_effort, read_only=True, last_message_path=plan_path)
+    plan = plan_path.read_text(encoding="utf-8").strip() if plan_path.is_file() else ""
+    if planned.returncode != 0 or planned.timed_out or not plan:
+        return AgentResult(planned.returncode or 1, planned.timed_out)
+    on_plan(plan, reason)
+    return run(prompt_for(plan), effort=effort)
+
+
+def _plan_comment_body(number: int, run_id: str, reason: str, plan: str, effort: str) -> str:
+    shown = plan if len(plan) <= MAX_POSTED_PLAN_CHARS else plan[:MAX_POSTED_PLAN_CHARS] + "\n\n…(truncated)"
+    return f"""<!-- dev-agents:issue-fix issue={number} run={run_id} phase=plan -->
+### 🤖 Dev-agents planning pass
+
+The implementation run assessed this issue as comprehensive: {reason}
+
+A read-only planning pass at {effort} effort wrote the plan below; implementation now follows it.
+
+<details>
+<summary>Implementation plan</summary>
+
+{shown}
+</details>
+"""
+
+
 def _prompt(
     repo: Path,
     issue: dict[str, Any],
@@ -309,6 +418,8 @@ def _prompt(
     conflicts: list[str],
     *,
     kind: str = "fix",
+    assess_scope: bool = False,
+    plan: str | None = None,
 ) -> str:
     framing = _KIND_FRAMING.get(kind, _KIND_FRAMING["fix"])
     if kind == "answer":
@@ -356,6 +467,7 @@ deployment environment. Add focused tests when behavior changes. Use the target 
 optimized validation commands when available, and keep independent checks parallel where practical.
 
 {framing.get('guidance', '')}
+{_plan_section(plan) if plan else _ASSESS_SCOPE if assess_scope else ''}
 
 Commit the {framing['artifact']} and push the branch to origin. Do not merge or close the issue/PR.
 If the issue is not safely actionable from the repository, leave the tree clean and explain the
@@ -679,14 +791,19 @@ class IssueFixerService:
                     summary = "Reused the previously pushed issue fix and verified its branch."
                     validation = "Existing remote branch is clean and ahead of the configured base."
                 else:
-                    prompt = _prompt(
-                        worktree,
-                        issue,
-                        self.config.base_branch,
-                        state["branch"],
-                        conflicts,
-                        kind=self.config.kind,
-                    )
+                    def prompt_for(plan: str | None = None, *, assess_scope: bool = False) -> str:
+                        return _prompt(
+                            worktree,
+                            issue,
+                            self.config.base_branch,
+                            state["branch"],
+                            conflicts,
+                            kind=self.config.kind,
+                            assess_scope=assess_scope,
+                            plan=plan,
+                        )
+
+                    prompt = prompt_for()
                     providers = [self.config.provider]
                     if self.config.fallback_provider and self.config.fallback_provider not in providers:
                         providers.append(self.config.fallback_provider)
@@ -710,18 +827,44 @@ class IssueFixerService:
                                 self.pr_config.model if provider == "codex" else None
                             )
                         )
-                        result = run_agent(
-                            provider,
-                            prompt,
-                            cwd=worktree,
-                            log_path=log_path,
-                            timeout_seconds=self.config.timeout_minutes * 60,
-                            heartbeat_seconds=self.pr_config.heartbeat_seconds,
-                            reasoning_effort=self.config.reasoning_effort
-                            or self.pr_config.reasoning_effort,
-                            model=model,
-                            json_events=provider == "muse",
-                        )
+                        effort = self.config.reasoning_effort or self.pr_config.reasoning_effort
+
+                        def attempt(agent_prompt: str, **options: Any) -> AgentResult:
+                            return run_agent(
+                                provider,
+                                agent_prompt,
+                                cwd=worktree,
+                                log_path=log_path,
+                                timeout_seconds=self.config.timeout_minutes * 60,
+                                heartbeat_seconds=self.pr_config.heartbeat_seconds,
+                                reasoning_effort=options.pop("effort", effort),
+                                model=model,
+                                json_events=provider == "muse",
+                                **options,
+                            )
+
+                        planning_effort = self.config.planning_effort
+                        if planning_effort and provider == "codex":
+                            def on_plan(plan: str, reason: str) -> None:
+                                _log(f"issue-fixer issue={number} run_id={run_id} phase=planned")
+                                _publish_issue_comment(
+                                    self.project.repo,
+                                    number,
+                                    _plan_comment_body(number, run_id, reason, plan, planning_effort),
+                                )
+
+                            result = _implement_with_planning(
+                                attempt,
+                                prompt_for=lambda plan: prompt_for(plan, assess_scope=plan is None),
+                                planning_prompt=_planning_prompt(issue, self.config.base_branch),
+                                log_path=log_path,
+                                plan_path=log_path.with_suffix(".plan.md"),
+                                effort=effort,
+                                planning_effort=planning_effort,
+                                on_plan=on_plan,
+                            )
+                        else:
+                            result = attempt(prompt)
                         results[provider] = result
                         return result
 
@@ -762,6 +905,9 @@ class IssueFixerService:
                     fixed, validation = verify_pushed(result)
                     if not fixed and result.timed_out:
                         summary = "Agent timed out before producing a verified pushed fix."
+                    elif not fixed:
+                        # Report the agent's own reason (a blocker, say) instead of the generic line.
+                        summary = _reported_line(_last_agent_output(log_path), "SUMMARY") or summary
                     if used_provider != self.config.provider:
                         review_note = (
                             f"Written by fallback provider {used_provider} "

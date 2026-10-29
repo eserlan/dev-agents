@@ -9,14 +9,18 @@ from dev_agents.copy_review import AnswerQualityAssessment, CoherenceCheck, Edit
 from dev_agents.issue_fixer import (
     IssueFixerService,
     _existing_issue_pr,
+    _implement_with_planning,
     _isolated_issue_worktree,
     _issue,
     _issue_result_body,
+    _last_agent_output,
     _open_bug_issues,
+    _plan_comment_body,
     _pr_number_from_url,
     _pr_result_body,
     _prompt,
     _publish_issue_comment,
+    _reported_line,
     _reset_worktree_for_fallback,
 )
 from dev_agents.runtime import StateRepository
@@ -715,3 +719,117 @@ def test_pre_pr_gate_requires_a_clean_verdict_even_without_blockers(
     assert still_fixed is True
     assert "passed the score gate" not in note
     assert "needs_human_review" in note
+
+
+def _planning_run(log_path: Path, outputs: list[str], plan: str = "1. Do it\n2. Test it"):
+    """A fake agent runner: each call appends a log segment; the read-only call writes the plan."""
+    calls: list[dict[str, object]] = []
+
+    def run(prompt: str, **options: object) -> AgentResult:
+        calls.append({"prompt": prompt, **options})
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"=== agent started provider=codex ===\nuser\n{prompt}\n")
+            stream.write(outputs[len(calls) - 1] + "\n")
+        if options.get("read_only") and plan:
+            Path(str(options["last_message_path"])).write_text(plan, encoding="utf-8")
+        return AgentResult(0, False)
+
+    return run, calls
+
+
+def _plan_kwargs(tmp_path: Path, plans: list[tuple[str, str]]) -> dict[str, object]:
+    return {
+        "prompt_for": lambda plan: f"IMPLEMENT plan={plan}" + (
+            "" if plan else "\nISSUE_FIX_PLAN_REQUIRED: <why this issue needs a plan, in one line>"
+        ),
+        "planning_prompt": "PLAN",
+        "log_path": tmp_path / "issue.log",
+        "plan_path": tmp_path / "issue.plan.md",
+        "effort": "medium",
+        "planning_effort": "high",
+        "on_plan": lambda plan, reason: plans.append((plan, reason)),
+    }
+
+
+def test_a_small_issue_is_implemented_without_planning(tmp_path: Path) -> None:
+    run, calls = _planning_run(tmp_path / "issue.log", ["SUMMARY: fixed it"])
+    plans: list[tuple[str, str]] = []
+
+    result = _implement_with_planning(run, **_plan_kwargs(tmp_path, plans))  # type: ignore[arg-type]
+
+    assert result.returncode == 0
+    assert [call["prompt"] for call in calls] == [
+        "IMPLEMENT plan=None\nISSUE_FIX_PLAN_REQUIRED: <why this issue needs a plan, in one line>"
+    ]
+    assert calls[0]["effort"] == "medium"
+    assert plans == []
+
+
+def test_a_comprehensive_issue_is_planned_at_higher_effort_then_implemented(tmp_path: Path) -> None:
+    run, calls = _planning_run(
+        tmp_path / "issue.log",
+        ["ISSUE_FIX_PLAN_REQUIRED: needs migrations, server and UI", "plan written", "SUMMARY: done"],
+    )
+    plans: list[tuple[str, str]] = []
+
+    result = _implement_with_planning(run, **_plan_kwargs(tmp_path, plans))  # type: ignore[arg-type]
+
+    assert result.returncode == 0
+    assert [call["prompt"] for call in calls][1:] == ["PLAN", "IMPLEMENT plan=1. Do it\n2. Test it"]
+    assert [call["effort"] for call in calls] == ["medium", "high", "medium"]
+    assert calls[1]["read_only"] is True and calls[1]["last_message_path"] == tmp_path / "issue.plan.md"
+    assert "read_only" not in calls[2]
+    assert plans == [("1. Do it\n2. Test it", "needs migrations, server and UI")]
+
+
+def test_a_failed_or_empty_plan_ends_the_attempt_without_implementing(tmp_path: Path) -> None:
+    run, calls = _planning_run(
+        tmp_path / "issue.log", ["ISSUE_FIX_PLAN_REQUIRED: big", "no plan"], plan=""
+    )
+    plans: list[tuple[str, str]] = []
+
+    result = _implement_with_planning(run, **_plan_kwargs(tmp_path, plans))  # type: ignore[arg-type]
+
+    assert result.returncode == 1
+    assert len(calls) == 2
+    assert plans == []
+
+
+def test_report_fields_ignore_the_prompt_placeholders_and_earlier_runs(tmp_path: Path) -> None:
+    log = tmp_path / "issue.log"
+    log.write_text(
+        "=== agent started ===\nSUMMARY: first run\n"
+        "=== agent started ===\nuser\nSUMMARY: <what was implemented>\nSUMMARY: blocked by X\n",
+        encoding="utf-8",
+    )
+
+    output = _last_agent_output(log)
+
+    assert _reported_line(output, "SUMMARY") == "blocked by X"
+    assert _reported_line("SUMMARY: <placeholder>", "SUMMARY") == ""
+    assert _last_agent_output(tmp_path / "missing.log") == ""
+
+
+def test_prompt_adds_the_scope_assessment_or_the_plan(tmp_path: Path) -> None:
+    issue = {"number": 7, "title": "T", "body": "B"}
+
+    plain = _prompt(tmp_path, issue, "main", "b", [], kind="enhancement")
+    assessing = _prompt(tmp_path, issue, "main", "b", [], kind="enhancement", assess_scope=True)
+    planned = _prompt(tmp_path, issue, "main", "b", [], kind="enhancement", assess_scope=True, plan="1. Step")
+
+    assert "ISSUE_FIX_PLAN_REQUIRED" not in plain
+    assert "ISSUE_FIX_PLAN_REQUIRED: <why" in assessing
+    assert "Implementation plan:\n1. Step" in planned
+    assert "ISSUE_FIX_PLAN_REQUIRED" not in planned
+
+
+def test_plan_comment_collapses_the_plan() -> None:
+    body = _plan_comment_body(7, "run-1", "needs migrations", "1. Step", "high")
+
+    assert "<!-- dev-agents:issue-fix issue=7 run=run-1 phase=plan -->" in body
+    assert "comprehensive: needs migrations" in body
+    assert "<summary>Implementation plan</summary>\n\n1. Step\n</details>" in body
+
+
+def test_planning_is_off_by_default() -> None:
+    assert IssueFixerConfig().planning_effort is None
