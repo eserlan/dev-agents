@@ -196,7 +196,8 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                             supplied_candidate=candidate,
                             on_event=degodify_phase,
                             timeout_seconds=config.degodify_timeout_minutes * 60,
-                            model=config.degodify_model, reasoning_effort=config.reasoning_effort,
+                            model=config.degodify_model,
+                            reasoning_effort=config.degodify_reasoning_effort or config.reasoning_effort,
                         )
                         _log(
                             f"handled delivery={delivery} event=degodify path={candidate.relative_path} "

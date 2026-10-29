@@ -1292,22 +1292,22 @@ def test_review_status_phase_creates_status_comment_with_history(monkeypatch, tm
 
     assert _publish_pr_run_comment(
         tmp_path, 42, "run-1", "review-started",
-        "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review started\n\nbody",
+        "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 gpt-6.1-terra review started\n\nbody",
     )
 
     post = calls[-1]
     assert post[:3] == ("gh", "api", "repos/owner/repo/issues/42/comments")
     assert "PATCH" not in post
     assert "<!-- dev-agents:history -->" in _posted_body(post)
-    assert "Luna review started" in _posted_body(post).split("Run history", 1)[1]
+    assert "gpt-6.1-terra review started" in _posted_body(post).split("Run history", 1)[1]
 
 
 def test_review_status_phases_update_one_comment_and_keep_history(monkeypatch, tmp_path: Path) -> None:
     existing = {
         "id": 7,
-        "body": "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review started\n\n"
+        "body": "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 gpt-6.1-terra review started\n\n"
         "<details><summary>Run history</summary>\n<!-- dev-agents:history -->\n\n"
-        "- 01:31 CET Luna review started\n</details>\n",
+        "- 01:31 CET gpt-6.1-terra review started\n</details>\n",
     }
     quoted = {"id": 9, "body": f"> {existing['body']}"}
     other_run = {"id": 3, "body": existing["body"].replace("run=run-1", "run=run-0")}
@@ -1315,32 +1315,32 @@ def test_review_status_phases_update_one_comment_and_keep_history(monkeypatch, t
 
     assert _publish_pr_run_comment(
         tmp_path, 42, "run-1", "review-final",
-        "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review completed — clean\n\ndone",
+        "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 gpt-6.1-terra review completed — clean\n\ndone",
     )
 
     patch = calls[-1]
     assert patch[:6] == ("gh", "api", "repos/owner/repo/issues/comments/7", "--method", "PATCH", "-f")
     body = _posted_body(patch)
-    assert body.startswith("<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review completed")
+    assert body.startswith("<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 gpt-6.1-terra review completed")
     history = body.split("<!-- dev-agents:history -->", 1)[1]
-    assert "- 01:31 CET Luna review started" in history
-    assert "Luna review completed — clean" in history
+    assert "- 01:31 CET gpt-6.1-terra review started" in history
+    assert "gpt-6.1-terra review completed — clean" in history
     assert not any(call[2] == "repos/owner/repo/issues/42/comments" and "--paginate" not in call for call in calls)
 
 
 def test_repeated_progress_notes_replace_their_history_entry() -> None:
-    progress = "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review in progress\n"
-    first = _with_history(progress, _with_history("### 🤖 Luna review started\n"))
+    progress = "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 gpt-6.1-terra review in progress\n"
+    first = _with_history(progress, _with_history("### 🤖 gpt-6.1-terra review started\n"))
     second = _with_history(progress, first)
 
     history = second.split("<!-- dev-agents:history -->", 1)[1]
-    assert history.count("Luna review in progress") == 1
-    assert history.count("Luna review started") == 1
+    assert history.count("gpt-6.1-terra review in progress") == 1
+    assert history.count("gpt-6.1-terra review started") == 1
 
 
 def test_actionable_run_phases_post_new_comments(monkeypatch, tmp_path: Path) -> None:
     """Findings, pauses and failures must notify, so they never edit the status comment."""
-    status = {"id": 7, "body": _with_history("<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review started\n")}
+    status = {"id": 7, "body": _with_history("<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 gpt-6.1-terra review started\n")}
     calls = _comment_api(monkeypatch, [status])
 
     for phase in ("review-findings", "auto-paused", "review-halted", "fix-failed"):
@@ -1513,7 +1513,7 @@ def test_clean_review_final_describes_what_changed() -> None:
         "pr_summary": "Adds a keyboard tracker.", "pr_files": [{"path": "a.ts", "description": "Tracks the inset"}],
     }})
 
-    assert "Luna review completed — clean" in body
+    assert "gpt-6-luna review completed — clean" in body
     assert "Adds a keyboard tracker." in body
     assert "| `a.ts` | Tracks the inset |" in body
 
@@ -1522,3 +1522,30 @@ def test_review_final_without_a_summary_has_no_empty_section() -> None:
     body = _review_completed_body(42, "run-1", {"review_report": {"verdict": "clean", "findings": [], "fixes": []}})
 
     assert "What changed in this PR" not in body
+
+
+def test_comments_name_the_configured_model_and_effort() -> None:
+    started = _review_started_body(42, "run-1", {"headRefOid": "abc"}, model="gpt-6.1-terra", effort="medium")
+    final = _review_completed_body(
+        42, "run-1", {"review_report": {"verdict": "clean"}}, model="gpt-6.1-terra", effort="medium",
+    )
+    findings = _review_findings_body(
+        42, "run-1", {"findings": [{"severity": "low", "location": "a.ts:1", "impact": "x"}]},
+        model="gpt-6.1-terra", effort="medium",
+    )
+
+    for body in (started, final, findings):
+        assert "- Model: `gpt-6.1-terra` (medium effort)" in body
+        assert "Luna" not in body
+    assert "### 🤖 gpt-6.1-terra review started" in started
+    assert "### 🤖 gpt-6.1-terra review completed — clean" in final
+    assert "gpt-6.1-terra's independent audit" in findings
+
+
+def test_service_names_its_configured_model(tmp_path: Path) -> None:
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=tmp_path, github="owner/repo"),
+        PrFixerConfig(state_path=tmp_path / "state.db", model="gpt-6.1-terra", reasoning_effort="medium"),
+    )
+
+    assert service._agent_identity() == {"model": "gpt-6.1-terra", "effort": "medium"}

@@ -8,7 +8,7 @@ PR reviews, PR fixes, and issue-fixer queues (including `gui-fix`) use Codex. Th
 default model is `gpt-6-luna`; set `pr_fixer.model` to override it for a project.
 The PR-fixer `providers` setting is retained for configuration compatibility, but it cannot enable
 fallback to another agent. `reasoning_effort` controls the Codex reasoning level and defaults to
-`high`.
+`high`. Review and fix comments name the model and effort they ran with.
 
 ```bash
 mkdir -p ~/.config/dev-agents ~/.config/systemd/user
@@ -44,7 +44,7 @@ run, entries in that directory untouched for 24 hours are removed. Only agent su
 redirected; the daemon's own temporary files are unchanged.
 
 When a target repository provides `scripts/affected-workspaces.mjs`, `scripts/lint-changed.mjs`,
-and `scripts/test-changed.mjs`, remediation and review prompts require Luna to follow that
+and `scripts/test-changed.mjs`, remediation and review prompts require the agent to follow that
 repository's CI scope selection. Ordinary PRs run the changed-file lint/test validators and the
 independent type-check commands in parallel after dependencies are installed. Changes to shared
 configuration, scripts, or dependency manifests follow the workflow's widened affected
@@ -193,7 +193,7 @@ issue_fixers:
     branch_prefix: dev-agents/copy-fix-
 ```
 
-When an open issue in that repository receives the `copy-fix` label, Luna uses the issue and
+When an open issue in that repository receives the `copy-fix` label, the agent uses the issue and
 surrounding repository content to make the requested copy edits, preserves meaning and formatting,
 then pushes a branch and opens a PR against `staging`. Ambiguous editorial requests are reported
 without guessing. The normal PR review workflow handles the resulting PR.
@@ -298,7 +298,7 @@ writer and use Codex with `gpt-6-luna` when Muse exits unsuccessfully or times o
 ```
 
 On startup and during reconciliation, open issues carrying the configured label are claimed in
-SQLite. Luna works in an isolated branch, runs the target repository's validation, pushes the
+SQLite. The agent works in an isolated branch, runs the target repository's validation, pushes the
 branch, and opens a PR containing an issue marker. The normal PR review/fix workflow then owns
 that PR; the issue fixer never merges or closes it. Existing marked PRs prevent duplicate issue
 branches, and failed claims may be retried safely.
@@ -316,7 +316,7 @@ After a successful remediation run, the daemon also creates or updates top-level
 that run. Each review run has one status comment (marker `<!-- dev-agents:pr-review run=… -->`)
 that is edited in place as the run moves through started, in progress, fixes started and its final
 outcome, with a collapsed run history of those steps; retries of the same run update it too. A
-fix push starts a new run and so a new status comment. Luna must also emit a validated structured
+fix push starts a new run and so a new status comment. The review agent must also emit a validated structured
 `REPORT_JSON` containing the verdict, findings with severity/category/location, the categories
 checked, validation commands, and fixes. The normalized result is persisted in the run metadata and
 event timeline; the final status update uses its human-readable summary to explain what actually

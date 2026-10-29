@@ -31,7 +31,9 @@ the built-in skills as a fallback:
   providers, with prompts rendered from the `release-evaluate`,
   `release-shortform`, and `release-longform` skills in `skills/` — the same
   files a human or agent loads for manual drafting, so pipeline and hand-made
-  copy share one voice.
+  copy share one voice. `release_comms.codex_model` and `codex_reasoning_effort`
+  choose the model and effort when Codex runs; other providers keep their own
+  default models.
 - Discord copy is derived from the Bluesky drafts (hashtags stripped) and the
   recommended channels reflect what was actually generated.
 - `evaluate` dry-run output then contains real drafts instead of empty lists.

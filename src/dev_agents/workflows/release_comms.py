@@ -230,6 +230,8 @@ def evaluate_release(
     promote_run_id: str,
     timeout_seconds: float = 600,
     recent_posts: str = "(none)",
+    codex_model: str | None = None,
+    codex_reasoning_effort: str | None = None,
 ) -> EvaluatorResult:
     """Run the daemon-owned evaluator, including when local generation is enabled."""
     delta = collect_release_delta(repo, new_sha, previous_sha, timeout_seconds)
@@ -237,6 +239,8 @@ def evaluate_release(
         repo=repo,
         delta=delta,
         providers=providers,
+        codex_model=codex_model,
+        codex_reasoning_effort=codex_reasoning_effort,
         log_dir=log_dir,
         run_id=promote_run_id,
         timeout_seconds=timeout_seconds,
@@ -312,6 +316,8 @@ def build_release_comms_workflow() -> Any:
                     repo=state["repo"],
                     delta=local_delta(state),
                     providers=state["config"].providers,
+                    codex_model=state["config"].codex_model,
+                    codex_reasoning_effort=state["config"].codex_reasoning_effort,
                     log_dir=local_log_dir(state),
                     run_id=state["promote_run_id"],
                     timeout_seconds=local_timeout(state),
@@ -327,6 +333,8 @@ def build_release_comms_workflow() -> Any:
                     state["promote_run_id"],
                     timeout_seconds=local_timeout(state),
                     recent_posts=recent_posts(state),
+                    codex_model=state["config"].codex_model,
+                    codex_reasoning_effort=state["config"].codex_reasoning_effort,
                 )
         if content_image_drafts and not evaluator_result.postworthy:
             evaluator_result = EvaluatorResult(
@@ -380,6 +388,8 @@ def build_release_comms_workflow() -> Any:
             evaluator=eval_res,
             delta=local_delta(state),
             providers=state["config"].providers,
+            codex_model=state["config"].codex_model,
+            codex_reasoning_effort=state["config"].codex_reasoning_effort,
             log_dir=local_log_dir(state),
             run_id=state["promote_run_id"],
             timeout_seconds=local_timeout(state),
@@ -395,6 +405,8 @@ def build_release_comms_workflow() -> Any:
             evaluator=eval_res,
             delta=local_delta(state),
             providers=state["config"].providers,
+            codex_model=state["config"].codex_model,
+            codex_reasoning_effort=state["config"].codex_reasoning_effort,
             log_dir=local_log_dir(state),
             run_id=state["promote_run_id"],
             timeout_seconds=local_timeout(state),
@@ -605,6 +617,8 @@ def build_release_comms_workflow() -> Any:
             evaluator=evaluator,
             base_drafts=writer_res.bluesky,
             providers=state["config"].providers,
+            codex_model=state["config"].codex_model,
+            codex_reasoning_effort=state["config"].codex_reasoning_effort,
             log_dir=local_log_dir(state),
             run_id=state["promote_run_id"],
             timeout_seconds=local_timeout(state),

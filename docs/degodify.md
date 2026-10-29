@@ -24,7 +24,8 @@ The `degodify` workflow identifies oversized files in target repositories and pe
 Only one degodify PR is open at a time: while a `curator/degod-*` PR is open, a new run records
 "waiting for open degodify PR" and does nothing, so nightly runs never stack refactors. Each run
 gets `pr_fixer.degodify_timeout_minutes` (default 60) shared across provider attempts. It uses
-`pr_fixer.degodify_model` (default `gpt-6.1-sol`) and the project's reasoning effort, including
+`pr_fixer.degodify_model` (default `gpt-6.1-sol`) and `pr_fixer.degodify_reasoning_effort`, which
+falls back to the project's reasoning effort, including
 when invoked from the CLI. An agent's zero exit code is accepted only when it leaves a clean
 committed change. Each provider gets one
 continuation in the same worktree to finish inspection-only or partial work, then the next
