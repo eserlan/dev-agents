@@ -33,6 +33,13 @@ class IssueFixerConfig(BaseModel):
     # comprehensive issue gets a read-only planning pass at this effort, then the implementation
     # runs again at ``reasoning_effort`` with the plan. None skips the assessment.
     planning_effort: str | None = None
+    # Codex queues only: resume the same session this many times when a run stops before pushing
+    # without reporting a blocker (``SUMMARY: BLOCKED: ...``).
+    continuations: int = Field(default=0, ge=0, le=10)
+    # Codex queues only: a model that takes over in the same worktree, with the plan and the
+    # partial work, when the queue's model still has not pushed after its continuations.
+    handoff_model: str | None = None
+    handoff_reasoning_effort: str | None = None
     # Answer queues only: run the copy reviewer on the draft before the PR
     # is opened and revise until it clears the score gate or the revision
     # cap is reached (the cap keeps a stuck draft from looping forever).
