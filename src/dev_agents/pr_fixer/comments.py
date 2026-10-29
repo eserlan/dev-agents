@@ -188,11 +188,13 @@ head will receive a full review.
         if pushed_fix and fixes
         else f"- Findings: {_findings_summary(review_report, 'No actionable defects found.')}\n"
     )
+    what_changed = _what_changed_section(review_report.get("pr_summary"), review_report.get("pr_files"))
+    what_changed = f"\n{what_changed}" if what_changed else ""
     return f"""<!-- dev-agents:pr-review run={run_id} -->
 {heading}
 
 {outcome}
-{fixes_section}
+{fixes_section}{what_changed}
 - PR: #{number}
 {round_line}
 {findings_line}- {commit_line}
@@ -204,18 +206,51 @@ head will receive a full review.
 
 
 MAX_LISTED_FINDINGS = 10
+MAX_LISTED_FILES = 30
+
+# GitHub's Primer palette: danger-emphasis darker for critical, then danger, attention, accent.
+SEVERITY_COLOURS = {"critical": "82071e", "high": "cf222e", "medium": "bf8700", "low": "0969da"}
+SEVERITY_ORDER = ("critical", "high", "medium", "low")
+
+
+def _severity_badge(severity: object) -> str:
+    """A coloured severity label; unknown severities fall back to plain bold text."""
+    name = str(severity or "unknown").lower()
+    colour = SEVERITY_COLOURS.get(name)
+    if not colour:
+        return f"**{name.upper()}**"
+    return f"![{name.upper()}](https://img.shields.io/badge/{name.upper()}-{colour}?style=flat-square)"
+
+
+def _verdict_line(findings: list[dict[str, Any]]) -> str:
+    severities = {str(item.get("severity") or "").lower() for item in findings}
+    if severities & {"critical", "high"}:
+        return "🔴 Changes required"
+    if "medium" in severities:
+        return "🟡 Changes recommended"
+    return "🔵 Minor changes suggested"
+
+
+def _severity_counts(findings: list[dict[str, Any]]) -> str:
+    counts = [
+        f"{sum(1 for item in findings if str(item.get('severity') or '').lower() == name)} {_severity_badge(name)}"
+        for name in SEVERITY_ORDER
+        if any(str(item.get("severity") or "").lower() == name for item in findings)
+    ]
+    return " · ".join(counts) or str(len(findings))
 
 
 def _findings_markdown(report: dict[str, Any]) -> str:
-    """Render each structured finding as its own reviewable list item."""
+    """Render each structured finding as its own reviewable list item, most severe first."""
     findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
     if not findings:
         return "No actionable defects found.\n"
+    rank = {name: index for index, name in enumerate(SEVERITY_ORDER)}
+    findings = sorted(findings, key=lambda item: rank.get(str(item.get("severity") or "").lower(), len(rank)))
     lines = []
     for index, item in enumerate(findings[:MAX_LISTED_FINDINGS], start=1):
-        severity = str(item.get("severity") or "unknown").upper()
-        category = f" · {item['category']}" if item.get("category") else ""
-        lines.append(f"{index}. **{severity}**{category} — `{item.get('location', '?')}`")
+        category = f" **{item['category']}**" if item.get("category") else ""
+        lines.append(f"{index}. {_severity_badge(item.get('severity'))}{category} — `{item.get('location', '?')}`")
         lines.append(f"   - Impact: {item.get('impact', '')}")
         if item.get("evidence"):
             lines.append(f"   - Evidence: {item['evidence']}")
@@ -224,6 +259,32 @@ def _findings_markdown(report: dict[str, Any]) -> str:
     if len(findings) > MAX_LISTED_FINDINGS:
         lines.append(f"\n…and {len(findings) - MAX_LISTED_FINDINGS} more in the run report.")
     return "\n".join(lines) + "\n"
+
+
+def _table_cell(text: object) -> str:
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def _what_changed_section(summary: object, files: object) -> str:
+    """Collapsed description of the reviewed diff, or nothing when the audit gave none."""
+    rows = [item for item in files or [] if isinstance(item, dict) and item.get("path")] if isinstance(files, list) else []
+    if not (isinstance(summary, str) and summary.strip()) and not rows:
+        return ""
+    table = ""
+    if rows:
+        table = "\n| File | Description |\n| ---- | ----------- |\n" + "".join(
+            f"| `{_table_cell(item['path'])}` | {_table_cell(item.get('description', ''))} |\n"
+            for item in rows[:MAX_LISTED_FILES]
+        )
+        if len(rows) > MAX_LISTED_FILES:
+            table += f"\n…and {len(rows) - MAX_LISTED_FILES} more files.\n"
+    text = summary.strip() if isinstance(summary, str) else ""
+    return f"""<details>
+<summary><strong>What changed in this PR</strong></summary>
+
+{text}
+{table}</details>
+"""
 
 
 def _review_findings_body(
@@ -249,23 +310,39 @@ def _review_findings_body(
         if unverified
         else ""
     )
+    findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
     return f"""<!-- dev-agents:pr-review-findings run={run_id} -->
 ### 🤖 Luna review findings
 
-Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}:
+#### {_verdict_line(findings)}
+
+Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}.
+
+**Findings:** {_severity_counts(findings)}
+
+<details open>
+<summary><strong>Open ({count})</strong></summary>
 
 {_findings_markdown(report)}
-Dev-agents will fix these findings by default. An active external development process can
-claim this run before the fixer starts (it waits at least {claim_window_seconds} seconds) by
-posting exactly:
+</details>
+
+{_what_changed_section(report.get("summary"), report.get("files"))}
+{unverified_section}Dev-agents fixes these findings by default.
+
+<details>
+<summary>Claim this run for an external agent</summary>
+
+An active external development process can claim this run before the fixer starts (it waits at
+least {claim_window_seconds} seconds) by posting exactly:
 
 `/dev-agents claim {run_id}`
 
 Claims from repository owners, members or collaborators pause the fixer for up to 30 minutes.
 A push starts a fresh review; without a push, dev-agents resumes fixing. Attribution alone
 does not claim the work.
+</details>
 
-{unverified_section}{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
+{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
 - Run: `{run_id}`
 {_report_line(report_url)}
 """

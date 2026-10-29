@@ -182,6 +182,10 @@ markup, labels and roles, focus handling, and contrast calculated from the theme
 List anything that can only be confirmed visually under `limitations`, and set the check's status
 from the source evidence you do have.
 
+Describe the reviewed diff for the reader: `summary` says in one or two sentences what the PR
+changes, and `files` lists every changed file with a short phrase on what changed in it. Describe;
+do not judge. Findings belong in `findings`.
+
 Record one `checks` entry for every lens above, with `category` set to exactly its identifier:
 premise-inversion, tests, resource-budget, security-privacy, lifecycle, accessibility. Add any
 other areas you reviewed (such as the bundled repository guidance) as separate entries.

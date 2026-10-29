@@ -24,7 +24,11 @@ from dev_agents.pr_fixer import (
     _review_started_body,
     _target_validation_instructions,
 )
-from dev_agents.pr_fixer.comments import _review_findings_body, _with_history
+from dev_agents.pr_fixer.comments import (
+    _review_completed_body,
+    _review_findings_body,
+    _with_history,
+)
 from dev_agents.runtime import StateRepository
 
 
@@ -679,6 +683,7 @@ def test_clean_audit_succeeds_without_pushing_the_base_merge(monkeypatch, tmp_pa
 
         assert _kwargs["read_only"] is True
         _kwargs["last_message_path"].write_text(json.dumps({
+            "summary": "Merges the base branch.", "files": [],
             "verdict": "clean", "findings": [], "categories_checked": ["general"],
             "checks": [{"category": category, "status": "pass", "evidence": "Read changed path"}
                        for category in sorted(AUDIT_LENSES)], "limitations": [],
@@ -1459,3 +1464,61 @@ def test_failed_fix_posts_outcome_and_preserves_feedback(monkeypatch, tmp_path: 
     assert service.state.unprocessed_feedback("pr-fixer", "42", ["check:failed"]) == [
         "check:failed"
     ]
+
+
+def test_findings_overview_orders_by_severity_with_badges_and_counts() -> None:
+    findings = [
+        {"severity": "low", "category": "tests", "location": "a.ts:1", "impact": "Minor gap"},
+        {"severity": "high", "category": "lifecycle", "location": "b.ts:2", "impact": "Leaks a listener"},
+        {"severity": "low", "category": "tests", "location": "c.ts:3", "impact": "Another gap"},
+    ]
+    body = _review_findings_body(42, "run-1", {
+        "findings": findings,
+        "summary": "Adds a keyboard tracker.",
+        "files": [{"path": "a.ts", "description": "Tracks | the inset"}],
+    })
+
+    high = "![HIGH](https://img.shields.io/badge/HIGH-cf222e?style=flat-square)"
+    low = "![LOW](https://img.shields.io/badge/LOW-0969da?style=flat-square)"
+    assert "#### 🔴 Changes required" in body
+    assert f"**Findings:** 1 {high} · 2 {low}" in body
+    assert body.index("`b.ts:2`") < body.index("`a.ts:1`") < body.index("`c.ts:3`")
+    assert f"1. {high} **lifecycle** — `b.ts:2`" in body
+    assert "<summary><strong>What changed in this PR</strong></summary>" in body
+    assert "| `a.ts` | Tracks \\| the inset |" in body
+    assert "`/dev-agents claim run-1`" in body
+
+
+@pytest.mark.parametrize(
+    ("severities", "verdict"),
+    [(["medium", "low"], "🟡 Changes recommended"), (["low"], "🔵 Minor changes suggested"),
+     (["critical"], "🔴 Changes required")],
+)
+def test_findings_overview_verdict_follows_the_worst_severity(severities: list[str], verdict: str) -> None:
+    findings = [{"severity": name, "location": "a.ts:1", "impact": "x"} for name in severities]
+
+    assert f"#### {verdict}" in _review_findings_body(42, "run-1", {"findings": findings})
+
+
+def test_unknown_severity_falls_back_to_plain_label() -> None:
+    body = _review_findings_body(42, "run-1", {"findings": [{"severity": "odd", "location": "a.ts:1", "impact": "x"}]})
+
+    assert "1. **ODD** — `a.ts:1`" in body
+    assert "shields.io/badge/ODD" not in body
+
+
+def test_clean_review_final_describes_what_changed() -> None:
+    body = _review_completed_body(42, "run-1", {"review_report": {
+        "verdict": "clean", "findings": [], "fixes": [],
+        "pr_summary": "Adds a keyboard tracker.", "pr_files": [{"path": "a.ts", "description": "Tracks the inset"}],
+    }})
+
+    assert "Luna review completed — clean" in body
+    assert "Adds a keyboard tracker." in body
+    assert "| `a.ts` | Tracks the inset |" in body
+
+
+def test_review_final_without_a_summary_has_no_empty_section() -> None:
+    body = _review_completed_body(42, "run-1", {"review_report": {"verdict": "clean", "findings": [], "fixes": []}})
+
+    assert "What changed in this PR" not in body

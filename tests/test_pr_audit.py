@@ -5,9 +5,12 @@ import pytest
 
 from dev_agents.pr_fixer.audit import AUDIT_LENSES, compare_reference_comments, parse_audit_report
 
+SUMMARY = {"summary": "Adds a feature.", "files": [{"path": "feature.txt", "description": "Adds the feature"}]}
+
 
 def payload() -> dict:
     return {
+        "summary": "Adds a feature.", "files": [{"path": "feature.txt", "description": "Adds the feature"}],
         "verdict": "clean", "findings": [], "categories_checked": sorted(AUDIT_LENSES),
         "checks": [{"category": category, "status": "pass", "evidence": "Inspected the affected execution path"}
                    for category in sorted(AUDIT_LENSES)], "limitations": [],
@@ -81,7 +84,7 @@ def test_paraphrased_lens_categories_are_canonicalised(tmp_path: Path) -> None:
     checks = [{"category": name, "status": "pass", "evidence": "Traced the changed path"} for name in paraphrased]
     checks.append({"category": "Codex-Cryptica architecture and privacy", "status": "pass", "evidence": "Checked"})
     path = tmp_path / "audit.json"
-    path.write_text(json.dumps({"verdict": "clean", "findings": [], "categories_checked": ["general"],
+    path.write_text(json.dumps({**SUMMARY, "verdict": "clean", "findings": [], "categories_checked": ["general"],
                                 "checks": checks, "limitations": []}))
 
     report = parse_audit_report(path, initial=True)
@@ -96,7 +99,7 @@ def test_a_lens_merely_mentioned_inside_another_category_does_not_count(tmp_path
     checks = [{"category": lens, "status": "pass", "evidence": "Traced"} for lens in sorted(AUDIT_LENSES - {"security-privacy"})]
     checks.append({"category": "architecture and privacy", "status": "pass", "evidence": "Checked"})
     path = tmp_path / "audit.json"
-    path.write_text(json.dumps({"verdict": "clean", "findings": [], "categories_checked": ["general"],
+    path.write_text(json.dumps({**SUMMARY, "verdict": "clean", "findings": [], "categories_checked": ["general"],
                                 "checks": checks, "limitations": []}))
 
     with pytest.raises(ValueError, match="all adversarial lenses"):
