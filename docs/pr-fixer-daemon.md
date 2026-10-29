@@ -322,6 +322,11 @@ checked, validation commands, and fixes. The normalized result is persisted in t
 event timeline; the final status update uses its human-readable summary to explain what actually
 changed, alongside the resulting commit, PR files, and validation result.
 
+The audit also describes the diff (`summary` and a `files` table). The findings comment is a
+review overview: a verdict from the worst severity, severity counts with coloured badges, the
+findings most severe first, a collapsed "What changed in this PR" section and collapsed claim
+instructions. A clean review shows the same "What changed" section in its final status.
+
 Edits notify nobody, so events that may need a human post their own comment: the findings (with
 the claim instructions, marker `pr-review-findings`), pause alerts, claims, halts, fix failures and
 completed feedback-fix summaries. Comment delivery is best-effort and is recorded in workflow event

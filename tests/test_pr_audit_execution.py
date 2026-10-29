@@ -72,6 +72,8 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
                 "impact": "Invalid input reaches the sensitive sink", "remediation": "Validate before use",
             }]
             audit = {
+                "summary": "Changes the feature branch.",
+                "files": [{"path": "feature.txt", "description": "Adds the new branch"}],
                 "verdict": "findings" if findings else "clean", "findings": findings,
                 "categories_checked": sorted(AUDIT_LENSES),
                 "checks": [{"category": c, "status": "finding" if c == "security-privacy" and findings else "pass", "evidence": "Traced changed path"} for c in sorted(AUDIT_LENSES)],
@@ -158,7 +160,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         phases = [phase for phase, _body in comments]
         assert phases.index("review-findings") < phases.index("review-fixes-started")
         findings_body = dict(comments)["review-findings"]
-        assert "**HIGH** · security-privacy — `feature.txt:1`" in findings_body
+        assert "![HIGH](https://img.shields.io/badge/HIGH-cf222e?style=flat-square) **security-privacy** — `feature.txt:1`" in findings_body
+        assert "#### 🔴 Changes required" in findings_body
+        assert "| `feature.txt` | Adds the new branch |" in findings_body
         assert "Suggested fix: Validate before use" in findings_body
         assert "in Luna's findings comment" in dict(comments)["review-fixes-started"]
     if mode == "handoff":

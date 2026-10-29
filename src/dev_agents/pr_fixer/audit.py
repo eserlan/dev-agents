@@ -35,9 +35,18 @@ class AuditCheck(BaseModel):
     evidence: str = Field(min_length=1)
 
 
+class AuditFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    description: str = Field(min_length=1, description="What this PR changes in the file, in one short phrase.")
+
+
 class AuditReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    summary: str = Field(min_length=1, description="One or two sentences on what the PR changes, for a reviewer.")
+    files: list[AuditFile] = Field(description="Every file the reviewed diff changes.")
     verdict: Literal["clean", "findings", "incomplete"]
     findings: list[AuditFinding]
     categories_checked: list[str] = Field(min_length=1)
@@ -52,6 +61,8 @@ class AuditReport(BaseModel):
             "categories_checked": self.categories_checked,
             "validation": ["Independent read-only audit; no repair or test execution"],
             "fixes": [],
+            "pr_summary": self.summary,
+            "pr_files": [file.model_dump() for file in self.files],
         }
 
 
