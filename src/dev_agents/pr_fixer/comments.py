@@ -450,7 +450,6 @@ def _fix_summary_body(
 The automated fixer addressed {reason_text} on PR #{number}.
 
 - {commit_line}
-- Validation: the triggering feedback was re-checked successfully.
 {details_line}- Validation: the triggering feedback was re-checked successfully.
 - Files in the resulting PR diff: {file_text}
 {_model_line(model, effort)}- Run: `{run_id}`

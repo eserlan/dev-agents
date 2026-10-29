@@ -1549,3 +1549,10 @@ def test_service_names_its_configured_model(tmp_path: Path) -> None:
     )
 
     assert service._agent_identity() == {"model": "gpt-6.1-terra", "effort": "medium"}
+
+
+def test_fix_summary_states_validation_once() -> None:
+    body = _fix_summary_body(42, "run-1", {"headRefOid": "a"}, {"headRefOid": "b"}, ["check:x"], ["a.ts"], details="Fixed it")
+
+    assert body.count("- Validation:") == 1
+    assert "- What changed: Fixed it\n- Validation:" in body
