@@ -46,8 +46,10 @@ class IssueFixerConfig(BaseModel):
     pre_pr_review: bool = True
     pre_pr_score_threshold: float = Field(default=8.5, ge=0, le=10)
     pre_pr_max_revisions: int = Field(default=3, ge=0, le=10)
-    fallback_provider: Literal["codex", "muse"] | None = None
+    # None inherits the PR fixer's fallback.
+    fallback_provider: Literal["codex", "muse", "claude"] | None = None
     fallback_model: str | None = None
+    fallback_reasoning_effort: str | None = None
     base_branch: str = "main"
     branch_prefix: str = "dev-agents/issue-"
     timeout_minutes: int = 30
@@ -193,6 +195,11 @@ class PrFixerConfig(BaseModel):
     providers: list[str] = ["codex"]
     model: str | None = None
     reasoning_effort: str = "high"
+    # Reruns a review or fix that Codex failed without touching the worktree (a usage limit,
+    # a crash), and takes the work while Codex is over its usage limit.
+    fallback_provider: Literal["claude"] | None = None
+    fallback_model: str | None = None
+    fallback_reasoning_effort: str | None = None
     timeout_minutes: int = 20
     reconcile_interval_seconds: int = 300
     review_without_copilot: bool = True

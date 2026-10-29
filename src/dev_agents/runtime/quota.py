@@ -1,7 +1,7 @@
 """Provider usage-limit gate shared by every daemon that runs agents on one account.
 
-When Codex reports "You've hit your usage limit ... try again at 11:20 PM", every
-run started before that time fails the same way. Recording the reset time lets the
+When a provider reports that the account is over its usage limit, every run started
+before the quoted reset time fails the same way. Recording the reset time lets the
 fixers skip claiming work (no attempt is counted, nothing is posted) and keeps a
 quota outage from auto-pausing PRs and issues that did nothing wrong.
 """
@@ -13,8 +13,10 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
-USAGE_LIMIT_PATTERN = re.compile(r"hit your usage limit", re.IGNORECASE)
-_RESET_AT = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AP]M)?", re.IGNORECASE)
+# Codex: "You've hit your usage limit ... try again at 11:20 PM".
+# Claude: "You've hit your limit · resets 11pm (Europe/Oslo)".
+USAGE_LIMIT_PATTERN = re.compile(r"hit your (?:usage )?limit|usage limit reached", re.IGNORECASE)
+_RESET_AT = re.compile(r"(?:try again at|resets) (\d{1,2})(?::(\d{2}))?\s*([AP]M)?", re.IGNORECASE)
 # Used when the message names no reset time we can parse.
 DEFAULT_BLOCK = timedelta(hours=1)
 
@@ -33,7 +35,7 @@ def usage_limit_reset(text: str, now: datetime) -> datetime | None:
     match = _RESET_AT.search(text)
     if match is None:
         return now + DEFAULT_BLOCK
-    hour, minute, meridiem = int(match.group(1)), int(match.group(2)), match.group(3)
+    hour, minute, meridiem = int(match.group(1)), int(match.group(2) or 0), match.group(3)
     if meridiem:
         hour = hour % 12 + (12 if meridiem.upper() == "PM" else 0)
     if hour > 23 or minute > 59:
