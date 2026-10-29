@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -13,9 +14,10 @@ from datetime import datetime
 from math import ceil
 from pathlib import Path
 from threading import Event
+from typing import TextIO
 from uuid import uuid4
 
-from dev_agents.runtime.quota import record_quota_block, usage_limit_reset
+from dev_agents.runtime.quota import quota_blocked_until, record_quota_block, usage_limit_reset
 from dev_agents.runtime.retention import remove_older_than
 
 # Shared by PR review/fix and issue-fix queues, including GUI enhancements.
@@ -126,15 +128,18 @@ def provider_command(
             "-",
         ]
     if provider == "claude":
+        # The prompt arrives on stdin; JSON output carries the final message and any
+        # structured output, which run_agent unpacks into the log and last-message file.
         return [
             "claude",
             "-p",
-            "--dangerously-skip-permissions",
+            *(["--permission-mode", "plan"] if read_only else ["--dangerously-skip-permissions"]),
             "--model",
-            "haiku",
+            model or "haiku",
             "--effort",
-            "medium",
-            prompt,
+            reasoning_effort or "medium",
+            "--output-format",
+            "json",
         ]
     if provider == "agy":
         timeout_minutes = max(1, ceil(timeout_seconds / 60))
@@ -159,6 +164,29 @@ def provider_command(
             prompt,
         ]
     return [provider, "-p", prompt]
+
+
+def _unpack_claude_output(
+    output: str, stream: TextIO, last_message_path: Path | None, structured: bool
+) -> None:
+    """Write Claude's final message to the log as text and save it like Codex's last message.
+
+    Callers read report lines (``SUMMARY: ...``) from the log as plain text, as before.
+    """
+    try:
+        payload = json.loads(output)
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        stream.write(output)
+        return
+    message = str(payload.get("result") or "")
+    stream.write(f"{message}\n")
+    if last_message_path is not None:
+        output = payload.get("structured_output") if structured else None
+        last_message_path.write_text(
+            json.dumps(output) if output is not None else message, encoding="utf-8"
+        )
 
 
 class AgentCleanupError(RuntimeError):
@@ -260,13 +288,22 @@ def run_agent(
     30-40 minute review reads as hung.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    blocked_until = quota_blocked_until(provider)
+    if blocked_until is not None:
+        # Starting would only be refused again; let the caller fall back or wait.
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                f"\n=== agent skipped provider={provider}: usage limit until {blocked_until.isoformat()} ===\n"
+            )
+        return AgentResult(returncode=1, timed_out=False, quota_exhausted=True)
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\n=== agent started provider={provider} ===\n")
         stream.flush()
         run_start = stream.tell()
         scope = f"dev-agents-run-{uuid4().hex}.scope" if _user_systemd_available() else None
         prompt_stream = None
-        if provider == "codex":
+        claude_output = None
+        if provider in ("codex", "claude"):
             prompt_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")  # noqa: SIM115 - closed immediately after spawn in finally
             prompt_stream.write(prompt)
             prompt_stream.seek(0)
@@ -281,30 +318,37 @@ def run_agent(
                 **({"resume_session": resume_session} if resume_session else {}),
             )
             if read_only:
-                if provider != "codex":
-                    raise ValueError("read_only auditing requires the Codex provider")
+                if provider not in ("codex", "claude"):
+                    raise ValueError("read_only auditing requires the Codex or Claude provider")
                 command = provider_command(provider, prompt, timeout_seconds, reasoning_effort, model, read_only=True)
             if last_message_path is not None:
-                if provider != "codex":
-                    raise ValueError("last_message_path requires the Codex provider")
+                if provider not in ("codex", "claude"):
+                    raise ValueError("last_message_path requires the Codex or Claude provider")
                 last_message_path.parent.mkdir(parents=True, exist_ok=True)
-                command.extend(["--output-last-message", str(last_message_path)])
+                if provider == "codex":
+                    command.extend(["--output-last-message", str(last_message_path)])
             if output_schema_path is not None:
-                if provider != "codex":
-                    raise ValueError("output_schema_path requires the Codex provider")
-                command.extend(["--output-schema", str(output_schema_path)])
+                if provider == "codex":
+                    command.extend(["--output-schema", str(output_schema_path)])
+                elif provider == "claude":
+                    command.extend(["--json-schema", output_schema_path.read_text(encoding="utf-8")])
+                else:
+                    raise ValueError("output_schema_path requires the Codex or Claude provider")
             if scope is not None:
                 command = [
                     "systemd-run", "--user", "--scope", "--quiet", "--collect",
                     f"--unit={scope}", "--property=TimeoutStopSec=5s", "--", *command,
                 ]
+            # Claude's JSON result is unpacked into the log afterwards; its stderr still streams.
+            if provider == "claude":
+                claude_output = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")  # noqa: SIM115 - closed after unpacking
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
                 env=_agent_environment(),
                 stdin=prompt_stream,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
+                stdout=claude_output or stream,
+                stderr=stream if claude_output else subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
             )
@@ -344,6 +388,10 @@ def run_agent(
             except (OSError, subprocess.TimeoutExpired) as error:
                 raise AgentCleanupError("Could not confirm agent shutdown") from error
         returncode = process.wait()
+        if claude_output is not None:
+            with claude_output:
+                claude_output.seek(0)
+                _unpack_claude_output(claude_output.read(), stream, last_message_path, output_schema_path is not None)
         stream.write(f"=== agent finished exit={returncode} timed_out={timed_out} ===\n")
     sweep_agent_tmp()
     quota_exhausted = False

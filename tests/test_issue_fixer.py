@@ -902,6 +902,23 @@ def test_issue_claims_wait_while_every_provider_is_over_quota(tmp_path: Path, is
     assert fixer._auto_pause_if_exhausted(7, "issue-fix-7-x", 5, "quota") is False
 
 
+def test_codex_issue_queues_inherit_the_pr_fixers_claude_fallback(tmp_path: Path) -> None:
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    pr_config = PrFixerConfig(
+        fallback_provider="claude", fallback_model="claude-sonnet-5-5", fallback_reasoning_effort="medium",
+    )
+    state = StateRepository(tmp_path / "state.db", "demo", tmp_path)
+
+    codex = IssueFixerService("demo", project, IssueFixerConfig(), pr_config, state)
+    muse = IssueFixerService(
+        "demo", project, IssueFixerConfig(provider="muse", fallback_provider="codex", fallback_model="gpt-6-luna"),
+        pr_config, state,
+    )
+
+    assert (codex._fallback_provider(), codex._fallback_options()) == ("claude", ("claude-sonnet-5-5", "medium"))
+    assert (muse._fallback_provider(), muse._fallback_options()) == ("codex", ("gpt-6-luna", None))
+
+
 def test_report_fields_ignore_the_prompt_placeholders_and_earlier_runs(tmp_path: Path) -> None:
     log = tmp_path / "issue.log"
     log.write_text(

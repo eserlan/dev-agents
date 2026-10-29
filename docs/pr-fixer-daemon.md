@@ -86,6 +86,21 @@ count no failed attempt and post no comment. Failures during the block never app
 label, and an issue run hit by the limit is not handed off to another model on the same account.
 If the message gives no reset time, the block lasts one hour.
 
+## Claude fallback
+
+Set `fallback_provider: claude`, `fallback_model` and `fallback_reasoning_effort` under
+`pr_fixer` to rerun a PR review or fix on Claude when Codex fails. The fallback only takes over
+when Codex left the worktree as it found it (a usage limit, a crash), never after a timeout or
+partial edits. While Codex is over its usage limit, the fallback runs straight away. Claude
+audits run in plan mode (read-only) with the same JSON schema. Comments name the model that
+actually ran.
+
+Codex issue queues inherit this fallback unless they set their own `fallback_provider`. As before,
+a fallback for an issue starts again from the base branch.
+
+The claim gate and auto-pause guard above apply only while every configured provider is over
+its usage limit.
+
 ## State database
 
 Workflow state is stored in the configured `pr_fixer.state_path` SQLite database. If it is omitted,

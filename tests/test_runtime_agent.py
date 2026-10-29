@@ -50,8 +50,64 @@ def test_claude_provider_command_uses_haiku_medium() -> None:
         "haiku",
         "--effort",
         "medium",
-        "fix it",
+        "--output-format",
+        "json",
     ]
+
+
+def test_claude_provider_command_takes_the_fallback_model_and_read_only_mode() -> None:
+    command = provider_command("claude", "audit", model="claude-sonnet-5-5", reasoning_effort="medium", read_only=True)
+
+    assert command[:6] == ["claude", "-p", "--permission-mode", "plan", "--model", "claude-sonnet-5-5"]
+    assert "--dangerously-skip-permissions" not in command and "audit" not in command
+
+
+def test_run_agent_unpacks_claude_json_into_the_log_and_last_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    payload = {"type": "result", "result": "SUMMARY: done", "structured_output": {"ok": True}}
+    (tmp_path / "out.json").write_text(json.dumps(payload), encoding="utf-8")
+    schema = tmp_path / "schema.json"
+    schema.write_text('{"type": "object"}', encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def command(*_args, **_kwargs):
+        return ["sh", "-c", f"cat {tmp_path / 'out.json'}; echo warning >&2"]
+
+    monkeypatch.setattr("dev_agents.runtime.agent.provider_command", command)
+    monkeypatch.setattr("dev_agents.runtime.agent._user_systemd_available", lambda: False)
+    real_popen = __import__("subprocess").Popen
+    monkeypatch.setattr(
+        "dev_agents.runtime.agent.subprocess.Popen",
+        lambda cmd, **kwargs: seen.append(cmd) or real_popen(cmd, **kwargs),
+    )
+    log, last = tmp_path / "agent.log", tmp_path / "last.json"
+
+    result = run_agent(
+        "claude", "x", cwd=tmp_path, log_path=log, timeout_seconds=5,
+        last_message_path=last, output_schema_path=schema,
+    )
+
+    assert result.returncode == 0
+    assert "SUMMARY: done\n" in log.read_text() and "warning" in log.read_text()
+    assert '"structured_output"' not in log.read_text()
+    assert json.loads(last.read_text()) == {"ok": True}
+    assert seen[0][-2:] == ["--json-schema", '{"type": "object"}']
+
+
+def test_run_agent_skips_a_provider_over_its_usage_limit(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta
+
+    from dev_agents.runtime.quota import record_quota_block
+
+    record_quota_block("codex", datetime.now().astimezone() + timedelta(hours=1))
+
+    result = run_agent("codex", "x", cwd=tmp_path, log_path=tmp_path / "agent.log", timeout_seconds=5)
+
+    assert result.quota_exhausted and result.returncode == 1
+    assert "agent skipped provider=codex" in (tmp_path / "agent.log").read_text()
 
 
 def test_generic_provider_command_uses_prompt_flag() -> None:

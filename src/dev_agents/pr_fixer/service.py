@@ -249,9 +249,35 @@ class PrFixerService:
             login and login not in agents and not login.endswith("[bot]") for login in logins
         )
 
-    def _agent_identity(self) -> dict[str, Any]:
-        """The model and effort the review and fix agents run with, for naming them in comments."""
+    def _agent_identity(self, report: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The model and effort that ran (or will run) the agent, for naming it in comments.
+
+        A run's report records the fallback model when Codex could not do the work.
+        """
+        if report and report.get("agent_model"):
+            return {"model": report["agent_model"], "effort": report.get("agent_effort")}
+        fallback = self.config.fallback_provider
+        if fallback and quota_blocked_until(PR_FIX_PROVIDER) is not None:
+            model, effort = self._provider_options(fallback)
+            return {"model": model or fallback, "effort": effort}
         return {"model": self.config.model or CODEX_MODEL, "effort": self.config.reasoning_effort}
+
+    def _providers(self) -> list[str]:
+        fallback = self.config.fallback_provider
+        return [PR_FIX_PROVIDER, *([fallback] if fallback and fallback != PR_FIX_PROVIDER else [])]
+
+    def _provider_options(self, provider: str) -> tuple[str | None, str | None]:
+        """Model and reasoning effort for one of `_providers()`."""
+        if provider == PR_FIX_PROVIDER:
+            return self.config.model, self.config.reasoning_effort
+        return self.config.fallback_model, self.config.fallback_reasoning_effort
+
+    def _quota_blocked_until(self) -> Any:
+        """The earliest reset time while every provider is over its usage limit, else None."""
+        blocked = [quota_blocked_until(provider) for provider in self._providers()]
+        if any(until is None for until in blocked):
+            return None
+        return min(blocked)
 
     def _review_plan(
         self, number: int, head_sha: str, *, human_head: bool = False
@@ -387,7 +413,7 @@ class PrFixerService:
                 new_sha,
                 fix_pushed=False,
                 superseded_by=new_sha,
-                **self._agent_identity(),
+                **self._agent_identity(state.get("report")),
             ),
         )
         _log(f"review-superseded pr={number} original_head={old_sha} new_head={new_sha}")
@@ -542,10 +568,10 @@ class PrFixerService:
             until = float(claim_info["expires_at"]) if claim_info else opened + self.config.review_claim_window_seconds
             if now < until:
                 return {"meta": meta, "keys": keys, "skip": True}
-        blocked_until = quota_blocked_until(PR_FIX_PROVIDER)
+        blocked_until = self._quota_blocked_until()
         if blocked_until is not None:
             # Claiming now would only fail, count an attempt and post a failure comment.
-            _log(f"quota-wait pr={number} provider={PR_FIX_PROVIDER} until={blocked_until.isoformat()}")
+            _log(f"quota-wait pr={number} until={blocked_until.isoformat()}")
             return {"meta": meta, "keys": keys, "skip": True}
         review_skill_path, _ = _review_skill(self.project.repo)
         claim = self.state.claim_run(
@@ -759,8 +785,8 @@ A follow-up comment will report the outcome.
         """
         if attempt < self.config.max_consecutive_failures:
             return
-        if quota_blocked_until(PR_FIX_PROVIDER) is not None:
-            # The provider is over its usage limit; the PR did nothing wrong.
+        if self._quota_blocked_until() is not None:
+            # Every provider is over its usage limit; the PR did nothing wrong.
             return
         try:
             _pkg._run(self.project.repo, "gh", "pr", "edit", str(number), "--add-label", "paused")
@@ -869,7 +895,7 @@ A follow-up comment will report the outcome.
                             if own_push and new_sha != old_sha
                             else "The review agent did not complete successfully; see the daemon log."
                         ),
-                        **self._agent_identity(),
+                        **self._agent_identity(state.get("report")),
                     ),
                 )
                 self._auto_pause_if_exhausted(
@@ -936,7 +962,7 @@ A follow-up comment will report the outcome.
                     validation,
                     fix_pushed=fix_pushed,
                     follow_up=follow_up_pending,
-                    **self._agent_identity(),
+                    **self._agent_identity(state.get("report")),
                 ),
             )
             self.state.record_event(
@@ -1023,7 +1049,7 @@ A follow-up comment will report the outcome.
 The agent did not complete the fix for PR #{number}. Feedback remains actionable for retry.
 
 - Attempt: {state.get('attempt', 1)}
-- Model: `{self.config.model or CODEX_MODEL}` ({self.config.reasoning_effort} effort)
+- Model: `{self._agent_identity(state.get('report'))['model']}` ({self._agent_identity(state.get('report'))['effort']} effort)
 - Run: `{state['run_id']}`
 """,
             )
@@ -1071,7 +1097,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 changed_files,
                 details=state.get("report", {}).get("fixes"),
                 report_url=state.get("report_url"),
-                **self._agent_identity(),
+                **self._agent_identity(state.get("report")),
             )
             comment_posted = _publish_fix_summary(
                 self.project.repo, number, state["run_id"], summary
@@ -1129,6 +1155,12 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
 
                 def run_provider(provider: str) -> Any:
                     deadline = time.monotonic() + self.config.timeout_minutes * 60
+                    model, effort = self._provider_options(provider)
+                    report.update(
+                        agent_provider=provider,
+                        agent_model=model or (CODEX_MODEL if provider == PR_FIX_PROVIDER else provider),
+                        agent_effort=effort,
+                    )
                     prompt = (
                         _review_prompt(
                             worktree,
@@ -1158,7 +1190,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             "review-progress",
                             _review_progress_body(
                                 number, run_id, meta or {}, None, review_round, elapsed_seconds,
-                                **self._agent_identity(),
+                                **self._agent_identity(report),
                             ),
                         )
                         _log(f"review-progress pr={number} elapsed_minutes={elapsed_seconds // 60}")
@@ -1199,11 +1231,11 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             audit_result = AgentResult(0, False)
                         else:
                             audit_result = run_agent(
-                                PR_FIX_PROVIDER, prompt, cwd=worktree,
+                                provider, prompt, cwd=worktree,
                                 log_path=log.with_suffix(".audit.log"),
                                 timeout_seconds=self.config.timeout_minutes * 60,
                                 heartbeat_seconds=self.config.heartbeat_seconds,
-                                reasoning_effort=self.config.reasoning_effort, model=self.config.model,
+                                reasoning_effort=effort, model=model,
                                 on_progress=on_progress, cancel_event=self.cancel_events.get(number),
                                 last_message_path=audit_path, read_only=True,
                                 output_schema_path=schema_path,
@@ -1255,7 +1287,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                     number, run_id, audit.model_dump(),
                                     review_round=review_round, head_sha=original_head or None,
                                     claim_window_seconds=self.config.review_claim_window_seconds,
-                                    **self._agent_identity(),
+                                    **self._agent_identity(report),
                                 ),
                             )
                         if (not resuming and run_id and self.config.review_claim_window_seconds
@@ -1300,7 +1332,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                 self.project.repo, number, run_id, "review-fixes-started",
                                 _review_fixes_started_body(
                                     number, run_id, audit.model_dump(), review_round=review_round,
-                                    **self._agent_identity(),
+                                    **self._agent_identity(report),
                                 ),
                             )
 
@@ -1309,14 +1341,14 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         report.update(report_valid=False, report_error="run budget expired before repair")
                         return AgentResult(1, True)
                     result = run_agent(
-                        PR_FIX_PROVIDER,
+                        provider,
                         prompt,
                         cwd=worktree,
                         log_path=log,
                         timeout_seconds=max(1.0, deadline - time.monotonic()),
                         heartbeat_seconds=self.config.heartbeat_seconds,
-                        reasoning_effort=self.config.reasoning_effort,
-                        model=self.config.model,
+                        reasoning_effort=effort,
+                        model=model,
                         on_progress=on_progress,
                         cancel_event=self.cancel_events.get(number),
                         last_message_path=final_message,
@@ -1450,9 +1482,34 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         result.returncode == 0 and current and not conflict_markers and worktree_clean
                     )
 
-                # PR reviews and fixes are intentionally Codex-only. Keep the legacy providers
-                # field for config compatibility, but never let another agent handle PR code.
-                accepted = run_with_fallback((PR_FIX_PROVIDER,), run_provider, accept_provider)
+                provider_results: dict[str, AgentResult] = {}
+                before_codex: list[tuple[str, str]] = []
+
+                def worktree_snapshot() -> tuple[str, str]:
+                    return (
+                        _pkg._run(worktree, "git", "rev-parse", "HEAD", check=False),
+                        _pkg._run(worktree, "git", "status", "--porcelain", check=False),
+                    )
+
+                def run_provider_or_fallback(provider: str) -> Any:
+                    if provider == PR_FIX_PROVIDER:
+                        before_codex.append(worktree_snapshot())
+                    else:
+                        # The fallback reruns the same task only from where Codex left it
+                        # untouched; partial Codex edits or pushes are not handed over.
+                        previous = provider_results.get(PR_FIX_PROVIDER)
+                        touched = bool(before_codex) and worktree_snapshot() != before_codex[0]
+                        if previous is not None and (previous.timed_out or touched) or superseded_by:
+                            _log(f"fallback-skipped pr={number} provider={provider}")
+                            return AgentResult(1, previous.timed_out if previous else False)
+                        _log(f"fallback-start pr={number} provider={provider}")
+                    result = run_provider(provider)
+                    provider_results[provider] = result
+                    return result
+
+                # The legacy providers field is ignored; PR code goes to Codex, then only to
+                # the configured fallback.
+                accepted = run_with_fallback(self._providers(), run_provider_or_fallback, accept_provider)
                 # Remember which commits this run made before the worktree is removed, so the
                 # finalizer can still recognise its own push if the agent died before reporting.
                 own_range = f"{original_head}..HEAD" if original_head else "HEAD^!"

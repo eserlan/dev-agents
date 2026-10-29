@@ -873,8 +873,9 @@ class IssueFixerService:
 
                     prompt = prompt_for()
                     providers = [self.config.provider]
-                    if self.config.fallback_provider and self.config.fallback_provider not in providers:
-                        providers.append(self.config.fallback_provider)
+                    fallback = self._fallback_provider()
+                    if fallback and fallback not in providers:
+                        providers.append(fallback)
                     results: dict[str, AgentResult] = {}
 
                     def run_provider(provider: str) -> AgentResult:
@@ -888,14 +889,13 @@ class IssueFixerService:
                                 f"issue-fixer issue={number} run_id={run_id} "
                                 f"fallback-reset provider={provider}"
                             )
-                        model = (
-                            self.config.fallback_model
-                            if provider == self.config.fallback_provider
-                            else self.config.model or (
+                        if provider == fallback and provider != self.config.provider:
+                            model, effort = self._fallback_options()
+                        else:
+                            model = self.config.model or (
                                 self.pr_config.model if provider == "codex" else None
                             )
-                        )
-                        effort = self.config.reasoning_effort or self.pr_config.reasoning_effort
+                            effort = self.config.reasoning_effort or self.pr_config.reasoning_effort
 
                         def attempt(agent_prompt: str, **options: Any) -> AgentResult:
                             return run_agent(
@@ -1286,12 +1286,23 @@ class IssueFixerService:
                 return "\n\n".join(notes), False
             revisions += 1
 
+    def _fallback_provider(self) -> str | None:
+        """The queue's own fallback, else the PR fixer's (which only applies to Codex queues)."""
+        if self.config.fallback_provider:
+            return self.config.fallback_provider
+        return self.pr_config.fallback_provider if self.config.provider == "codex" else None
+
+    def _fallback_options(self) -> tuple[str | None, str | None]:
+        if self.config.fallback_provider:
+            return self.config.fallback_model, self.config.fallback_reasoning_effort
+        return self.pr_config.fallback_model, self.pr_config.fallback_reasoning_effort
+
     def _quota_blocked(self, number: int) -> bool:
         """True while every configured provider is over its usage limit.
 
         Claiming then would only fail, count an attempt and post a failure comment.
         """
-        providers = [self.config.provider, self.config.fallback_provider]
+        providers = [self.config.provider, self._fallback_provider()]
         blocked = [quota_blocked_until(p) for p in providers if p]
         if not blocked or any(until is None for until in blocked):
             return False
@@ -1309,8 +1320,9 @@ class IssueFixerService:
         """
         if attempt < self.pr_config.max_consecutive_failures:
             return False
-        if any(quota_blocked_until(p) for p in (self.config.provider, self.config.fallback_provider) if p):
-            # A provider is over its usage limit; the issue did nothing wrong.
+        providers = [p for p in (self.config.provider, self._fallback_provider()) if p]
+        if all(quota_blocked_until(p) for p in providers):
+            # Every provider is over its usage limit; the issue did nothing wrong.
             return False
         repo = self.project.repo
         try:

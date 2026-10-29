@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,7 @@ from dev_agents.pr_fixer.comments import (
     _with_history,
 )
 from dev_agents.runtime import StateRepository
+from dev_agents.runtime.agent import AgentResult
 
 
 def test_no_checks_reported_is_treated_as_empty(monkeypatch, tmp_path: Path) -> None:
@@ -518,7 +520,7 @@ def test_failed_review_auto_pauses_after_max_consecutive_failures(
 def test_failed_review_does_not_auto_pause_while_the_provider_is_over_quota(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     from dev_agents.runtime.quota import record_quota_block
 
@@ -659,12 +661,8 @@ def test_superseded_review_does_not_exhaust_the_chain(tmp_path: Path) -> None:
     assert plan["scope"] == "full"
 
 
-def test_clean_audit_succeeds_without_pushing_the_base_merge(monkeypatch, tmp_path: Path) -> None:
-    """isolated_worktree merges origin/{base} into the branch to surface conflicts
-    before the agent runs, so local HEAD is one housekeeping commit ahead when base
-    has moved. A read-only audit must not push it: the new head would invalidate the
-    clean verdict and start another review (PR #4032). The audit still succeeds,
-    because the branch is still the head it reviewed."""
+def _pr_checkout_behind_base(tmp_path: Path) -> tuple[Path, Path, str]:
+    """An origin with PR branch feature/x behind staging, and a clone of it."""
     origin = tmp_path / "origin"
     origin.mkdir()
     for command in (
@@ -700,6 +698,16 @@ def test_clean_audit_succeeds_without_pushing_the_base_merge(monkeypatch, tmp_pa
     subprocess.run(
         ["git", "clone", str(origin), str(checkout)], check=True, capture_output=True
     )
+    return origin, checkout, pr_head
+
+
+def test_clean_audit_succeeds_without_pushing_the_base_merge(monkeypatch, tmp_path: Path) -> None:
+    """isolated_worktree merges origin/{base} into the branch to surface conflicts
+    before the agent runs, so local HEAD is one housekeeping commit ahead when base
+    has moved. A read-only audit must not push it: the new head would invalidate the
+    clean verdict and start another review (PR #4032). The audit still succeeds,
+    because the branch is still the head it reviewed."""
+    origin, checkout, pr_head = _pr_checkout_behind_base(tmp_path)
 
     def fake_run_agent(_provider: str, _prompt: str, *, log_path: Path, **_kwargs: Any) -> Any:
         from dev_agents.pr_fixer.audit import AUDIT_LENSES
@@ -739,6 +747,62 @@ def test_clean_audit_succeeds_without_pushing_the_base_merge(monkeypatch, tmp_pa
         ["git", "rev-parse", "feature/x"], cwd=origin, check=True, capture_output=True, text=True
     ).stdout.strip()
     assert origin_feature_head == pr_head
+
+
+def test_review_falls_back_to_claude_when_codex_is_over_quota(monkeypatch, tmp_path: Path) -> None:
+    from dev_agents.pr_fixer.audit import AUDIT_LENSES
+
+    _origin, checkout, pr_head = _pr_checkout_behind_base(tmp_path)
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def fake_run_agent(provider: str, _prompt: str, *, log_path: Path, **kwargs: Any) -> Any:
+        calls.append((provider, kwargs["model"], kwargs["reasoning_effort"]))
+        if provider == "codex":
+            return AgentResult(1, False, quota_exhausted=True)
+        kwargs["last_message_path"].write_text(json.dumps({
+            "summary": "Merges the base branch.", "files": [],
+            "verdict": "clean", "findings": [], "categories_checked": ["general"],
+            "checks": [{"category": category, "status": "pass", "evidence": "Read changed path"}
+                       for category in sorted(AUDIT_LENSES)], "limitations": [],
+        }))
+        return AgentResult(0, False)
+
+    monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", fake_run_agent)
+    config = PrFixerConfig(
+        state_path=tmp_path / "state.db", worktree_dir=tmp_path / "worktrees", base_branch="staging",
+        model="gpt-6-luna", reasoning_effort="high",
+        fallback_provider="claude", fallback_model="claude-sonnet-5-5", fallback_reasoning_effort="medium",
+    )
+    service = PrFixerService("demo", ProjectConfig(repo=checkout, github="owner/repo"), config)
+
+    succeeded, report = service._fix(
+        42, "feature/x", [], review_only=True, meta={"headRefOid": pr_head}, run_id="pr-review-42-test",
+    )
+
+    assert succeeded is True
+    assert calls == [("codex", "gpt-6-luna", "high"), ("claude", "claude-sonnet-5-5", "medium")]
+    assert service._agent_identity(report) == {"model": "claude-sonnet-5-5", "effort": "medium"}
+
+
+def test_claims_wait_only_while_codex_and_its_fallback_are_both_over_quota(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from dev_agents.runtime.quota import record_quota_block
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = PrFixerConfig(
+        state_path=tmp_path / "state.db", fallback_provider="claude", fallback_model="claude-sonnet-5-5",
+    )
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), config)
+    soon = datetime.now().astimezone() + timedelta(hours=1)
+
+    record_quota_block("codex", soon)
+    assert service._quota_blocked_until() is None
+    assert service._agent_identity()["model"] == "claude-sonnet-5-5"
+
+    record_quota_block("claude", soon + timedelta(hours=1))
+    assert service._quota_blocked_until() == soon
 
 
 def _service_with_reviews(tmp_path: Path) -> tuple[PrFixerService, StateRepository]:
