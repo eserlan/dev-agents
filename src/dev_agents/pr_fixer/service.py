@@ -1127,10 +1127,8 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                     _log(f"agent-start pr={number} provider={provider} log={log}")
 
                     def on_progress(elapsed_seconds: int) -> None:
-                        # Fix-mode has no lifecycle "started" comment yet to patch
-                        # in place, so this is review-only for now -- see
-                        # _review_progress_body's docstring for why it reuses the
-                        # same marker instead of posting a new comment each time.
+                        # Fix-mode has no status comment to update, so progress
+                        # notes are review-only.
                         if not review_only or run_id is None:
                             return
                         _pkg._publish_pr_run_comment(
