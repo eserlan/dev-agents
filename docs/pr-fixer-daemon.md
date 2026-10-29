@@ -76,6 +76,16 @@ new pushes or daemon restarts. Human adjudication is required. There is no autom
 operator must deliberately clear the halted metadata and repair-attempt history to authorize a
 fresh budget. Previously saved audits without the new required evidence fields must be re-audited.
 
+## Provider usage limits
+
+When a Codex run fails with "You've hit your usage limit ... try again at 11:20 PM", the runtime
+records the reset time in `~/.local/state/dev-agents/quota/codex.json`. That file is shared by every
+daemon on the account. Until the reset time, the PR fixer and the issue fixer do not claim new runs.
+For the issue fixer, that means while every provider it is configured with is blocked. Skipped runs
+count no failed attempt and post no comment. Failures during the block never apply the `paused`
+label, and an issue run hit by the limit is not handed off to another model on the same account.
+If the message gives no reset time, the block lasts one hour.
+
 ## State database
 
 Workflow state is stored in the configured `pr_fixer.state_path` SQLite database. If it is omitted,

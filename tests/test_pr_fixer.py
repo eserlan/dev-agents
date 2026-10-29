@@ -515,6 +515,29 @@ def test_failed_review_auto_pauses_after_max_consecutive_failures(
     assert label_calls == [("gh", "pr", "edit", "42", "--add-label", "paused")]
 
 
+def test_failed_review_does_not_auto_pause_while_the_provider_is_over_quota(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import datetime, timedelta
+
+    from dev_agents.runtime.quota import record_quota_block
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = PrFixerConfig(state_path=tmp_path / "state.db", max_consecutive_failures=3)
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), config)
+    record_quota_block("codex", datetime.now().astimezone() + timedelta(hours=1))
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer.service._pkg._run",
+        lambda _repo, *args, **_kwargs: calls.append(args) or "",
+    )
+
+    service._auto_pause_if_exhausted(42, "pr-review-42-sha", 5, "the review agent kept failing")
+
+    assert calls == []
+
+
 def test_failed_review_does_not_auto_pause_below_the_failure_cap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

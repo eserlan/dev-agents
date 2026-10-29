@@ -1,5 +1,6 @@
 import json
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from dev_agents.issue_fixer import (
 )
 from dev_agents.runtime import StateRepository
 from dev_agents.runtime.agent import AgentResult
+from dev_agents.runtime.quota import record_quota_block
 
 
 def test_issue_reads_latest_reopen_across_event_pages(monkeypatch, tmp_path):
@@ -734,6 +736,8 @@ def _fake_runs(log_path: Path, outputs: list[str], plan: str = "1. Do it\n2. Tes
             stream.write(f"user\n{prompt}\n{output}\n")
         if options.get("read_only") and plan:
             Path(str(options["last_message_path"])).write_text(plan, encoding="utf-8")
+        if output == "QUOTA":
+            return AgentResult(1, False, quota_exhausted=True)
         return AgentResult(124 if output == "TIMEOUT" else 0, output == "TIMEOUT")
 
     return run, calls
@@ -870,6 +874,32 @@ def test_a_timed_out_run_is_neither_continued_nor_handed_off(tmp_path: Path) -> 
     ))
 
     assert result.timed_out and len(calls) == 1
+
+
+def test_a_quota_refusal_is_not_handed_off_to_the_same_account(tmp_path: Path) -> None:
+    run, calls = _fake_runs(tmp_path / "issue.log", ["QUOTA"])
+
+    result = _implement(run, **_implement_kwargs(  # type: ignore[arg-type]
+        tmp_path, [], [False], planning=None, continuations=3, handoff=("gpt-6-luna", "high", "gpt-6.1-terra"),
+    ))
+
+    assert result.quota_exhausted and len(calls) == 1
+
+
+def test_issue_claims_wait_while_every_provider_is_over_quota(tmp_path: Path, isolated_quota: Path) -> None:
+    fixer = IssueFixerService(
+        "demo",
+        ProjectConfig(repo=tmp_path, github="owner/repo"),
+        IssueFixerConfig(),
+        PrFixerConfig(max_consecutive_failures=1),
+        StateRepository(tmp_path / "state.db", "demo", tmp_path),
+    )
+    assert not fixer._quota_blocked(7)
+
+    record_quota_block("codex", datetime.now().astimezone() + timedelta(hours=1))
+
+    assert fixer._quota_blocked(7)
+    assert fixer._auto_pause_if_exhausted(7, "issue-fix-7-x", 5, "quota") is False
 
 
 def test_report_fields_ignore_the_prompt_placeholders_and_earlier_runs(tmp_path: Path) -> None:

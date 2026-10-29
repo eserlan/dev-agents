@@ -30,6 +30,7 @@ from dev_agents.runtime import (
     run_with_fallback,
 )
 from dev_agents.runtime.agent import CODEX_MODEL, AgentResult
+from dev_agents.runtime.quota import quota_blocked_until
 
 from ._shared import MAX_INTERNAL_REVIEW_ROUNDS, PR_FIX_PROVIDER, _log
 from .audit import (
@@ -541,6 +542,11 @@ class PrFixerService:
             until = float(claim_info["expires_at"]) if claim_info else opened + self.config.review_claim_window_seconds
             if now < until:
                 return {"meta": meta, "keys": keys, "skip": True}
+        blocked_until = quota_blocked_until(PR_FIX_PROVIDER)
+        if blocked_until is not None:
+            # Claiming now would only fail, count an attempt and post a failure comment.
+            _log(f"quota-wait pr={number} provider={PR_FIX_PROVIDER} until={blocked_until.isoformat()}")
+            return {"meta": meta, "keys": keys, "skip": True}
         review_skill_path, _ = _review_skill(self.project.repo)
         claim = self.state.claim_run(
             workflow,
@@ -752,6 +758,9 @@ A follow-up comment will report the outcome.
         otherwise retry and re-comment forever on reconcile's poll interval.
         """
         if attempt < self.config.max_consecutive_failures:
+            return
+        if quota_blocked_until(PR_FIX_PROVIDER) is not None:
+            # The provider is over its usage limit; the PR did nothing wrong.
             return
         try:
             _pkg._run(self.project.repo, "gh", "pr", "edit", str(number), "--add-label", "paused")
