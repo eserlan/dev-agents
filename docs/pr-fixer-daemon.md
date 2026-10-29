@@ -235,7 +235,8 @@ and posting again. The posted plan links files to the base branch on GitHub.
 
 Two settings handle a model that stops before finishing. `continuations` resumes the same Codex
 session (`codex exec resume`) with an instruction to carry on, up to that many times, while the
-branch is not pushed and the agent has not reported a blocker (`SUMMARY: BLOCKED: …`). If the work
+branch is not pushed. The first stop always resumes; after that, a blocker reported from the
+resumed session (`SUMMARY: BLOCKED: …`) ends the continuations. If the work
 is still not pushed after that, `handoff_model` (at `handoff_reasoning_effort`) takes over in the
 same worktree with the plan and the partial work. Every run has the queue's full timeout, and a
 timed-out run is neither continued nor handed off. When an attempt fails, the issue comment
