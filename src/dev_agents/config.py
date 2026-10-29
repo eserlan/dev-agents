@@ -230,6 +230,10 @@ class PrFixerConfig(BaseModel):
     degodify_model: str = "gpt-6.1-sol"
     # None inherits ``reasoning_effort``.
     degodify_reasoning_effort: str | None = None
+    # Retries a decomposition from a clean checkout when Codex leaves no clean committed change.
+    degodify_fallback_provider: Literal["claude"] | None = None
+    degodify_fallback_model: str | None = None
+    degodify_fallback_reasoning_effort: str | None = None
     # After this many consecutive failed attempts at the same run_id (e.g. a
     # provider quota outage), auto-apply the "paused" label instead of letting
     # reconcile retry-and-comment on it forever.

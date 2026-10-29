@@ -186,7 +186,10 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                         result = run_degodify(
                             project.repo,
                             base_branch=config.base_branch,
-                            providers=config.providers,
+                            providers=[
+                                *config.providers,
+                                *([config.degodify_fallback_provider] if config.degodify_fallback_provider else []),
+                            ],
                             dry_run=False,
                             log_path=(
                                 config.log_dir / "degodify.log"
@@ -198,6 +201,8 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                             timeout_seconds=config.degodify_timeout_minutes * 60,
                             model=config.degodify_model,
                             reasoning_effort=config.degodify_reasoning_effort or config.reasoning_effort,
+                            fallback_model=config.degodify_fallback_model,
+                            fallback_reasoning_effort=config.degodify_fallback_reasoning_effort,
                         )
                         _log(
                             f"handled delivery={delivery} event=degodify path={candidate.relative_path} "

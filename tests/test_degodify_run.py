@@ -110,9 +110,9 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
         prompts.append(prompt)
         budgets.setdefault(_name, []).append(kwargs["timeout_seconds"])
-        # The configured model and effort are Codex settings and never reach other providers.
-        assert kwargs["model"] == ("decomposition-model" if _name == "codex" else None)
-        assert kwargs["reasoning_effort"] == ("high" if _name == "codex" else None)
+        # Codex gets the decomposition model; the Claude fallback gets its own.
+        assert kwargs["model"] == ("decomposition-model" if _name == "codex" else "claude-opus-5-5")
+        assert kwargs["reasoning_effort"] == ("high" if _name == "codex" else "medium")
         worktree = kwargs["cwd"]
         if recovery == "exhausted" or (recovery == "fallback" and _name == "codex"):
             return AgentResult(0, False)
@@ -146,8 +146,9 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     events = []
     result = degodify._run_degodify_impl(
         repo, dry_run=False, supplied_candidate=candidate, log_path=tmp_path / "log",
-        providers=["codex", "muse"] if recovery == "fallback" else ["codex"],
+        providers=["codex", "claude"] if recovery == "fallback" else ["codex"],
         model="decomposition-model", reasoning_effort="high",
+        fallback_model="claude-opus-5-5", fallback_reasoning_effort="medium",
         on_event=lambda event, payload: events.append((event, payload)),
     )
     assert all(event == "agent_attempt" for event, _ in events)
@@ -157,7 +158,7 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
             assert provider_budgets[-1] < provider_budgets[0]
     if len(budgets) > 1:
         # A fallback provider gets its own full budget, not what the primary left over.
-        assert budgets["muse"][0] > 0
+        assert budgets["claude"][0] > 0
     if recovery in {"exhausted", "timeout"}:
         assert not result.succeeded and not created
         assert len(prompts) == (1 if recovery == "timeout" else 2)
