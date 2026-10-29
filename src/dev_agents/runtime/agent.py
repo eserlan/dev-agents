@@ -9,11 +9,13 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from math import ceil
 from pathlib import Path
 from threading import Event
 from uuid import uuid4
 
+from dev_agents.runtime.quota import record_quota_block, usage_limit_reset
 from dev_agents.runtime.retention import remove_older_than
 
 # Shared by PR review/fix and issue-fix queues, including GUI enhancements.
@@ -31,6 +33,8 @@ class AgentResult:
 
     returncode: int | None
     timed_out: bool
+    # The provider refused the run because the account is over its usage limit.
+    quota_exhausted: bool = False
 
 
 def agent_tmp_root() -> Path:
@@ -259,6 +263,7 @@ def run_agent(
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\n=== agent started provider={provider} ===\n")
         stream.flush()
+        run_start = stream.tell()
         scope = f"dev-agents-run-{uuid4().hex}.scope" if _user_systemd_available() else None
         prompt_stream = None
         if provider == "codex":
@@ -341,4 +346,13 @@ def run_agent(
         returncode = process.wait()
         stream.write(f"=== agent finished exit={returncode} timed_out={timed_out} ===\n")
     sweep_agent_tmp()
-    return AgentResult(returncode=returncode, timed_out=timed_out)
+    quota_exhausted = False
+    if returncode != 0 and not timed_out:
+        with log_path.open("rb") as log:
+            log.seek(run_start)
+            output = log.read().decode("utf-8", errors="replace")
+        reset = usage_limit_reset(output, datetime.now().astimezone())
+        if reset is not None:
+            record_quota_block(provider, reset)
+            quota_exhausted = True
+    return AgentResult(returncode=returncode, timed_out=timed_out, quota_exhausted=quota_exhausted)

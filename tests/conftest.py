@@ -22,6 +22,14 @@ def isolated_agent_tmp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture(autouse=True)
+def isolated_quota(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep provider usage-limit gates out of the real ~/.local/state."""
+    root = tmp_path / "quota"
+    monkeypatch.setattr("dev_agents.runtime.quota.quota_root", lambda: root)
+    return root
+
+
 @pytest.fixture
 def git_repository(tmp_path: Path) -> Path:
     repository = tmp_path / "repository"

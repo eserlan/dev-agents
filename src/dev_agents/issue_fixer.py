@@ -29,6 +29,7 @@ from dev_agents.runtime import (
     run_with_fallback,
 )
 from dev_agents.runtime.agent import CODEX_MODEL, AgentResult
+from dev_agents.runtime.quota import quota_blocked_until
 
 SHARED_PR_FIX_SKILL = Path(__file__).resolve().parents[2] / "skills/pr-fix/SKILL.md"
 
@@ -428,7 +429,7 @@ def _implement(
             planned = run(planning_prompt, effort=planning_effort, read_only=True, last_message_path=raw)
             plan = clean_plan(raw.read_text(encoding="utf-8")) if raw.is_file() else ""
             if planned.returncode != 0 or planned.timed_out or not plan:
-                return AgentResult(planned.returncode or 1, planned.timed_out)
+                return AgentResult(planned.returncode or 1, planned.timed_out, planned.quota_exhausted)
             plan_path.write_text(plan, encoding="utf-8")
             on_plan(plan, reason)
             result = run(prompt_for(plan, False), effort=effort)
@@ -442,7 +443,8 @@ def _implement(
             break
         result = run(CONTINUE_PROMPT, effort=effort, resume_session=session)
 
-    if handoff is not None and not result.timed_out and not is_done():
+    # A handoff model on the same exhausted account would fail the same way.
+    if handoff is not None and not result.timed_out and not result.quota_exhausted and not is_done():
         model, handoff_effort, previous_model = handoff
         result = run(
             prompt_for(plan, False) + "\n\n" + _handoff_section(previous_model),
@@ -781,6 +783,8 @@ class IssueFixerService:
             branch += f"-reopen-{reopen_event}"
         fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:16]
         run_id = f"issue-fix-{number}-{fingerprint}"
+        if self._quota_blocked(number):
+            return {"issue": issue, "run_id": run_id, "skip": True}
         claim = self.state.claim_run(
             "issue-fixer",
             run_id,
@@ -1282,6 +1286,19 @@ class IssueFixerService:
                 return "\n\n".join(notes), False
             revisions += 1
 
+    def _quota_blocked(self, number: int) -> bool:
+        """True while every configured provider is over its usage limit.
+
+        Claiming then would only fail, count an attempt and post a failure comment.
+        """
+        providers = [self.config.provider, self.config.fallback_provider]
+        blocked = [quota_blocked_until(p) for p in providers if p]
+        if not blocked or any(until is None for until in blocked):
+            return False
+        until = min(until for until in blocked if until is not None)
+        _log(f"issue-fixer quota-wait issue={number} until={until.isoformat()}")
+        return True
+
     def _auto_pause_if_exhausted(
         self, number: int, run_id: str, attempt: int, reason: str
     ) -> bool:
@@ -1291,6 +1308,9 @@ class IssueFixerService:
         re-comment on every reconcile pass forever (as the PR fixer's guard prevents).
         """
         if attempt < self.pr_config.max_consecutive_failures:
+            return False
+        if any(quota_blocked_until(p) for p in (self.config.provider, self.config.fallback_provider) if p):
+            # A provider is over its usage limit; the issue did nothing wrong.
             return False
         repo = self.project.repo
         try:
