@@ -160,7 +160,7 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         findings_body = dict(comments)["review-findings"]
         assert "**HIGH** · security-privacy — `feature.txt:1`" in findings_body
         assert "Suggested fix: Validate before use" in findings_body
-        assert "reported above" in dict(comments)["review-fixes-started"]
+        assert "in Luna's findings comment" in dict(comments)["review-fixes-started"]
     if mode == "handoff":
         assert report["handoff_agent"] == "claude"
         assert [phase for phase, _body in comments] == ["review-findings"]

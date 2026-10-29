@@ -24,6 +24,7 @@ from dev_agents.pr_fixer import (
     _review_started_body,
     _target_validation_instructions,
 )
+from dev_agents.pr_fixer.comments import _review_findings_body, _with_history
 from dev_agents.runtime import StateRepository
 
 
@@ -1264,26 +1265,95 @@ def test_review_progress_body_reuses_the_started_marker() -> None:
     assert "abc123" in body
 
 
-def test_review_lifecycle_posts_new_comment(monkeypatch, tmp_path: Path) -> None:
-    """A matching lifecycle comment must not be overwritten: always POST new."""
+def _comment_api(monkeypatch, comments: list[dict[str, Any]]) -> list[tuple[str, ...]]:
+    """Fake the comments API: listing returns ``comments``, posts and edits are recorded."""
     calls: list[tuple[str, ...]] = []
 
     def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
         calls.append(args)
-        return ""
+        return json.dumps([comments]) if "--paginate" in args else ""
 
     monkeypatch.setattr("dev_agents.pr_fixer.repository_slug", lambda _repo: "owner/repo")
     monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+    return calls
+
+
+def _posted_body(call: tuple[str, ...]) -> str:
+    return call[-1].removeprefix("body=")
+
+
+def test_review_status_phase_creates_status_comment_with_history(monkeypatch, tmp_path: Path) -> None:
+    calls = _comment_api(monkeypatch, [])
 
     assert _publish_pr_run_comment(
-        tmp_path, 42, "run-1", "review-final", "<!-- dev-agents:pr-review run=run-1 -->\\nfinal"
+        tmp_path, 42, "run-1", "review-started",
+        "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review started\n\nbody",
     )
-    assert any(
-        call[:4] == ("gh", "api", "repos/owner/repo/issues/42/comments", "-f")
-        for call in calls
+
+    post = calls[-1]
+    assert post[:3] == ("gh", "api", "repos/owner/repo/issues/42/comments")
+    assert "PATCH" not in post
+    assert "<!-- dev-agents:history -->" in _posted_body(post)
+    assert "Luna review started" in _posted_body(post).split("Run history", 1)[1]
+
+
+def test_review_status_phases_update_one_comment_and_keep_history(monkeypatch, tmp_path: Path) -> None:
+    existing = {
+        "id": 7,
+        "body": "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review started\n\n"
+        "<details><summary>Run history</summary>\n<!-- dev-agents:history -->\n\n"
+        "- 01:31 CET Luna review started\n</details>\n",
+    }
+    quoted = {"id": 9, "body": f"> {existing['body']}"}
+    other_run = {"id": 3, "body": existing["body"].replace("run=run-1", "run=run-0")}
+    calls = _comment_api(monkeypatch, [other_run, existing, quoted])
+
+    assert _publish_pr_run_comment(
+        tmp_path, 42, "run-1", "review-final",
+        "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review completed — clean\n\ndone",
     )
-    assert not any("PATCH" in call for call in calls)
+
+    patch = calls[-1]
+    assert patch[:6] == ("gh", "api", "repos/owner/repo/issues/comments/7", "--method", "PATCH", "-f")
+    body = _posted_body(patch)
+    assert body.startswith("<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review completed")
+    history = body.split("<!-- dev-agents:history -->", 1)[1]
+    assert "- 01:31 CET Luna review started" in history
+    assert "Luna review completed — clean" in history
+    assert not any(call[2] == "repos/owner/repo/issues/42/comments" and "--paginate" not in call for call in calls)
+
+
+def test_repeated_progress_notes_replace_their_history_entry() -> None:
+    progress = "<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review in progress\n"
+    first = _with_history(progress, _with_history("### 🤖 Luna review started\n"))
+    second = _with_history(progress, first)
+
+    history = second.split("<!-- dev-agents:history -->", 1)[1]
+    assert history.count("Luna review in progress") == 1
+    assert history.count("Luna review started") == 1
+
+
+def test_actionable_run_phases_post_new_comments(monkeypatch, tmp_path: Path) -> None:
+    """Findings, pauses and failures must notify, so they never edit the status comment."""
+    status = {"id": 7, "body": _with_history("<!-- dev-agents:pr-review run=run-1 -->\n### 🤖 Luna review started\n")}
+    calls = _comment_api(monkeypatch, [status])
+
+    for phase in ("review-findings", "auto-paused", "review-halted", "fix-failed"):
+        assert _publish_pr_run_comment(tmp_path, 42, "run-1", phase, f"<!-- dev-agents:pr-{phase} run=run-1 -->\nbody")
+
+    assert all("PATCH" not in call for call in calls)
     assert not any("--paginate" in call for call in calls)
+    assert [_posted_body(call) for call in calls] == [
+        f"<!-- dev-agents:pr-{phase} run=run-1 -->\nbody"
+        for phase in ("review-findings", "auto-paused", "review-halted", "fix-failed")
+    ]
+
+
+def test_findings_comment_is_not_mistaken_for_the_status_comment() -> None:
+    body = _review_findings_body(42, "run-1", {"findings": []})
+
+    assert "<!-- dev-agents:pr-review run=run-1 -->" not in body
+    assert "<!-- dev-agents:history -->" not in body
 
 
 def test_publish_fix_summary_posts_new_comment(monkeypatch, tmp_path: Path) -> None:

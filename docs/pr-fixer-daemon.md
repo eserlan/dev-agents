@@ -313,16 +313,19 @@ The PR workflow's `pause_on_external_agent_commits`, `external_agent_logins`, an
 Jules pushes the latest commit, all automation pauses for that PR until the resume label is added.
 
 After a successful remediation run, the daemon also creates or updates top-level PR comments for
-that run. A review creates one lifecycle comment; Luna updates it with concise findings before
-editing and a fixes-started status when concrete defects need remediation. Luna must also emit a
-validated structured `REPORT_JSON` containing the verdict, findings with severity/category/location,
-the categories checked, validation commands, and fixes. The normalized result is persisted in the
-run metadata and event timeline; the final lifecycle update uses its human-readable summary to
-explain what actually changed, alongside the resulting commit, PR files, and validation result.
-Each review or issue run carries one hidden lifecycle marker so retries update the same comment
-instead of adding phase-by-phase duplicates. Pause alerts and completed feedback-fix summaries stay
-separate because they represent distinct actionable events. Comment delivery is best-effort and is
-recorded in workflow event metadata.
+that run. Each review run has one status comment (marker `<!-- dev-agents:pr-review run=… -->`)
+that is edited in place as the run moves through started, in progress, fixes started and its final
+outcome, with a collapsed run history of those steps; retries of the same run update it too. A
+fix push starts a new run and so a new status comment. Luna must also emit a validated structured
+`REPORT_JSON` containing the verdict, findings with severity/category/location, the categories
+checked, validation commands, and fixes. The normalized result is persisted in the run metadata and
+event timeline; the final status update uses its human-readable summary to explain what actually
+changed, alongside the resulting commit, PR files, and validation result.
+
+Edits notify nobody, so events that may need a human post their own comment: the findings (with
+the claim instructions, marker `pr-review-findings`), pause alerts, claims, halts, fix failures and
+completed feedback-fix summaries. Comment delivery is best-effort and is recorded in workflow event
+metadata.
 
 Report deployments are also best-effort and rate-limited. Unchanged report content reuses its last
 deployment; changed content is limited to one public upload per hour and 24 uploads per rolling

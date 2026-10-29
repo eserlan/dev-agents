@@ -7,6 +7,8 @@ plain local import.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +79,8 @@ def _review_progress_body(
 ) -> str:
     """A periodic progress note so a long review doesn't read as hung.
 
-    Reuses the same `pr-review` marker as `_review_started_body` for
-    correlation; publishing posts it as a new comment.
+    Reuses the same `pr-review` marker as `_review_started_body`, so publishing updates the
+    run's status comment instead of adding one.
     """
     minutes = max(1, elapsed_seconds // 60)
     return f"""<!-- dev-agents:pr-review run={run_id} -->
@@ -247,7 +249,7 @@ def _review_findings_body(
         if unverified
         else ""
     )
-    return f"""<!-- dev-agents:pr-review run={run_id} -->
+    return f"""<!-- dev-agents:pr-review-findings run={run_id} -->
 ### 🤖 Luna review findings
 
 Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}:
@@ -278,7 +280,7 @@ def _review_fixes_started_body(
 ) -> str:
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
     subject = (
-        f"the {count} finding{'' if count == 1 else 's'} reported above"
+        f"the {count} finding{'' if count == 1 else 's'} in Luna's findings comment"
         if count
         else "the concrete findings identified during the review"
     )
@@ -355,21 +357,86 @@ The automated fixer addressed {reason_text} on PR #{number}.
 """
 
 
+STATUS_PHASES = frozenset({"review-started", "review-progress", "review-fixes-started", "review-final"})
+HISTORY_MARKER = "<!-- dev-agents:history -->"
+
+
+def _status_heading(body: str) -> str:
+    heading = next((line for line in body.splitlines() if line.startswith("### ")), "### Update")
+    return heading.removeprefix("### ").removeprefix("🤖 ").strip()
+
+
+def _with_history(body: str, previous: str = "") -> str:
+    """Append this phase to the status comment's run history, collapsing repeated progress notes."""
+    entries = []
+    if HISTORY_MARKER in previous:
+        tail = previous.split(HISTORY_MARKER, 1)[1].split("</details>", 1)[0]
+        entries = [line for line in tail.splitlines() if line.startswith("- ")]
+    heading = _status_heading(body)
+    entry = f"- {datetime.now().astimezone():%H:%M %Z} {heading}"
+    if entries and entries[-1].split(" ", 3)[-1] == heading:
+        entries[-1] = entry
+    else:
+        entries.append(entry)
+    history = "\n".join(entries)
+    return f"""{body.rstrip()}
+
+<details><summary>Run history</summary>
+{HISTORY_MARKER}
+
+{history}
+</details>
+"""
+
+
+def _run_status_comment(repo: Path, slug: str, number: int, run_id: str) -> dict[str, Any] | None:
+    """The run's status comment: the earliest comment carrying both its marker and a history."""
+    raw = _pkg._run(
+        repo, "gh", "api", f"repos/{slug}/issues/{number}/comments", "--paginate", "--slurp"
+    )
+    pages = json.loads(raw) if raw else []
+    marker = f"<!-- dev-agents:pr-review run={run_id} -->"
+    for page in pages if isinstance(pages, list) else []:
+        for comment in page if isinstance(page, list) else [page]:
+            body = str(comment.get("body", "")) if isinstance(comment, dict) else ""
+            if marker in body and HISTORY_MARKER in body and comment.get("id") is not None:
+                return comment
+    return None
+
+
 def _publish_pr_run_comment(
     repo: Path, number: int, run_id: str, phase: str, body: str
 ) -> bool:
-    """Post a new lifecycle comment for a PR run; never overwrites an existing one."""
+    """Publish a PR run's lifecycle update.
+
+    Routine review phases (``STATUS_PHASES``) update one status comment per run, so a review
+    no longer adds a comment for every step. Edits notify nobody, so findings, pauses, claims
+    and failures that need a human still post new comments.
+    """
     try:
         slug = _pkg.repository_slug(repo)
-        _pkg._run(
-            repo,
-            "gh",
-            "api",
-            f"repos/{slug}/issues/{number}/comments",
-            "-f",
-            f"body={body}",
-        )
-    except RuntimeError as error:
+        existing = _run_status_comment(repo, slug, number, run_id) if phase in STATUS_PHASES else None
+        if existing:
+            _pkg._run(
+                repo,
+                "gh",
+                "api",
+                f"repos/{slug}/issues/comments/{existing['id']}",
+                "--method",
+                "PATCH",
+                "-f",
+                f"body={_with_history(body, str(existing.get('body', '')))}",
+            )
+        else:
+            _pkg._run(
+                repo,
+                "gh",
+                "api",
+                f"repos/{slug}/issues/{number}/comments",
+                "-f",
+                f"body={_with_history(body) if phase in STATUS_PHASES else body}",
+            )
+    except (RuntimeError, json.JSONDecodeError) as error:
         _log(f"run-comment-failed pr={number} phase={phase} error={error}")
         return False
     return True
