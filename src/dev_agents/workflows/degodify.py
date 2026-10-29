@@ -86,6 +86,8 @@ class DegodifyState(TypedDict, total=False):
     providers: list[str]
     model: str | None
     reasoning_effort: str
+    fallback_model: str | None
+    fallback_reasoning_effort: str | None
     log_path: Path | None
     timeout_seconds: float
     dry_run: bool
@@ -304,6 +306,8 @@ def _run_degodify_impl(
     timeout_seconds: float = 25 * 60,
     model: str | None = None,
     reasoning_effort: str = "high",
+    fallback_model: str | None = None,
+    fallback_reasoning_effort: str | None = None,
     dry_run: bool = True,
     supplied_candidate: DegodifyFile | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
@@ -367,9 +371,12 @@ plan is not completion. If blocked, give the exact failing command and actionabl
                     name, prompt + recovery, cwd=worktree,
                     log_path=log_path or repo / ".dev-agents" / "degodify.log",
                     timeout_seconds=remaining,
-                    # The configured model and effort are Codex settings.
-                    model=model if name == "codex" else None,
-                    reasoning_effort=reasoning_effort if name == "codex" else None,
+                    # `model` and `reasoning_effort` are Codex settings; the fallback ones are Claude's.
+                    model=model if name == "codex" else fallback_model if name == "claude" else None,
+                    reasoning_effort=(
+                        reasoning_effort if name == "codex"
+                        else fallback_reasoning_effort if name == "claude" else None
+                    ),
                 )
                 complete = result.returncode == 0 and not result.timed_out and committed_change()
                 if on_event:
@@ -447,6 +454,8 @@ def build_degodify_workflow() -> Any:
             log_path=state.get("log_path"),
             timeout_seconds=state.get("timeout_seconds", 25 * 60),
             model=state.get("model"), reasoning_effort=state.get("reasoning_effort", "high"),
+            fallback_model=state.get("fallback_model"),
+            fallback_reasoning_effort=state.get("fallback_reasoning_effort"),
             dry_run=state.get("dry_run", True),
             supplied_candidate=state.get("candidate"),
             on_event=state.get("on_event"),
@@ -482,6 +491,8 @@ def run_degodify(
     timeout_seconds: float = 25 * 60,
     model: str | None = None,
     reasoning_effort: str = "high",
+    fallback_model: str | None = None,
+    fallback_reasoning_effort: str | None = None,
     dry_run: bool = True,
     supplied_candidate: DegodifyFile | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
@@ -495,6 +506,7 @@ def run_degodify(
         "log_path": log_path,
         "timeout_seconds": timeout_seconds,
         "model": model, "reasoning_effort": reasoning_effort,
+        "fallback_model": fallback_model, "fallback_reasoning_effort": fallback_reasoning_effort,
         "dry_run": dry_run,
         "supplied_candidate": supplied_candidate,
         "on_event": on_event,

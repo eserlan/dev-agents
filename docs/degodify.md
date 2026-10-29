@@ -31,6 +31,9 @@ committed change. Each provider gets one
 continuation in the same worktree to finish inspection-only or partial work, then the next
 configured provider may try. Each attempt records its exit status and committed-progress result
 as an `agent_attempt` event. Exhaustion records an explicit failure and opens no PR.
+`pr_fixer.degodify_fallback_provider: claude`, together with `degodify_fallback_model` and
+`degodify_fallback_reasoning_effort`, adds Claude after the configured providers in the daemon.
+Like any fallback provider, it starts from a clean checkout of the base branch.
 Degodify PRs go through the normal PR review
 chain and auto-merge like any other PR when the review comes back clean.
 
