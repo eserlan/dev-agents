@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=not arguments.execute,
                 timeout_seconds=degodify_config.degodify_timeout_minutes * 60,
                 model=degodify_config.degodify_model,
-                reasoning_effort=degodify_config.reasoning_effort,
+                reasoning_effort=degodify_config.degodify_reasoning_effort or degodify_config.reasoning_effort,
             )
             from dev_agents.visualize import schedule_report_refresh
 

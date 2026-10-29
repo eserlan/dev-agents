@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import dev_agents.pr_fixer as _pkg
+from dev_agents.runtime.agent import CODEX_MODEL
 
 from ._shared import MAX_INTERNAL_REVIEW_ROUNDS, _log
 from .github_ops import _findings_summary
@@ -41,6 +42,11 @@ Remove the `paused` label once the underlying issue is resolved to resume automa
 """
 
 
+def _model_line(model: str, effort: str | None) -> str:
+    """Name the model that did the work, so a comment never implies a different agent."""
+    return f"- Model: `{model}`" + (f" ({effort} effort)" if effort else "") + "\n"
+
+
 def _report_line(report_url: str | None) -> str:
     return f"- Report: [Open this run in dev-agents report]({report_url})\n" if report_url else ""
 
@@ -51,6 +57,9 @@ def _review_started_body(
     meta: dict[str, Any],
     report_url: str | None = None,
     review_round: int = 0,
+    *,
+    model: str = CODEX_MODEL,
+    effort: str | None = None,
 ) -> str:
     scope = (
         "the independent read-only audit (general defects and bundled repository-specific guidance)"
@@ -58,13 +67,13 @@ def _review_started_body(
         else "the one allowed targeted post-fix verification of the changed diff and prior findings"
     )
     return f"""<!-- dev-agents:pr-review run={run_id} -->
-### 🤖 Luna review started
+### 🤖 {model} review started
 
-Luna has started {scope} for PR #{number}. A separate fixer runs only after evidence-backed findings.
+{model} has started {scope} for PR #{number}. A separate fixer runs only after evidence-backed findings.
 
 - PR head: `{meta.get('headRefOid', 'unknown')}`
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}
 """
 
@@ -76,6 +85,9 @@ def _review_progress_body(
     report_url: str | None,
     review_round: int,
     elapsed_seconds: int,
+    *,
+    model: str = CODEX_MODEL,
+    effort: str | None = None,
 ) -> str:
     """A periodic progress note so a long review doesn't read as hung.
 
@@ -84,13 +96,13 @@ def _review_progress_body(
     """
     minutes = max(1, elapsed_seconds // 60)
     return f"""<!-- dev-agents:pr-review run={run_id} -->
-### 🤖 Luna review in progress
+### 🤖 {model} review in progress
 
 Still working on PR #{number} -- {minutes}m elapsed so far.
 
 - PR head: `{meta.get('headRefOid', 'unknown')}`
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}
 """
 
@@ -121,6 +133,9 @@ def _review_completed_body(
     fix_pushed: bool | None = None,
     superseded_by: str | None = None,
     follow_up: bool | None = None,
+    *,
+    model: str = CODEX_MODEL,
+    effort: str | None = None,
 ) -> str:
     """Render the final state into the same comment used for review progress."""
     review_report = report.get("review_report")
@@ -136,7 +151,7 @@ def _review_completed_body(
         # Only pushes this run did not make reach here: a run's own fix push is finalized as
         # "fixes pushed". Say so plainly, and leave out the discarded results.
         return f"""<!-- dev-agents:pr-review run={run_id} -->
-### 🤖 Luna review superseded
+### 🤖 {model} review superseded
 
 Someone else pushed `{superseded_by[:12]}` to this branch while the review was running, so its
 results applied to an outdated head and were discarded. Nothing was pushed by this run. The new
@@ -144,23 +159,23 @@ head will receive a full review.
 
 - PR: #{number}
 {round_line}
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}
 """
     handoff_agent = report.get("handoff_agent")
     if failure:
-        heading = "### 🤖 Luna review failed"
+        heading = f"### 🤖 {model} review failed"
         outcome = failure
     elif handoff_agent and not pushed_fix:
-        heading = f"### 🤖 Luna review completed — findings left for {handoff_agent}"
+        heading = f"### 🤖 {model} review completed — findings left for {handoff_agent}"
         outcome = (
-            f"This PR is driven by {handoff_agent}, so Luna left the findings above for it to fix"
+            f"This PR is driven by {handoff_agent}, so {model} left the findings above for it to fix"
             " instead of pushing its own repairs. Its next push gets a fresh review; auto-merge"
             " waits for a clean one."
         )
     elif pushed_fix:
-        heading = "### 🤖 Luna fixes pushed"
-        outcome = "Luna fixed the review findings and pushed the result."
+        heading = f"### 🤖 {model} fixes pushed"
+        outcome = f"{model} fixed the review findings and pushed the result."
         if follow_up:
             outcome += (
                 f" Because that commit changed the PR, a targeted verification review of it"
@@ -168,10 +183,10 @@ head will receive a full review.
                 " That review is expected; it checks the fix, not a new problem."
             )
     elif verdict == "clean":
-        heading = "### 🤖 Luna review completed — clean"
+        heading = f"### 🤖 {model} review completed — clean"
         outcome = "No actionable defects were found."
     else:
-        heading = "### 🤖 Luna review completed"
+        heading = f"### 🤖 {model} review completed"
         outcome = "The review completed without pushing a code change."
     shown_files = changed_files or []
     files_line = ", ".join(f"`{path}`" for path in shown_files[:12]) or "None"
@@ -200,7 +215,7 @@ head will receive a full review.
 {findings_line}- {commit_line}
 - Changed files: {files_line}
 - Validation: {validation_line}
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}
 """
 
@@ -295,6 +310,9 @@ def _review_findings_body(
     review_round: int = 0,
     head_sha: str | None = None,
     claim_window_seconds: int = 60,
+    *,
+    model: str = CODEX_MODEL,
+    effort: str | None = None,
 ) -> str:
     scope = "independent audit" if review_round == 0 else "targeted post-fix verification"
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
@@ -312,11 +330,11 @@ def _review_findings_body(
     )
     findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
     return f"""<!-- dev-agents:pr-review-findings run={run_id} -->
-### 🤖 Luna review findings
+### 🤖 {model} review findings
 
 #### {_verdict_line(findings)}
 
-Luna's {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}.
+{model}'s {scope} of PR #{number} found {count} issue{"" if count == 1 else "s"}.
 
 **Findings:** {_severity_counts(findings)}
 
@@ -343,7 +361,7 @@ does not claim the work.
 </details>
 
 {head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}
 """
 
@@ -354,20 +372,23 @@ def _review_fixes_started_body(
     report: dict[str, Any],
     report_url: str | None = None,
     review_round: int = 0,
+    *,
+    model: str = CODEX_MODEL,
+    effort: str | None = None,
 ) -> str:
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
     subject = (
-        f"the {count} finding{'' if count == 1 else 's'} in Luna's findings comment"
+        f"the {count} finding{'' if count == 1 else 's'} in the findings comment"
         if count
         else "the concrete findings identified during the review"
     )
     return f"""<!-- dev-agents:pr-review run={run_id} -->
-### 🤖 Luna fixes started
+### 🤖 {model} fixes started
 
-Luna is applying the smallest correct fixes for {subject} on PR #{number}.
+{model} is applying the smallest correct fixes for {subject} on PR #{number}.
 
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}
 """
 
@@ -382,6 +403,9 @@ def _fix_summary_body(
     reason: str | None = None,
     details: str | None = None,
     report_url: str | None = None,
+    *,
+    model: str = CODEX_MODEL,
+    effort: str | None = None,
 ) -> str:
     """Build the human-readable PR comment for a completed remediation run."""
     counts: dict[str, int] = {}
@@ -429,7 +453,7 @@ The automated fixer addressed {reason_text} on PR #{number}.
 - Validation: the triggering feedback was re-checked successfully.
 {details_line}- Validation: the triggering feedback was re-checked successfully.
 - Files in the resulting PR diff: {file_text}
-- Run: `{run_id}`
+{_model_line(model, effort)}- Run: `{run_id}`
 {_report_line(report_url)}{report_line}
 """
 

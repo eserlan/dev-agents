@@ -27,7 +27,7 @@ Open the generated HTML file in a browser. It contains an interactive canvas exp
 - drag to pan, scroll to zoom, and reset the view when needed;
 - inspect failure details without embedding large agent output.
 
-PR review run metadata includes the bounded structured review result when Luna emits a valid
+PR review run metadata includes the bounded structured review result when the review agent emits a valid
 `REPORT_JSON`: verdict, concrete findings, categories checked, validation, and fixes. Raw agent
 output remains in the configured log files.
 

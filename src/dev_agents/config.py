@@ -129,6 +129,10 @@ class ReleaseCommsConfig(BaseModel):
 
     tracking_issue: int = 2906
     providers: list[str] = ["muse", "claude", "agy", "codex"]
+    # Codex model and effort for the evaluator and writers; None keeps Codex's defaults.
+    # Other providers use their own default models.
+    codex_model: str | None = None
+    codex_reasoning_effort: str | None = None
     timeout_minutes: int = 10
     state_path: Path | None = None
     log_dir: Path | None = None
@@ -206,6 +210,8 @@ class PrFixerConfig(BaseModel):
     # audit) needs far longer than the single extraction degodify used to make.
     degodify_timeout_minutes: int = 60
     degodify_model: str = "gpt-6.1-sol"
+    # None inherits ``reasoning_effort``.
+    degodify_reasoning_effort: str | None = None
     # After this many consecutive failed attempts at the same run_id (e.g. a
     # provider quota outage), auto-apply the "paused" label instead of letting
     # reconcile retry-and-comment on it forever.

@@ -396,6 +396,34 @@ def test_run_evaluator_pass_raises_when_provider_fails(
         )
 
 
+def test_release_passes_give_the_codex_model_only_to_codex(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = '```json\n{"postworthy": true, "reason": "R", "importance": "high"}\n```'
+    calls: list[tuple[str, Any, Any]] = []
+
+    def fake(provider: str, prompt: str, **kwargs: Any) -> AgentResult:
+        calls.append((provider, kwargs.get("model"), kwargs.get("reasoning_effort")))
+        if provider == "muse":
+            return AgentResult(returncode=1, timed_out=False)
+        Path(str(kwargs["log_path"])).write_text(payload, encoding="utf-8")
+        return AgentResult(returncode=0, timed_out=False)
+
+    monkeypatch.setattr("dev_agents.workflows.release_content.run_agent", fake)
+    run_evaluator_pass(
+        repo=tmp_path,
+        delta=ReleaseDelta("new", "prev", [], [], ""),
+        providers=["muse", "codex"],
+        codex_model="gpt-6.1-terra",
+        codex_reasoning_effort="medium",
+        log_dir=tmp_path,
+        run_id="7",
+        timeout_seconds=60,
+    )
+
+    assert calls == [("muse", None, None), ("codex", "gpt-6.1-terra", "medium")]
+
+
 def test_run_writer_pass_does_not_request_a_discord_draft(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

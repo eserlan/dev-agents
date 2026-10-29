@@ -164,7 +164,7 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert "#### 🔴 Changes required" in findings_body
         assert "| `feature.txt` | Adds the new branch |" in findings_body
         assert "Suggested fix: Validate before use" in findings_body
-        assert "in Luna's findings comment" in dict(comments)["review-fixes-started"]
+        assert "in the findings comment" in dict(comments)["review-fixes-started"]
     if mode == "handoff":
         assert report["handoff_agent"] == "claude"
         assert [phase for phase, _body in comments] == ["review-findings"]
@@ -273,7 +273,7 @@ def test_final_comments_explain_fix_pushes_and_supersession() -> None:
         "fixes": [{"location": "a.ts:1", "summary": "Parse the price with the shop precision"}],
     }}
     pushed = _review_completed_body(7, "run-7", report, old_sha="a" * 40, new_sha="b" * 40, fix_pushed=True, follow_up=True)
-    assert "### 🤖 Luna fixes pushed" in pushed
+    assert "### 🤖 gpt-6-luna fixes pushed" in pushed
     assert "- `a.ts:1`: Parse the price with the shop precision" in pushed
     assert "round 2/3" in pushed and "That review is expected" in pushed
     assert "Pushed fix commit `bbbbbbbbbbbb`" in pushed
@@ -303,5 +303,5 @@ def test_final_comment_explains_handed_off_findings() -> None:
 
     report = {"handoff_agent": "claude", "review_report": {"verdict": "findings", "findings": [], "fixes": []}}
     body = _review_completed_body(9, "run-9", report, old_sha="a" * 40, new_sha="a" * 40)
-    assert "### 🤖 Luna review completed — findings left for claude" in body
+    assert "### 🤖 gpt-6-luna review completed — findings left for claude" in body
     assert "Its next push gets a fresh review" in body

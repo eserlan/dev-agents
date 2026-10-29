@@ -29,7 +29,7 @@ from dev_agents.runtime import (
     run_agent,
     run_with_fallback,
 )
-from dev_agents.runtime.agent import AgentResult
+from dev_agents.runtime.agent import CODEX_MODEL, AgentResult
 
 from ._shared import MAX_INTERNAL_REVIEW_ROUNDS, PR_FIX_PROVIDER, _log
 from .audit import (
@@ -248,6 +248,10 @@ class PrFixerService:
             login and login not in agents and not login.endswith("[bot]") for login in logins
         )
 
+    def _agent_identity(self) -> dict[str, Any]:
+        """The model and effort the review and fix agents run with, for naming them in comments."""
+        return {"model": self.config.model or CODEX_MODEL, "effort": self.config.reasoning_effort}
+
     def _review_plan(
         self, number: int, head_sha: str, *, human_head: bool = False
     ) -> dict[str, Any] | None:
@@ -382,6 +386,7 @@ class PrFixerService:
                 new_sha,
                 fix_pushed=False,
                 superseded_by=new_sha,
+                **self._agent_identity(),
             ),
         )
         _log(f"review-superseded pr={number} original_head={old_sha} new_head={new_sha}")
@@ -665,6 +670,7 @@ class PrFixerService:
                     state["meta"],
                     report_url,
                     int(state.get("review_round", 0)),
+                    **self._agent_identity(),
                 ),
             )
         else:
@@ -682,6 +688,7 @@ including any failing checks. The agent will investigate, make fixes, and run va
 
 - PR head: `{state['meta'].get('headRefOid', 'unknown')}`
 - Attempt: {state.get('attempt', 1)}
+- Model: `{self.config.model or CODEX_MODEL}` ({self.config.reasoning_effort} effort)
 - Run: `{state['run_id']}`
 
 A follow-up comment will report the outcome.
@@ -853,6 +860,7 @@ A follow-up comment will report the outcome.
                             if own_push and new_sha != old_sha
                             else "The review agent did not complete successfully; see the daemon log."
                         ),
+                        **self._agent_identity(),
                     ),
                 )
                 self._auto_pause_if_exhausted(
@@ -919,6 +927,7 @@ A follow-up comment will report the outcome.
                     validation,
                     fix_pushed=fix_pushed,
                     follow_up=follow_up_pending,
+                    **self._agent_identity(),
                 ),
             )
             self.state.record_event(
@@ -1005,6 +1014,7 @@ A follow-up comment will report the outcome.
 The agent did not complete the fix for PR #{number}. Feedback remains actionable for retry.
 
 - Attempt: {state.get('attempt', 1)}
+- Model: `{self.config.model or CODEX_MODEL}` ({self.config.reasoning_effort} effort)
 - Run: `{state['run_id']}`
 """,
             )
@@ -1052,6 +1062,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 changed_files,
                 details=state.get("report", {}).get("fixes"),
                 report_url=state.get("report_url"),
+                **self._agent_identity(),
             )
             comment_posted = _publish_fix_summary(
                 self.project.repo, number, state["run_id"], summary
@@ -1137,7 +1148,8 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             run_id,
                             "review-progress",
                             _review_progress_body(
-                                number, run_id, meta or {}, None, review_round, elapsed_seconds
+                                number, run_id, meta or {}, None, review_round, elapsed_seconds,
+                                **self._agent_identity(),
                             ),
                         )
                         _log(f"review-progress pr={number} elapsed_minutes={elapsed_seconds // 60}")
@@ -1234,6 +1246,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                     number, run_id, audit.model_dump(),
                                     review_round=review_round, head_sha=original_head or None,
                                     claim_window_seconds=self.config.review_claim_window_seconds,
+                                    **self._agent_identity(),
                                 ),
                             )
                         if (not resuming and run_id and self.config.review_claim_window_seconds
@@ -1276,7 +1289,10 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             self.state.record_event("pr-review", run_id, "fixer", "fixer_started", metadata={"findings_count": len(audit.findings)})
                             _pkg._publish_pr_run_comment(
                                 self.project.repo, number, run_id, "review-fixes-started",
-                                _review_fixes_started_body(number, run_id, audit.model_dump(), review_round=review_round),
+                                _review_fixes_started_body(
+                                    number, run_id, audit.model_dump(), review_round=review_round,
+                                    **self._agent_identity(),
+                                ),
                             )
 
                     final_message = log.with_suffix(".fixer.txt")
