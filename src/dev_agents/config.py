@@ -29,6 +29,10 @@ class IssueFixerConfig(BaseModel):
     # None inherits the PR fixer's reasoning effort; set explicitly to pin
     # the writing effort for this queue (for example the answer queue).
     reasoning_effort: str | None = None
+    # Codex queues only. When set, the implementation run first assesses the issue's scope; a
+    # comprehensive issue gets a read-only planning pass at this effort, then the implementation
+    # runs again at ``reasoning_effort`` with the plan. None skips the assessment.
+    planning_effort: str | None = None
     # Answer queues only: run the copy reviewer on the draft before the PR
     # is opened and revise until it clears the score gate or the revision
     # cap is reached (the cap keeps a stuck draft from looping forever).

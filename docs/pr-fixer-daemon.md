@@ -212,6 +212,23 @@ Codex inspects the target repository's documentation instructions and existing h
 updates the help for the feature named in the issue. It opens a PR for the usual review pipeline;
 unclear feature requests are reported without guessing.
 
+A Codex queue can plan comprehensive issues before implementing them:
+
+```yaml
+issue_fixers:
+  - label: feature
+    kind: enhancement
+    planning_effort: high
+```
+
+With `planning_effort` set, the implementation run (at the queue's `reasoning_effort`) first
+assesses the issue's scope. A small issue is implemented directly. For a comprehensive one, such
+as migrations, server code and UI together, the run prints `ISSUE_FIX_PLAN_REQUIRED: <why>` and
+stops without editing. A read-only planning pass at `planning_effort` then writes the plan, which
+is posted to the issue in a collapsed section, and a second implementation run follows it. Each
+attempt gets at most one planning pass, and every run has the queue's full timeout. When an
+attempt fails, the issue comment carries the agent's own `SUMMARY` line instead of a generic one.
+
 An optional reactive copy review runs after an Answer PR is merged to the configured branch:
 
 ```yaml
