@@ -302,18 +302,22 @@ def test_pr_fixer_starts_internal_review_for_green_pr_without_copilot(
     assert record.status == "running"
 
 
+def test_no_external_agent_pauses_by_default() -> None:
+    assert PrFixerConfig().external_agent_logins == []
+
+
 def test_external_agent_commit_pauses_pr_automation(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     project = ProjectConfig(repo=repo, github="owner/repo")
-    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    config = PrFixerConfig(state_path=tmp_path / "state.db", external_agent_logins=["coding-agent[bot]"])
     metadata: dict[str, Any] = {
         "baseRefName": "staging",
-        "headRefOid": "jules-sha",
+        "headRefOid": "agent-sha",
         "state": "OPEN",
         "isDraft": False,
         "labels": [],
-        "commits": [{"authors": [{"login": "google-labs-jules[bot]"}]}],
+        "commits": [{"authors": [{"login": "coding-agent[bot]"}]}],
     }
     published: list[tuple[Any, ...]] = []
     monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
@@ -326,8 +330,8 @@ def test_external_agent_commit_pauses_pr_automation(monkeypatch, tmp_path: Path)
 
     assert state["skip"] is True
     assert state["skip_reason"] == "external-agent-commit"
-    assert state["external_agent"] == "google-labs-jules[bot]"
-    assert published[0][2:4] == ("pr-review-pause-42-jules-sha", "external-agent-paused")
+    assert state["external_agent"] == "coding-agent[bot]"
+    assert published[0][2:4] == ("pr-review-pause-42-agent-sha", "external-agent-paused")
 
 
 def test_external_agent_pause_can_be_explicitly_resumed(
@@ -336,17 +340,17 @@ def test_external_agent_pause_can_be_explicitly_resumed(
     repo = tmp_path / "repo"
     repo.mkdir()
     project = ProjectConfig(repo=repo, github="owner/repo")
-    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    config = PrFixerConfig(state_path=tmp_path / "state.db", external_agent_logins=["coding-agent[bot]"])
     metadata: dict[str, Any] = {
         "baseRefName": "staging",
         "headRefName": "feature/review-me",
-        "headRefOid": "jules-sha",
+        "headRefOid": "agent-sha",
         "state": "OPEN",
         "isDraft": False,
         "mergeable": "MERGEABLE",
         "reviewDecision": "",
         "labels": [{"name": "dev-agents-resume"}],
-        "commits": [{"authors": [{"login": "google-labs-jules[bot]"}]}],
+        "commits": [{"authors": [{"login": "coding-agent[bot]"}]}],
         "reviews": [],
         "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
     }

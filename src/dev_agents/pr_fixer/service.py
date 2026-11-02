@@ -1471,7 +1471,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         # A run can take 5-20+ minutes (an agent pass plus validation).
                         # If origin has moved to a head that is neither what we started
                         # from nor what we ourselves just pushed, someone else (an
-                        # external agent like Jules, a human, or an overlapping run)
+                        # external coding agent, a human, or an overlapping run)
                         # pushed to this same branch while we were working. Our result
                         # was computed against an already-superseded head -- it is not
                         # evidence of a genuine review/fix failure, and must not consume

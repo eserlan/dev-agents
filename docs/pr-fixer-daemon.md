@@ -191,8 +191,8 @@ quality tracking. Read-only historical replays are documented in
 [the PR auditor replay notes](../evals/pr-audit/README.md).
 
 To avoid concurrent-agent rewrite loops, `pause_on_external_agent_commits` is enabled by default.
-When the latest commit author matches `external_agent_logins` (Jules is included in the example
-configuration), all review, fix, and auto-merge activity pauses for that PR. The daemon publishes
+When the latest commit author matches `external_agent_logins` (empty by default; list the bot
+logins of any external coding agents), all review, fix, and auto-merge activity pauses for that PR. The daemon publishes
 one idempotent pause comment per head. Apply the configured `external_agent_resume_label`
 (`dev-agents-resume` by default) when the external agent is finished and automation should resume.
 
@@ -364,8 +364,8 @@ reconciliation passes are deduplicated, while reconciliation can recover a misse
 Each reopened cycle uses a fresh branch; an existing open fix PR still prevents another run.
 
 The PR workflow's `pause_on_external_agent_commits`, `external_agent_logins`, and
-`external_agent_resume_label` settings also protect issue-fixer PRs. If an external agent such as
-Jules pushes the latest commit, all automation pauses for that PR until the resume label is added.
+`external_agent_resume_label` settings also protect issue-fixer PRs. If a listed external agent
+pushes the latest commit, all automation pauses for that PR until the resume label is added.
 
 After a successful remediation run, the daemon also creates or updates top-level PR comments for
 that run. Each review run has one status comment (marker `<!-- dev-agents:pr-review run=… -->`)
