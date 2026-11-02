@@ -30,6 +30,11 @@ The command writes a JSON inspection summary to stdout. Its Git commands are rea
 See [docs/pr-fixer-daemon.md](docs/pr-fixer-daemon.md) for the systemd and Cloudflare Tunnel
 setup. Secrets and tunnel credentials remain outside the repository.
 
+## Persona sweeps
+
+Scheduled single-purpose improvement PRs (performance, accessibility, dependency injection),
+with personas defined in the target repository. See [docs/sweeps.md](docs/sweeps.md).
+
 ## Visualize workflow runs
 
 Generate a local HTML view of the LangGraph flows and recent job timelines:

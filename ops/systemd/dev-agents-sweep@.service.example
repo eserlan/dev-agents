@@ -1,0 +1,20 @@
+[Unit]
+Description=dev-agents %i persona sweep for codex-cryptica
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/dev-agents
+# Same PATH as the PR fixer so gh, bun and the agent CLIs resolve under the user manager.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl
+# Exit 1 means the sweep ran but opened no PR (gate or agent failure); see the flow report.
+ExecStart=%h/dev/dev-agents/.venv/bin/dev-agents sweep run codex-cryptica --persona %i --execute --config %h/.config/dev-agents/projects.yaml
+TimeoutStartSec=2h
+
+# Installation:
+#   cp dev-agents-sweep@.service.example ~/.config/systemd/user/dev-agents-sweep@.service
+#   cp dev-agents-sweep@.timer.example   ~/.config/systemd/user/dev-agents-sweep@.timer
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dev-agents-sweep@palette.timer dev-agents-sweep@binder.timer
+# Run one by hand: systemctl --user start dev-agents-sweep@bolt.service

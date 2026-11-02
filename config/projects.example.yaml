@@ -38,6 +38,16 @@ projects:
       auto_merge_issue_fixes_only: false
       log_retention_days: 30
       worktree_retention_days: 2
+    # Optional scheduled persona sweeps (see docs/sweeps.md). Personas live in the target
+    # repository under personas_dir; run each with `dev-agents sweep run <project> --persona <name>`.
+    sweep:
+      personas_dir: .agents/sweeps
+      base_branch: staging
+      providers: [codex]
+      reasoning_effort: medium
+      fallback_provider: claude
+      fallback_model: claude-sonnet-5-5
+      timeout_minutes: 30
     # Optional issue-driven fixer. Open issues carrying this label are handled in an isolated
     # branch and submitted as PRs; the normal PR review/fix workflow then takes over.
     issue_fixer:

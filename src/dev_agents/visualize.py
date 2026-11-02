@@ -27,10 +27,12 @@ from dev_agents.runtime import state_database_path
 from dev_agents.workflows.degodify import build_degodify_workflow
 from dev_agents.workflows.inspection import build_inspection_workflow
 from dev_agents.workflows.release_comms import build_release_comms_workflow
+from dev_agents.workflows.sweep import build_sweep_workflow
 
 WORKFLOW_NAMES = (
     "inspection",
     "degodify",
+    "sweep",
     "issue-fixer",
     "pr-fixer",
     "pr-review",
@@ -42,6 +44,7 @@ PR_DATABASE_WORKFLOWS = (
     "issue-fixer",
     "issue-reconcile",
     "degodify",
+    "sweep",
     "github-webhook",
 )
 OSLO = ZoneInfo("Europe/Oslo")
@@ -480,6 +483,7 @@ def workflow_mermaid(workflow: str) -> str:
     builders = {
         "inspection": build_inspection_workflow,
         "degodify": build_degodify_workflow,
+        "sweep": build_sweep_workflow,
         "release-comms": build_release_comms_workflow,
     }
     try:
@@ -597,6 +601,7 @@ def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
     builders = {
         "inspection": build_inspection_workflow,
         "degodify": build_degodify_workflow,
+        "sweep": build_sweep_workflow,
     }
     try:
         graph = builders[workflow]().get_graph()
