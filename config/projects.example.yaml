@@ -31,7 +31,8 @@ projects:
       # Pause when the latest commit is from an external coding agent. Apply this label
       # to explicitly resume automation after that agent is finished.
       pause_on_external_agent_commits: true
-      external_agent_logins: ["google-labs-jules[bot]"]
+      # e.g. ["some-coding-agent[bot]"]; empty means nothing pauses.
+      external_agent_logins: []
       external_agent_resume_label: dev-agents-resume
       auto_merge: false
       # Set both auto_merge and this flag to true to merge only PRs created by issue_fixer.

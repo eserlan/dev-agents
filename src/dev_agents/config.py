@@ -70,7 +70,7 @@ class CopyReviewConfig(BaseModel):
 
 
 class SweepConfig(BaseModel):
-    """Scheduled persona sweeps: small, focused improvement PRs (the former Jules personas).
+    """Scheduled persona sweeps: small, focused improvement PRs.
 
     Each persona's instructions, title, journal and diff limits live in the target repository
     under ``personas_dir`` as ``<persona>.md``; this block only says how to run them.
@@ -240,7 +240,8 @@ class PrFixerConfig(BaseModel):
     auto_merge_quiet_seconds: int = 60
     heartbeat_seconds: int = 30
     pause_on_external_agent_commits: bool = True
-    external_agent_logins: list[str] = ["google-labs-jules[bot]"]
+    # Bot logins whose pushes pause automation on a PR until the resume label is applied.
+    external_agent_logins: list[str] = []
     external_agent_resume_label: str = "dev-agents-resume"
     # External repairs require an explicit, expiring claim on the reviewed run.
     review_claim_window_seconds: int = Field(default=60, ge=0)
