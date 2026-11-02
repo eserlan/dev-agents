@@ -6,7 +6,7 @@ import pytest
 
 from dev_agents.runtime import AgentResult
 from dev_agents.workflows import committing_agent, sweep
-from dev_agents.workflows.sweep import PersonaError, parse_persona, sweep_gate
+from dev_agents.workflows.sweep import PersonaError, parse_persona, sweep_gate, unescape_newlines
 
 PERSONA_FILE = """---
 title: "⚡ Bolt"
@@ -66,6 +66,11 @@ def test_gate_ignores_the_journal_and_enforces_limits() -> None:
     assert sweep_gate("-\t-\tlogo.png", BOLT) is None
 
 
+def test_escaped_newlines_become_line_breaks_outside_code() -> None:
+    body = "💡 What: x.\\n🎯 Why: y.\n\nUses `split(\"\\n\")` here."
+    assert unescape_newlines(body) == "💡 What: x.\n🎯 Why: y.\n\nUses `split(\"\\n\")` here."
+
+
 def test_persona_is_read_from_the_fetched_base_not_the_local_checkout(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     (repo / ".agents/sweeps/bolt.md").write_text('---\ntitle: "local edit"\n---\nignored')
@@ -87,7 +92,9 @@ def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         {"title": "🎨 Palette: unrelated", "headRefName": "palette/x", "state": "OPEN"},
     ])
     monkeypatch.setattr(sweep, "_gh", lambda _repo, *args, **_kwargs: created.append(args) or "https://example.test/pr/9")
-    return repo, created, prompts
+    installs: list[Path] = []
+    monkeypatch.setattr(sweep, "install_dependencies", lambda worktree: installs.append(worktree) or True)
+    return repo, created, prompts, installs
 
 
 def run(repo: Path, monkeypatch: pytest.MonkeyPatch, prompts: list[str], behaviour) -> sweep.SweepRunResult:
@@ -110,8 +117,8 @@ def commit(worktree: Path, message: str, *, lines: int = 1, journal: bool = True
 
 
 def test_a_focused_change_becomes_a_pr_against_the_base(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo, created, prompts = sandbox
-    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Single-pass filter in a.ts\n\nWhat: one loop.\nWhy: hot path."))
+    repo, created, prompts, installs = sandbox
+    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Single-pass filter in a.ts\n\nWhat: one loop.\\nWhy: hot path."))
 
     assert result.succeeded and result.pull_request_url == "https://example.test/pr/9"
     assert result.branch and result.branch.startswith("bolt/sweep-")
@@ -119,15 +126,17 @@ def test_a_focused_change_becomes_a_pr_against_the_base(sandbox, monkeypatch: py
     assert args[args.index("--base") + 1] == "staging"
     assert args[args.index("--title") + 1] == "⚡ Bolt: Single-pass filter in a.ts"
     body = args[args.index("--body") + 1]
-    assert body.startswith("What: one loop.") and "Scheduled `bolt` sweep" in body
+    assert body.startswith("What: one loop.\nWhy: hot path.") and "Scheduled `bolt` sweep" in body
     assert "[merged] ⚡ Bolt: Earlier Jules change" in prompts[0] and "Palette" not in prompts[0]
     assert git(repo, "ls-remote", "origin", result.branch)
+    # Dependencies are installed in the worktree before the agent validates its change.
+    assert len(installs) == 1
     # The local branch and worktree are cleaned up once pushed.
     assert git(repo, "branch", "--list", result.branch) == ""
 
 
 def test_nothing_worth_changing_opens_no_pr(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo, created, prompts = sandbox
+    repo, created, prompts, _installs = sandbox
 
     def noop(_worktree: Path, prompt: str) -> None:
         marker = prompt.split("write a one-line reason to `")[1].split("`")[0]
@@ -141,7 +150,7 @@ def test_nothing_worth_changing_opens_no_pr(sandbox, monkeypatch: pytest.MonkeyP
 
 
 def test_an_oversized_change_is_not_pushed(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo, created, prompts = sandbox
+    repo, created, prompts, _installs = sandbox
     result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Big", lines=20, journal=False))
 
     assert not result.succeeded and not created

@@ -31,6 +31,7 @@ from dev_agents.runtime import GitHubError, gh_json
 from dev_agents.workflows.committing_agent import (
     branch_worktree,
     committed_change,
+    install_dependencies,
     open_pull_request_with_prefix,
     run_committing_agent,
 )
@@ -164,9 +165,20 @@ Rules for this run:
   (## YYYY-MM-DD - <title>, then **Learning:** and **Action:** lines).
 - Make exactly one commit. Its subject is the PR title and must start with "{persona.title}: ".
   Its body is the PR description: what changed, why it matters, and how it was verified.
+  Write the message to a file and commit with `git commit -F <file>` so the body keeps its
+  line breaks; do not put `\\n` escapes in a `-m` argument.
 - If you find nothing clearly worth changing, do not invent work: leave the tree unchanged, make
   no commit, and write a one-line reason to `{noop_path}`.
 - Do not push, open, or merge a pull request; the workflow does that."""
+
+
+def unescape_newlines(text: str) -> str:
+    """Turn literal `\\n` escapes into line breaks, leaving `code spans` untouched.
+
+    Agents sometimes pass a multi-line message to `git commit -m` with escaped newlines.
+    """
+    parts = text.split("`")
+    return "`".join(part if index % 2 else part.replace("\\n", "\n") for index, part in enumerate(parts))
 
 
 def sweep_gate(numstat: str, persona: Persona) -> str | None:
@@ -218,6 +230,8 @@ def _run_sweep_impl(
     with branch_worktree(repo, base_branch, branch, prefix=f"sweep-{persona.name}-") as worktree:
         noop_path = Path(_git(worktree, "rev-parse", "--path-format=absolute", "--git-path", NOOP_MARKER))
         noop_path.unlink(missing_ok=True)
+        # Validation (tests, type checks, generated tsconfigs) needs the locked dependencies.
+        install_dependencies(worktree)
 
         def finished() -> bool:
             return committed_change(worktree, base_branch) or (
@@ -231,7 +245,7 @@ def _run_sweep_impl(
             log_path=log_path or repo / ".dev-agents" / "sweep.log",
             timeout_seconds=timeout_seconds, model=model, reasoning_effort=reasoning_effort,
             fallback_model=fallback_model, fallback_reasoning_effort=fallback_reasoning_effort,
-            finished=finished, on_event=on_event,
+            finished=finished, after_reset=lambda: install_dependencies(worktree), on_event=on_event,
         )
         if accepted is None:
             return SweepRunResult(persona.name, branch, None, False, False,
@@ -247,6 +261,7 @@ def _run_sweep_impl(
         if not title.startswith(persona.title):
             title = f"{persona.title}: {title}"
         body = _git(worktree, "log", "-1", "--format=%b", first)
+        body = unescape_newlines(body)
         body = f"{body}\n\n---\n*Scheduled `{persona.name}` sweep by dev-agents · agent `{accepted}`*".lstrip()
         _git(worktree, "push", "-u", "origin", branch)
         pr_url = _gh(repo, "pr", "create", "--base", base_branch, "--head", branch, "--title", title, "--body", body)

@@ -16,11 +16,15 @@ from langgraph.graph import END, START, StateGraph
 from dev_agents.runtime import GitHubError, gh_json
 from dev_agents.workflows.committing_agent import (
     branch_worktree,
+    install_dependencies,
     open_pull_request_with_prefix,
     run_committing_agent,
 )
 from dev_agents.workflows.committing_agent import gh as _gh
 from dev_agents.workflows.committing_agent import git as _git
+
+# Kept under the old name; tests and callers patch it here.
+_install_dependencies = install_dependencies
 
 
 @dataclass(frozen=True)
@@ -170,21 +174,6 @@ def fallow_enabled(worktree: Path) -> bool:
     return (worktree / ".fallowrc.json").is_file() or (
         package.is_file() and '"fallow"' in package.read_text(encoding="utf-8", errors="replace")
     )
-
-
-def _install_dependencies(worktree: Path) -> bool:
-    """Install locked dependencies so fallow resolves the worktree like CI does."""
-    if (worktree / "node_modules").is_dir():
-        return True
-    if not any((worktree / name).is_file() for name in ("bun.lock", "bun.lockb")):
-        return False
-    try:
-        result = subprocess.run(
-            ("bun", "install", "--frozen-lockfile"), cwd=worktree, capture_output=True, text=True, timeout=900, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
 
 
 def _fallow_json(worktree: Path, *args: str, timeout: float = 600) -> dict[str, Any] | None:
