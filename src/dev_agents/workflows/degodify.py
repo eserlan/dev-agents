@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,7 +13,14 @@ from typing import Any, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
 
-from dev_agents.runtime import AgentResult, GitHubError, gh_json, run_agent, run_with_fallback
+from dev_agents.runtime import GitHubError, gh_json
+from dev_agents.workflows.committing_agent import (
+    branch_worktree,
+    open_pull_request_with_prefix,
+    run_committing_agent,
+)
+from dev_agents.workflows.committing_agent import gh as _gh
+from dev_agents.workflows.committing_agent import git as _git
 
 
 @dataclass(frozen=True)
@@ -278,14 +284,7 @@ def repository_analysis(repo: Path, *, top_count: int = 50) -> list[DegodifyFile
 
 def open_degodify_pull_request(repo: Path) -> str | None:
     """Return the URL of an already open degodify PR, if there is one."""
-    try:
-        pulls = gh_json(repo, "pr", "list", "--state", "open", "--json", "headRefName,url", "--limit", "200")
-    except (GitHubError, TypeError):
-        return None
-    for pull in pulls if isinstance(pulls, list) else []:
-        if str(pull.get("headRefName", "")).startswith(BRANCH_PREFIX):
-            return str(pull.get("url") or pull.get("headRefName"))
-    return None
+    return open_pull_request_with_prefix(repo, BRANCH_PREFIX)
 
 
 def plan_degodify(repo: Path, *, top_count: int = 50) -> CandidateSelection:
@@ -325,73 +324,19 @@ def _run_degodify_impl(
         # Not a failure: tonight's decomposition waits until the previous one has merged.
         return DegodifyRunResult(candidate, None, None, False, True, f"waiting for open degodify PR {open_pull}")
 
-    root = repo / ".dev-agents-worktrees"
-    root.mkdir(parents=True, exist_ok=True)
-    worktree = Path(tempfile.mkdtemp(prefix="degodify-", dir=root))
-    try:
-        _git(repo, "fetch", "origin", base_branch)
-        _git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base_branch}")
+    log = log_path or repo / ".dev-agents" / "degodify.log"
+    with branch_worktree(repo, base_branch, branch, prefix="degodify-") as worktree:
         use_fallow = fallow_enabled(worktree) and _install_dependencies(worktree)
         inspected = _fallow_json(worktree, "inspect", "--file", candidate.relative_path) if use_fallow else None
         fallow = summarize_fallow_inspect(inspected, candidate.relative_path) if inspected else None
         prompt = build_decomposition_prompt(candidate, branch, base_branch, worktree, fallow)
-        configured_providers = providers or [provider]
-        attempts = 0
-
-        def committed_change() -> bool:
-            return (
-                _git(worktree, "status", "--porcelain") == ""
-                and _git(worktree, "rev-parse", "HEAD") != _git(worktree, "rev-parse", f"origin/{base_branch}")
-            )
-
-        def run_provider(name: str) -> AgentResult:
-            nonlocal attempts
-            if name != configured_providers[0]:
-                _git(worktree, "reset", "--hard", f"origin/{base_branch}")
-                _git(worktree, "clean", "-fdx")
-                if use_fallow:
-                    _install_dependencies(worktree)
-            result = AgentResult(1, False)
-            # One continuation per provider preserves partial edits and gives an
-            # inspection-only turn a chance to finish. Each provider gets its own
-            # deadline so a slow primary cannot starve the fallback.
-            deadline = time.monotonic() + timeout_seconds
-            for turn in range(2):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return AgentResult(1, True)
-                attempts += 1
-                recovery = "" if turn == 0 else """
-The previous attempt did not leave a clean committed change. Continue in this same worktree;
-inspect git status and the existing edits before doing anything else. Preserve partial work.
-Implement the decomposition now, run focused validation, and commit. An inspection summary or
-plan is not completion. If blocked, give the exact failing command and actionable blocker.
-"""
-                result = run_agent(
-                    name, prompt + recovery, cwd=worktree,
-                    log_path=log_path or repo / ".dev-agents" / "degodify.log",
-                    timeout_seconds=remaining,
-                    # `model` and `reasoning_effort` are Codex settings; the fallback ones are Claude's.
-                    model=model if name == "codex" else fallback_model if name == "claude" else None,
-                    reasoning_effort=(
-                        reasoning_effort if name == "codex"
-                        else fallback_reasoning_effort if name == "claude" else None
-                    ),
-                )
-                complete = result.returncode == 0 and not result.timed_out and committed_change()
-                if on_event:
-                    on_event("agent_attempt", {
-                        "provider": name, "attempt": attempts, "continuation": bool(turn),
-                        "returncode": result.returncode, "timed_out": result.timed_out,
-                        "committed_change": complete,
-                    })
-                if complete or result.timed_out:
-                    break
-            return result
-
-        accepted = run_with_fallback(
-            configured_providers, run_provider,
-            lambda _name, result: result.returncode == 0 and not result.timed_out and committed_change(),
+        accepted, attempts = run_committing_agent(
+            worktree, base_branch, prompt,
+            providers=providers or [provider], task="decomposition", log_path=log,
+            timeout_seconds=timeout_seconds, model=model, reasoning_effort=reasoning_effort,
+            fallback_model=fallback_model, fallback_reasoning_effort=fallback_reasoning_effort,
+            after_reset=(lambda: _install_dependencies(worktree)) if use_fallow else None,
+            on_event=on_event,
         )
         if accepted is None:
             return DegodifyRunResult(candidate, branch, None, False, False,
@@ -424,12 +369,10 @@ plan is not completion. If blocked, give the exact failing command and actionabl
             "New modules:",
             *[f"- `{path}` ({_line_count(worktree / path)} lines)" for path in new_files],
             "",
-            f"Agent: `{accepted[0] if accepted else provider}`.",
+            f"Agent: `{accepted}`.",
         ])
         pr_url = _gh(repo, "pr", "create", "--base", base_branch, "--head", branch, "--title", title, "--body", body)
         return DegodifyRunResult(candidate, branch, pr_url, False, True)
-    finally:
-        _git(repo, "worktree", "remove", "--force", str(worktree), check=False)
 
 
 def build_degodify_workflow() -> Any:
@@ -512,30 +455,6 @@ def run_degodify(
         "on_event": on_event,
     })
     return cast(DegodifyRunResult, result["result"])
-
-
-def _git(repo: Path, *args: str, check: bool = True, timeout: float = 120) -> str:
-    try:
-        result = subprocess.run(
-            ("git", *args), cwd=repo, text=True, capture_output=True, check=False, timeout=timeout
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout:g}s") from error
-    if check and result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git command failed")
-    return result.stdout.strip()
-
-
-def _gh(repo: Path, *args: str, timeout: float = 60) -> str:
-    try:
-        result = subprocess.run(
-            ("gh", *args), cwd=repo, text=True, capture_output=True, check=False, timeout=timeout
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(f"gh {' '.join(args)} timed out after {timeout:g}s") from error
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh command failed")
-    return result.stdout.strip()
 
 
 def select_candidate(files: list[DegodifyFile], active_items: list[str]) -> CandidateSelection:

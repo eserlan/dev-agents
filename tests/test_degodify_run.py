@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from dev_agents.runtime import AgentResult
-from dev_agents.workflows import degodify
+from dev_agents.workflows import committing_agent, degodify
 from dev_agents.workflows.degodify import (
     DegodifyFile,
     build_decomposition_prompt,
@@ -105,7 +105,7 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     budgets: dict[str, list[float]] = {}
     from types import SimpleNamespace
     clock = iter(range(0, 10000, 10))
-    monkeypatch.setattr(degodify, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(committing_agent, "time", SimpleNamespace(monotonic=lambda: next(clock)))
 
     def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
         prompts.append(prompt)
@@ -133,7 +133,7 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
         git(worktree, "commit", "-m", "split")
         return AgentResult(0, False)
 
-    monkeypatch.setattr(degodify, "run_agent", agent)
+    monkeypatch.setattr(committing_agent, "run_agent", agent)
     monkeypatch.setattr(degodify, "open_degodify_pull_request", lambda _repo: None)
     monkeypatch.setattr(degodify, "_install_dependencies", lambda _worktree: True)
     monkeypatch.setattr(
@@ -213,7 +213,7 @@ def test_planner_falls_back_to_the_built_in_scan_without_an_analyzer(tmp_path: P
 
 def test_a_new_decomposition_waits_while_one_is_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(degodify, "open_degodify_pull_request", lambda _repo: "https://example.test/pr/7")
-    monkeypatch.setattr(degodify, "run_agent", lambda *_args, **_kwargs: pytest.fail("agent must not run"))
+    monkeypatch.setattr(committing_agent, "run_agent", lambda *_args, **_kwargs: pytest.fail("agent must not run"))
     candidate = DegodifyFile(TARGET, 1000, 1000, "Utility / Module", "CRITICAL")
 
     result = degodify._run_degodify_impl(tmp_path, dry_run=False, supplied_candidate=candidate)
@@ -224,9 +224,9 @@ def test_a_new_decomposition_waits_while_one_is_open(tmp_path: Path, monkeypatch
 
 def test_open_degodify_pull_request_matches_the_curator_branch_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     pulls = [{"headRefName": "feature/x", "url": "u1"}, {"headRefName": "curator/degod-store-1", "url": "u2"}]
-    monkeypatch.setattr(degodify, "gh_json", lambda *_args: pulls)
+    monkeypatch.setattr(committing_agent, "gh_json", lambda *_args: pulls)
     assert degodify.open_degodify_pull_request(Path(".")) == "u2"
-    monkeypatch.setattr(degodify, "gh_json", lambda *_args: pulls[:1])
+    monkeypatch.setattr(committing_agent, "gh_json", lambda *_args: pulls[:1])
     assert degodify.open_degodify_pull_request(Path(".")) is None
 
 
