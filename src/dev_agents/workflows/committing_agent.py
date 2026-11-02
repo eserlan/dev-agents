@@ -121,6 +121,21 @@ def run_committing_agent(
     return (accepted[0] if accepted else None), attempts
 
 
+def install_dependencies(worktree: Path) -> bool:
+    """Install locked dependencies so validation and fallow see the worktree like CI does."""
+    if (worktree / "node_modules").is_dir():
+        return True
+    if not any((worktree / name).is_file() for name in ("bun.lock", "bun.lockb")):
+        return False
+    try:
+        result = subprocess.run(
+            ("bun", "install", "--frozen-lockfile"), cwd=worktree, capture_output=True, text=True, timeout=900, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def open_pull_request_with_prefix(repo: Path, prefix: str) -> str | None:
     """Return the URL of an open PR whose head branch starts with `prefix`, if any."""
     try:
