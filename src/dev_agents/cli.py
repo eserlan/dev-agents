@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dev_agents.config import (
@@ -12,11 +13,13 @@ from dev_agents.config import (
     ContentQueueConfig,
     PrFixerConfig,
     ReleaseCommsConfig,
+    SweepConfig,
     load_projects_config,
     select_project,
 )
 from dev_agents.context.repository import RepositoryError
 from dev_agents.daemon import serve_project
+from dev_agents.pr_fixer.local_state import _state_path
 from dev_agents.runtime import StateRepository, state_database_path
 from dev_agents.visualize import (
     WORKFLOW_NAMES,
@@ -35,6 +38,7 @@ from dev_agents.workflows.content_queue import (
 from dev_agents.workflows.degodify import run_degodify
 from dev_agents.workflows.inspection import inspect_project
 from dev_agents.workflows.release_comms import run_release_comms
+from dev_agents.workflows.sweep import PersonaError, run_sweep
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,6 +68,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--base", default="staging")
     run.add_argument("--provider", default="codex")
     run.add_argument("--execute", action="store_true", help="Create branch, push, and open a PR")
+    sweep = subcommands.add_parser("sweep", help="Run scheduled persona improvement sweeps")
+    sweep_subcommands = sweep.add_subparsers(dest="sweep_command", required=True)
+    sweep_run = sweep_subcommands.add_parser("run", help="Plan or execute one persona sweep")
+    sweep_run.add_argument("project", help="Configured project name")
+    sweep_run.add_argument("--persona", required=True, help="Persona file name, e.g. bolt")
+    sweep_run.add_argument("--config", type=Path, default=Path("config/projects.yaml"))
+    sweep_run.add_argument("--execute", action="store_true", help="Create branch, push, and open a PR")
     comms = subcommands.add_parser("release-comms", help="Run release communications workflows")
     comms_subcommands = comms.add_subparsers(dest="release_comms_command", required=True)
     evaluate = comms_subcommands.add_parser(
@@ -192,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0 if result.succeeded else 1
+    if arguments.command == "sweep" and arguments.sweep_command == "run":
+        return _run_sweep_command(parser, arguments)
     if arguments.command == "release-comms" and arguments.release_comms_command == "evaluate":
         try:
             config = load_projects_config(arguments.config)
@@ -382,6 +395,56 @@ def main(argv: list[str] | None = None) -> int:
         print(output.resolve())
         return 0
     return 1
+
+
+def _run_sweep_command(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
+    try:
+        project = select_project(load_projects_config(arguments.config), arguments.project)
+    except ConfigError as error:
+        parser.exit(2, f"error: {error}\n")
+    config = project.sweep or SweepConfig()
+    persona = arguments.persona
+    claims: StateRepository | None = None
+    run_id = f"{persona}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+    if arguments.execute:
+        # Executed runs share the PR fixer's database so the flow report shows them.
+        claims = StateRepository(_state_path(project.pr_fixer or PrFixerConfig(), arguments.project), arguments.project, project.repo)
+        claims.claim_run("sweep", run_id, metadata={"persona": persona})
+
+    def record(event: str, payload: dict[str, object]) -> None:
+        if claims is not None:
+            claims.record_event("sweep", run_id, event, event, metadata=payload)
+
+    try:
+        result = run_sweep(
+            project.repo, persona,
+            personas_dir=config.personas_dir, base_branch=config.base_branch,
+            providers=[*config.providers, *([config.fallback_provider] if config.fallback_provider else [])],
+            log_path=config.log_dir / f"sweep-{persona}.log" if config.log_dir else None,
+            timeout_seconds=config.timeout_minutes * 60,
+            model=config.model, reasoning_effort=config.reasoning_effort,
+            fallback_model=config.fallback_model, fallback_reasoning_effort=config.fallback_reasoning_effort,
+            recent_limit=config.recent_pull_requests, dry_run=not arguments.execute, on_event=record,
+        )
+    except (PersonaError, RuntimeError) as error:
+        if claims is not None:
+            claims.complete_run("sweep", run_id, status="failed", error=str(error))
+        parser.exit(2, f"error: {error}\n")
+    if claims is not None:
+        claims.complete_run(
+            "sweep", run_id,
+            status="completed" if result.succeeded else "failed",
+            error=None if result.succeeded else result.reason,
+            metadata={"reason": result.reason, "pull_request": result.pull_request_url, "noop": result.noop},
+        )
+        from dev_agents.visualize import schedule_report_refresh
+
+        schedule_report_refresh(arguments.project, project)
+    print(json.dumps({
+        "persona": result.persona, "branch": result.branch, "pullRequestUrl": result.pull_request_url,
+        "dryRun": result.dry_run, "succeeded": result.succeeded, "noop": result.noop, "reason": result.reason,
+    }, indent=2, sort_keys=True))
+    return 0 if result.succeeded else 1
 
 
 if __name__ == "__main__":

@@ -69,6 +69,30 @@ class CopyReviewConfig(BaseModel):
     instructions_path: Path | None = None
 
 
+class SweepConfig(BaseModel):
+    """Scheduled persona sweeps: small, focused improvement PRs (the former Jules personas).
+
+    Each persona's instructions, title, journal and diff limits live in the target repository
+    under ``personas_dir`` as ``<persona>.md``; this block only says how to run them.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    personas_dir: str = ".agents/sweeps"
+    base_branch: str = "staging"
+    providers: list[str] = ["codex"]
+    model: str | None = None
+    reasoning_effort: str = "high"
+    # Retries from a clean checkout when the configured providers leave no usable result.
+    fallback_provider: Literal["claude"] | None = None
+    fallback_model: str | None = None
+    fallback_reasoning_effort: str | None = None
+    timeout_minutes: int = 30
+    # How many of the persona's recent PRs the agent sees, so it does not redo earlier work.
+    recent_pull_requests: int = Field(default=40, ge=0, le=200)
+    log_dir: Path | None = None
+
+
 class ProjectConfig(BaseModel):
     """A target repository available to workflows."""
 
@@ -92,6 +116,7 @@ class ProjectConfig(BaseModel):
     # e.g. a "bug" queue plus a "gui-fix" enhancement queue running together.
     issue_fixers: list[IssueFixerConfig] = []
     copy_review: CopyReviewConfig | None = None
+    sweep: SweepConfig | None = None
     release_comms: ReleaseCommsConfig | None = None
     discord_notifications: DiscordNotificationsConfig | None = None
 

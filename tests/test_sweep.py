@@ -1,0 +1,171 @@
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from dev_agents.runtime import AgentResult
+from dev_agents.workflows import committing_agent, sweep
+from dev_agents.workflows.sweep import PersonaError, parse_persona, sweep_gate
+
+PERSONA_FILE = """---
+title: "⚡ Bolt"
+journal: .agents/journal/bolt.md
+max_files: 2
+max_changed_lines: 10
+---
+Find one measurable performance improvement on a hot path.
+"""
+BOLT = parse_persona("bolt", PERSONA_FILE)
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=repo, text=True, stderr=subprocess.DEVNULL).strip()
+
+
+def make_repo(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(origin, "init", "-b", "staging")
+    git(origin, "config", "user.email", "test@example.test")
+    git(origin, "config", "user.name", "Test")
+    (origin / ".agents/sweeps").mkdir(parents=True)
+    (origin / ".agents/sweeps/bolt.md").write_text(PERSONA_FILE)
+    (origin / "src").mkdir()
+    (origin / "src/a.ts").write_text("export const a = [1, 2].map((x) => x).filter(Boolean);\n")
+    git(origin, "add", ".")
+    git(origin, "commit", "-m", "base")
+    git(origin, "config", "receive.denyCurrentBranch", "ignore")
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", str(origin), str(repo)], check=True, capture_output=True)
+    git(repo, "config", "user.email", "test@example.test")
+    git(repo, "config", "user.name", "Test")
+    return repo
+
+
+def test_parse_persona_reads_front_matter_and_instructions() -> None:
+    assert BOLT.title == "⚡ Bolt"
+    assert BOLT.journal == ".agents/journal/bolt.md"
+    assert (BOLT.max_files, BOLT.max_changed_lines) == (2, 10)
+    assert BOLT.instructions == "Find one measurable performance improvement on a hot path."
+    assert BOLT.branch_prefix == "bolt/"
+    defaults = parse_persona("palette", '---\ntitle: "🎨 Palette"\n---\nBody')
+    assert (defaults.journal, defaults.max_files, defaults.max_changed_lines) == (".agents/journal/palette.md", 6, 150)
+    with pytest.raises(PersonaError):
+        parse_persona("x", "no front matter")
+    with pytest.raises(PersonaError):
+        parse_persona("x", "---\njournal: j.md\n---\nmissing title")
+
+
+def test_gate_ignores_the_journal_and_enforces_limits() -> None:
+    journal = f"40\t0\t{BOLT.journal}"
+    assert sweep_gate(f"3\t2\tsrc/a.ts\n{journal}", BOLT) is None
+    assert sweep_gate(journal, BOLT) == "the commit only touched the journal"
+    assert sweep_gate("1\t0\ta\n1\t0\tb\n1\t0\tc", BOLT) == "changed 3 files (limit 2)"
+    assert sweep_gate("9\t9\tsrc/a.ts", BOLT) == "changed 18 lines (limit 10)"
+    assert sweep_gate("-\t-\tlogo.png", BOLT) is None
+
+
+def test_persona_is_read_from_the_fetched_base_not_the_local_checkout(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / ".agents/sweeps/bolt.md").write_text('---\ntitle: "local edit"\n---\nignored')
+    assert sweep.load_persona(repo, "staging", ".agents/sweeps", "bolt").title == "⚡ Bolt"
+    with pytest.raises(PersonaError, match="not found"):
+        sweep.load_persona(repo, "staging", ".agents/sweeps", "palette")
+    with pytest.raises(PersonaError, match="invalid persona name"):
+        sweep.load_persona(repo, "staging", ".agents/sweeps", "../bolt")
+
+
+@pytest.fixture
+def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = make_repo(tmp_path)
+    created: list[tuple[str, ...]] = []
+    prompts: list[str] = []
+    monkeypatch.setattr(sweep, "open_pull_request_with_prefix", lambda _repo, _prefix: None)
+    monkeypatch.setattr(sweep, "gh_json", lambda *_args: [
+        {"title": "⚡ Bolt: Earlier Jules change", "headRefName": "bolt/old-1", "state": "MERGED"},
+        {"title": "🎨 Palette: unrelated", "headRefName": "palette/x", "state": "OPEN"},
+    ])
+    monkeypatch.setattr(sweep, "_gh", lambda _repo, *args, **_kwargs: created.append(args) or "https://example.test/pr/9")
+    return repo, created, prompts
+
+
+def run(repo: Path, monkeypatch: pytest.MonkeyPatch, prompts: list[str], behaviour) -> sweep.SweepRunResult:
+    def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
+        prompts.append(prompt)
+        behaviour(kwargs["cwd"], prompt)
+        return AgentResult(0, False)
+
+    monkeypatch.setattr(committing_agent, "run_agent", agent)
+    return sweep._run_sweep_impl(repo, BOLT, dry_run=False, log_path=repo.parent / "log")
+
+
+def commit(worktree: Path, message: str, *, lines: int = 1, journal: bool = True) -> None:
+    (worktree / "src/a.ts").write_text("".join(f"export const a{i} = {i};\n" for i in range(lines)))
+    if journal:
+        (worktree / ".agents/journal").mkdir(parents=True, exist_ok=True)
+        (worktree / BOLT.journal).write_text("## 2026-11-02 - lesson\n" * 30)
+    git(worktree, "add", ".")
+    git(worktree, "commit", "-m", message)
+
+
+def test_a_focused_change_becomes_a_pr_against_the_base(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts = sandbox
+    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Single-pass filter in a.ts\n\nWhat: one loop.\nWhy: hot path."))
+
+    assert result.succeeded and result.pull_request_url == "https://example.test/pr/9"
+    assert result.branch and result.branch.startswith("bolt/sweep-")
+    args = created[0]
+    assert args[args.index("--base") + 1] == "staging"
+    assert args[args.index("--title") + 1] == "⚡ Bolt: Single-pass filter in a.ts"
+    body = args[args.index("--body") + 1]
+    assert body.startswith("What: one loop.") and "Scheduled `bolt` sweep" in body
+    assert "[merged] ⚡ Bolt: Earlier Jules change" in prompts[0] and "Palette" not in prompts[0]
+    assert git(repo, "ls-remote", "origin", result.branch)
+    # The local branch and worktree are cleaned up once pushed.
+    assert git(repo, "branch", "--list", result.branch) == ""
+
+
+def test_nothing_worth_changing_opens_no_pr(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts = sandbox
+
+    def noop(_worktree: Path, prompt: str) -> None:
+        marker = prompt.split("write a one-line reason to `")[1].split("`")[0]
+        Path(marker).write_text("every hot path is already a single pass\n")
+
+    result = run(repo, monkeypatch, prompts, noop)
+
+    assert result.succeeded and result.noop and not created and result.branch is None
+    assert result.reason == "nothing worth changing: every hot path is already a single pass"
+    assert len(prompts) == 1
+
+
+def test_an_oversized_change_is_not_pushed(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts = sandbox
+    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Big", lines=20, journal=False))
+
+    assert not result.succeeded and not created
+    assert result.reason == "changed 21 lines (limit 10)"
+    assert git(repo, "ls-remote", "origin", "refs/heads/bolt/*") == ""
+
+
+def test_a_sweep_waits_while_the_persona_has_an_open_pr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sweep, "open_pull_request_with_prefix", lambda _repo, prefix: f"https://example.test/{prefix}")
+    monkeypatch.setattr(committing_agent, "run_agent", lambda *_a, **_k: pytest.fail("agent must not run"))
+
+    result = sweep._run_sweep_impl(tmp_path, BOLT, dry_run=False)
+
+    assert result.succeeded and result.reason == "waiting for open bolt PR https://example.test/bolt/"
+
+
+def test_cli_dry_run_loads_the_persona_without_mutating(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from dev_agents.cli import main
+
+    repo = make_repo(tmp_path)
+    config = tmp_path / "projects.yaml"
+    config.write_text(f"projects:\n  demo:\n    repo: {repo}\n")
+
+    assert main(["sweep", "run", "demo", "--persona", "bolt", "--config", str(config)]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["dryRun"] is True and output["persona"] == "bolt" and output["branch"].startswith("bolt/sweep-")
+    assert git(repo, "branch", "--list", "bolt/*") == ""

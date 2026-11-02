@@ -37,6 +37,8 @@ def branch_worktree(repo: Path, base_branch: str, branch: str, *, prefix: str) -
         yield worktree
     finally:
         git(repo, "worktree", "remove", "--force", str(worktree), check=False)
+        # Pushed work lives on the remote; a run that pushed nothing leaves nothing behind.
+        git(repo, "branch", "-D", branch, check=False)
 
 
 def committed_change(worktree: Path, base_branch: str) -> bool:
