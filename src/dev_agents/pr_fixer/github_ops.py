@@ -101,6 +101,25 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
     return meta, keys
 
 
+def _infrastructure_failures(meta: dict[str, Any], keys: list[str], patterns: list[str]) -> dict[str, str]:
+    """Failing-check feedback keys whose failed-job log matches an infrastructure pattern.
+
+    Maps each such key to the matched pattern. Only check keys are considered; review comments,
+    reviews and merge conflicts are always actionable.
+    """
+    lowered = [pattern.lower() for pattern in patterns if pattern]
+    matches: dict[str, str] = {}
+    for check in meta.get("checks", []):
+        if not (check.get("bucket") == "fail" or check.get("state") == "FAILURE"):
+            continue
+        key = f"check:{meta['headRefOid']}:{check.get('workflow', '')}:{check['name']}:{check['state']}"
+        details = str(check.get("failureDetails", "")).lower()
+        pattern = next((p for p, low in zip(patterns, lowered, strict=False) if low in details), None)
+        if key in keys and pattern:
+            matches[key] = pattern
+    return matches
+
+
 def _is_issue_fix_pr(meta: dict[str, Any]) -> bool:
     """Identify PRs created by the label-driven issue fixer."""
     return bool(re.search(r"<!--\s*dev-agents:issue-fix\s+issue=\d+\b", str(meta.get("body", ""))))
