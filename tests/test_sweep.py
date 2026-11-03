@@ -326,3 +326,58 @@ def test_a_failed_workflow_hands_its_failures_and_timeout_to_the_agent(sandbox, 
     assert "https://example.test/run/77" in prompts[0] and "gh run view 77 --log-failed" in prompts[0]
     assert "  - [chromium] › tests/b.spec.ts:9:1 › B › switches vault" in prompts[0]
     assert budgets[0] > 60  # the persona's 75 minutes, not the configured minute
+
+
+def test_network_errors_are_transient_but_hook_rejections_are_not() -> None:
+    def error(stderr: str) -> RuntimeError:
+        return committing_agent._command_error(subprocess.CompletedProcess([], 1, "", stderr), "failed")
+
+    assert isinstance(error("fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com"),
+                      committing_agent.TransientCommandError)
+    assert isinstance(error("HTTP 502: Bad Gateway (https://api.github.com/graphql)"), committing_agent.TransientCommandError)
+    rejected = error("❌ UI pattern check failed.\nerror: failed to push some refs to 'github.com:x/y.git'")
+    assert not isinstance(rejected, committing_agent.TransientCommandError)
+
+
+@pytest.fixture
+def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from langgraph.types import RetryPolicy
+
+    policy = RetryPolicy(max_attempts=3, initial_interval=0.01, jitter=False,
+                         retry_on=committing_agent.TransientCommandError)
+    monkeypatch.setattr(committing_agent, "NETWORK_RETRY", policy)
+    monkeypatch.setattr(sweep, "NETWORK_RETRY", policy)
+
+
+def test_a_push_that_hits_a_network_error_is_retried_not_repaired(sandbox, monkeypatch: pytest.MonkeyPatch, fast_retry) -> None:
+    repo, created, prompts, _installs = sandbox
+    real_git = committing_agent.git
+    failures = ["fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com"]
+
+    def flaky_git(path: Path, *args: str, **kwargs):
+        if args[:1] == ("push",) and failures:
+            raise committing_agent.TransientCommandError(failures.pop())
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(committing_agent, "git", flaky_git)
+    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Tidy"))
+
+    assert result.succeeded and created and len(prompts) == 1 and not failures
+
+
+def test_a_retried_pr_creation_reuses_the_pr_that_was_opened(sandbox, monkeypatch: pytest.MonkeyPatch, fast_retry) -> None:
+    repo, _created, prompts, _installs = sandbox
+    opened: list[str] = []
+
+    def create(_repo, *args, **_kwargs):
+        # GitHub opened the PR but the response was lost.
+        opened.append(args[args.index("--head") + 1])
+        raise committing_agent.TransientCommandError("HTTP 502: Bad Gateway")
+
+    monkeypatch.setattr(sweep, "_gh", create)
+    monkeypatch.setattr(sweep, "open_pull_request_with_prefix",
+                        lambda _repo, prefix: "https://example.test/pr/11" if prefix in opened else None)
+
+    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Tidy"))
+
+    assert result.succeeded and result.pull_request_url == "https://example.test/pr/11" and len(opened) == 1

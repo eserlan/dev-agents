@@ -109,11 +109,17 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
 
     def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
         prompts.append(prompt)
-        budgets.setdefault(_name, []).append(kwargs["timeout_seconds"])
+        if "could not publish your change" not in prompt:
+            # A repair is a new turn with its own deadline; only the first run's budgets shrink.
+            budgets.setdefault(_name, []).append(kwargs["timeout_seconds"])
         # Codex gets the decomposition model; the Claude fallback gets its own.
         assert kwargs["model"] == ("decomposition-model" if _name == "codex" else "claude-opus-5-5")
         assert kwargs["reasoning_effort"] == ("high" if _name == "codex" else "medium")
         worktree = kwargs["cwd"]
+        if "could not publish your change" in prompt:
+            # A split that is still too small goes back to the agent, which gives up here.
+            assert "target only shrank from 1000 to 900 lines" in prompt
+            return AgentResult(0, False)
         if recovery == "exhausted" or (recovery == "fallback" and _name == "codex"):
             return AgentResult(0, False)
         if recovery == "timeout":
@@ -151,7 +157,8 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
         fallback_model="claude-opus-5-5", fallback_reasoning_effort="medium",
         on_event=lambda event, payload: events.append((event, payload)),
     )
-    assert all(event == "agent_attempt" for event, _ in events)
+    attempts = [payload for event, payload in events if event == "agent_attempt"]
+    assert events[-1][0] == "publish_result"
     for provider_budgets in budgets.values():
         assert provider_budgets == sorted(provider_budgets, reverse=True)
         if len(provider_budgets) > 1:
@@ -159,13 +166,18 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
     if len(budgets) > 1:
         # A fallback provider gets its own full budget, not what the primary left over.
         assert budgets["claude"][0] > 0
+    # The worktree and its local branch are gone whatever the outcome.
+    assert git(repo, "worktree", "list").count("\n") == 0
+    assert git(repo, "branch", "--list", "curator/*") == ""
     if recovery in {"exhausted", "timeout"}:
         assert not result.succeeded and not created
         assert len(prompts) == (1 if recovery == "timeout" else 2)
         assert "no clean committed change" in result.reason
         return
-    assert len(prompts) == {"immediate": 1, "noop": 2, "dirty": 2, "fallback": 3}[recovery]
-    assert events[-1][1]["committed_change"] is True
+    # A rejected split adds one repair turn and its continuation.
+    assert len(prompts) == {"immediate": 1, "noop": 2, "dirty": 2, "fallback": 3}[recovery] + (0 if expect_pr else 2)
+    first_run = attempts[: len(attempts) - (0 if expect_pr else 2)]
+    assert first_run[-1]["committed_change"] is True
 
     assert "- huge at line 40" in prompts[0]
     assert result.succeeded is expect_pr
@@ -176,7 +188,8 @@ def test_execute_opens_a_pr_only_for_a_substantial_decomposition(tmp_path: Path,
         assert "| Lines in `large.ts` | 1000 | 200 |" in body and "`src/theme.ts` (800 lines)" in body
     else:
         assert created == []
-        assert result.reason == "target only shrank from 1000 to 900 lines (needs at least 25%)"
+        assert result.reason == "target only shrank from 1000 to 900 lines (needs at least 25%) (not repaired after 1 attempt(s))"
+        assert ("repair", {"repair": 1, "repaired": False}) in events
 
 
 def test_planner_uses_the_repository_analyzer_and_its_catalogue_exemptions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

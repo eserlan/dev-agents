@@ -487,7 +487,7 @@ def workflow_mermaid(workflow: str) -> str:
         "release-comms": build_release_comms_workflow,
     }
     try:
-        return cast(str, builders[workflow]().get_graph().draw_mermaid())
+        return cast(str, builders[workflow]().get_graph(xray=True).draw_mermaid())
     except KeyError as error:
         raise ValueError(f"unknown workflow: {workflow}") from error
 
