@@ -497,3 +497,17 @@ def test_workflow_mermaid_rejects_unknown_workflow() -> None:
     assert "collect_issue" in workflow_mermaid("issue-fixer")
     with pytest.raises(ValueError, match="unknown workflow"):
         workflow_mermaid("missing")
+
+
+def test_pr_graphs_draw_the_provider_pass_with_event_node_names() -> None:
+    review = workflow_graph("pr-review")
+    fix = workflow_graph("pr-fixer")
+    review_ids = [node["id"] for node in review["nodes"]]
+    # The node ids are the event node names the PR fixer records, so runs light them up.
+    assert review_ids == ["__start__", "collect_feedback", "remediate", "start_provider", "auditor",
+                          "repair_gate", "fixer", "verify", "finalize", "__end__"]
+    assert [node["id"] for node in fix["nodes"]] == [i for i in review_ids if i not in {"auditor", "repair_gate"}]
+    review_edges = {(edge["source"], edge["target"]) for edge in review["edges"]}
+    assert {("verify", "start_provider"), ("verify", "finalize"), ("repair_gate", "verify")} <= review_edges
+    assert not any("auditor" in (edge["source"], edge["target"]) for edge in fix["edges"])
+    assert "verify[verify] -.-> start_provider[start_provider]" in workflow_mermaid("pr-fixer")

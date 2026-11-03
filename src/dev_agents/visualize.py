@@ -446,22 +446,49 @@ def schedule_report_refresh(project_name: str, project: ProjectConfig) -> None:
         return
 
 
-def _pr_fixer_mermaid() -> str:
-    return """graph TD
-    __start__([START]) --> collect_feedback[collect_feedback]
-    collect_feedback --> remediate[remediate]
-    remediate --> finalize[finalize]
-    finalize --> __end__([END])"""
+def _pr_graph(*, review: bool) -> dict[str, list[dict[str, Any]]]:
+    """The PR fixer or reviewer flow, with remediate's provider pass drawn from its real graph.
+
+    collect_feedback -> remediate -> start_provider -> [auditor -> repair_gate] -> fixer ->
+    verify -> finalize. remediate goes straight to finalize when there is nothing to fix.
+    Fix runs have no auditor or repair_gate.
+    """
+    from dev_agents.pr_fixer.service import PROVIDER_PASS_NODES, build_provider_pass
+
+    inner = build_provider_pass({name: lambda _state: {} for name in PROVIDER_PASS_NODES}).get_graph()
+    hidden = set() if review else {"auditor", "repair_gate"}
+    names = ["collect_feedback", "remediate", *(n for n in PROVIDER_PASS_NODES if n not in hidden), "finalize"]
+    nodes = [
+        {"id": "__start__", "label": "START", "kind": "start"},
+        *({"id": name, "label": name, "kind": "node"} for name in names),
+        {"id": "__end__", "label": "END", "kind": "end"},
+    ]
+    edges = [
+        {"source": "__start__", "target": "collect_feedback", "conditional": False},
+        {"source": "collect_feedback", "target": "remediate", "conditional": False},
+        {"source": "remediate", "target": "finalize", "conditional": True},
+    ]
+    for edge in inner.edges:
+        source = "remediate" if edge.source == "__start__" else str(edge.source)
+        target = "finalize" if edge.target == "__end__" else str(edge.target)
+        if source in hidden or target in hidden:
+            continue
+        edges.append({"source": source, "target": target, "conditional": bool(edge.conditional)})
+    edges.append({"source": "finalize", "target": "__end__", "conditional": False})
+    return {"nodes": nodes, "edges": edges}
 
 
-def _pr_review_mermaid() -> str:
-    return """graph TD
-    __start__([START]) --> collect_feedback[collect_feedback]
-    collect_feedback --> general_review[general_review]
-    general_review --> codex_review[codex_review]
-    codex_review --> remediate[remediate]
-    remediate --> finalize[finalize]
-    finalize --> __end__([END])"""
+def _graph_mermaid(graph: dict[str, list[dict[str, Any]]]) -> str:
+    labels = {node["id"]: node["label"] for node in graph["nodes"]}
+
+    def shape(node_id: str) -> str:
+        return f"{node_id}([{labels[node_id]}])" if node_id in {"__start__", "__end__"} else f"{node_id}[{labels[node_id]}]"
+
+    lines = ["graph TD"]
+    for edge in graph["edges"]:
+        arrow = "-.->" if edge["conditional"] else "-->"
+        lines.append(f"    {shape(edge['source'])} {arrow} {shape(edge['target'])}")
+    return "\n".join(lines)
 
 
 def _issue_fixer_mermaid() -> str:
@@ -474,10 +501,8 @@ def _issue_fixer_mermaid() -> str:
 
 def workflow_mermaid(workflow: str) -> str:
     """Return the current static graph definition for compatibility callers."""
-    if workflow == "pr-fixer":
-        return _pr_fixer_mermaid()
-    if workflow == "pr-review":
-        return _pr_review_mermaid()
+    if workflow in {"pr-fixer", "pr-review"}:
+        return _graph_mermaid(_pr_graph(review=workflow == "pr-review"))
     if workflow == "issue-fixer":
         return _issue_fixer_mermaid()
     builders = {
@@ -494,40 +519,8 @@ def workflow_mermaid(workflow: str) -> str:
 
 def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
     """Return node and edge data suitable for an interactive graph renderer."""
-    if workflow == "pr-fixer":
-        return {
-            "nodes": [
-                {"id": "__start__", "label": "START", "kind": "start"},
-                {"id": "collect_feedback", "label": "collect_feedback", "kind": "node"},
-                {"id": "remediate", "label": "remediate", "kind": "node"},
-                {"id": "finalize", "label": "finalize", "kind": "node"},
-                {"id": "__end__", "label": "END", "kind": "end"},
-            ],
-            "edges": [
-                {"source": "__start__", "target": "collect_feedback", "conditional": False},
-                {"source": "collect_feedback", "target": "remediate", "conditional": False},
-                {"source": "remediate", "target": "finalize", "conditional": False},
-                {"source": "finalize", "target": "__end__", "conditional": False},
-            ],
-        }
-    if workflow == "pr-review":
-        nodes = [
-            {"id": "__start__", "label": "START", "kind": "start"},
-            {"id": "collect_feedback", "label": "collect_feedback", "kind": "node"},
-            {"id": "general_review", "label": "general_review", "kind": "node"},
-            {"id": "codex_review", "label": "codex_review", "kind": "node"},
-            {"id": "remediate", "label": "remediate", "kind": "node"},
-            {"id": "finalize", "label": "finalize", "kind": "node"},
-            {"id": "__end__", "label": "END", "kind": "end"},
-        ]
-        node_ids = [node["id"] for node in nodes]
-        return {
-            "nodes": nodes,
-            "edges": [
-                {"source": source, "target": target, "conditional": False}
-                for source, target in pairwise(node_ids)
-            ],
-        }
+    if workflow in {"pr-fixer", "pr-review"}:
+        return _pr_graph(review=workflow == "pr-review")
     if workflow == "issue-fixer":
         nodes = [
             {"id": "__start__", "label": "START", "kind": "start"},
