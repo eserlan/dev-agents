@@ -17,8 +17,11 @@ from ._shared import (
 )
 
 
-def _review_skill(repo: Path) -> tuple[str, str]:
-    """Load the canonical review skill, with compatibility fallbacks for older repos."""
+def _review_skill(repo: Path, configured: str | None = None) -> tuple[str, str]:
+    """Load the project's review skill: the configured path, else the codex-review candidates."""
+    if configured:
+        path = repo / configured
+        return configured, bundle_markdown(repo, path) if path.is_file() else ""
     for relative_path in REVIEW_SKILL_CANDIDATES:
         path = repo / relative_path
         if path.is_file():
@@ -122,14 +125,15 @@ def _review_prompt(
     review_round: int = 0,
     parent_sha: str | None = None,
     prior_report: dict[str, Any] | None = None,
+    review_skill: str | None = None,
 ) -> str:
     """Build the independent auditor prompt; the auditor never implements its findings."""
     from .audit import audit_json_schema
 
-    skill_relative_path, skill_text = _review_skill(repo)
+    skill_relative_path, skill_text = _review_skill(repo, review_skill)
     if review_round == 0:
         scope = f"""Run both independent lenses: GENERAL DEFECT REVIEW of the actual diff against
-origin/{base_branch} and CODEX-CRYPTICA REVIEW using `{skill_relative_path}` and its bundled guidance.
+origin/{base_branch} and PROJECT-SPECIFIC REVIEW using `{skill_relative_path}` and its bundled guidance.
 Inspect changed code, surrounding callers and the actual execution paths, rather than the author's
 explanation alone. Explicitly record all six adversarial lenses, using not_applicable with evidence
 when a lens does not apply. A passing build or large passing test count is not a clean review."""

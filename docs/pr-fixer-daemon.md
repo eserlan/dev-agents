@@ -155,8 +155,11 @@ for immediate repairs. The old attribution-based handoff settings no longer cont
 With `review_without_copilot: true` (the default), an open, non-draft PR targeting the configured
 base branch is checked for a submitted Copilot review. If none exists, the daemon runs an independent
 read-only auditor, even when GitHub has not reported any checks yet. The auditor inspects general
-defects and the target repository's canonical `.agent/skills/codex-review/SKILL.md` guidance (with
-compatibility fallbacks for older repositories). Only valid, evidence-backed findings are handed to
+defects and the target repository's project-specific review skill: the repository-relative
+`review_skill` path when configured (for example `.agent/skills/bear-skill/SKILL.md`), otherwise
+the canonical `.agent/skills/codex-review/SKILL.md` (with compatibility fallbacks for older
+repositories). A configured path that does not exist is not replaced by a fallback; the auditor
+runs the general lenses only. Only valid, evidence-backed findings are handed to
 a separate fixer for repairs, tests, commits and pushes in the isolated worktree. A clean audit runs
 no fixer; malformed or incomplete audits cannot qualify as clean. Auto-merge requires
 at least one completed successful check. A review chain allows one full initial review and, only

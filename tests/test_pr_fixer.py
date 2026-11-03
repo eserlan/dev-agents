@@ -176,6 +176,38 @@ def test_review_skill_prefers_canonical_path(tmp_path: Path) -> None:
     )
 
 
+def test_configured_review_skill_overrides_candidates(tmp_path: Path) -> None:
+    candidate = tmp_path / ".agent/skills/codex-review/SKILL.md"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("codex review skill", encoding="utf-8")
+    configured = tmp_path / ".agent/skills/bear-skill/SKILL.md"
+    configured.parent.mkdir(parents=True)
+    configured.write_text("bear review skill", encoding="utf-8")
+
+    assert _review_skill(tmp_path, ".agent/skills/bear-skill/SKILL.md") == (
+        ".agent/skills/bear-skill/SKILL.md",
+        "bear review skill",
+    )
+    prompt = _review_prompt(
+        tmp_path, 42, {}, "main", [], review_skill=".agent/skills/bear-skill/SKILL.md"
+    )
+    assert "PROJECT-SPECIFIC REVIEW using `.agent/skills/bear-skill/SKILL.md`" in prompt
+    assert "bear review skill" in prompt
+    assert "codex review skill" not in prompt
+    assert "CODEX-CRYPTICA" not in prompt
+
+
+def test_missing_configured_review_skill_does_not_fall_back(tmp_path: Path) -> None:
+    candidate = tmp_path / ".agent/skills/codex-review/SKILL.md"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("codex review skill", encoding="utf-8")
+
+    assert _review_skill(tmp_path, ".agent/skills/bear-skill/SKILL.md") == (
+        ".agent/skills/bear-skill/SKILL.md",
+        "",
+    )
+
+
 def test_review_prompt_requires_lifecycle_comments(tmp_path: Path) -> None:
     prompt = _review_prompt(
         tmp_path,

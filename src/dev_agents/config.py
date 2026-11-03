@@ -228,6 +228,9 @@ class PrFixerConfig(BaseModel):
     timeout_minutes: int = 20
     reconcile_interval_seconds: int = 300
     review_without_copilot: bool = True
+    # Repository-relative path of the project-specific review skill. Omit to use the first
+    # existing codex-review skill path (REVIEW_SKILL_CANDIDATES).
+    review_skill: str | None = None
     auto_merge: bool = False
     auto_merge_issue_fixes_only: bool = False
     log_retention_days: int = 30
