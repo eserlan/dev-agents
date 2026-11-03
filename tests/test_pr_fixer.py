@@ -1521,6 +1521,7 @@ def test_fix_announces_pickup_before_agent_only_for_actionable_claim(
         assert published[0][3] == "fix-started"
         assert "picked up PR #42" in published[0][4]
         assert "abc123" in published[0][4]
+        assert "Failing check `failed`" in published[0][4]
         return True, {}
 
     monkeypatch.setattr(service, "_fix", fake_fix)
@@ -1687,3 +1688,22 @@ def test_fix_prompt_skips_validation_when_nothing_changes(tmp_path: Path) -> Non
     prompt = _prompt(tmp_path, 42, ["check:abc:deploy:FAILURE"], "staging", [])
     assert "Validate only what you change." in prompt
     assert "already passed on CI for this same head" in prompt
+
+
+def test_fix_started_lists_each_feedback_item() -> None:
+    from dev_agents.pr_fixer.comments import _feedback_items_markdown
+
+    meta = {
+        "headRefOid": "abc",
+        "baseRefName": "staging",
+        "url": "https://github.com/o/r/pull/7",
+        "checks": [{"workflow": "CI", "name": "Test", "state": "FAILURE", "link": "https://ci/1"}],
+        "reviews": [{"id": "R1", "author": {"login": "octo"}, "state": "CHANGES_REQUESTED"}],
+    }
+    keys = ["check:abc:CI:Test:FAILURE", "comment:99", "review:R1", "conflict:abc"]
+    assert _feedback_items_markdown(keys, meta).splitlines() == [
+        "- Failing check **CI / Test** ([log](https://ci/1))",
+        "- [Unresolved review thread](https://github.com/o/r/pull/7#discussion_r99)",
+        "- Changes requested by `octo`",
+        "- Merge conflict with `staging`",
+    ]

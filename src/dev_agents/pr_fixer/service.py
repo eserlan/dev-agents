@@ -43,6 +43,7 @@ from .claims import repair_claim
 from .comments import (
     _auto_pause_body,
     _external_agent_pause_body,
+    _feedback_items_markdown,
     _fix_summary_body,
     _publish_fix_summary,
     _review_completed_body,
@@ -823,8 +824,10 @@ class PrFixerService:
                 f"""<!-- dev-agents:pr-fix-started run={state['run_id']} -->
 ### 🤖 Dev-agents fix started
 
-Dev-agents has picked up PR #{number} and is working on {len(unseen)} actionable feedback item(s),
-including any failing checks. The agent will investigate, make fixes, and run validation.
+Dev-agents has picked up PR #{number} and is working on {len(unseen)} actionable feedback item(s).
+The agent will investigate, make fixes, and run validation.
+
+{_feedback_items_markdown(unseen, state['meta'])}
 
 - PR head: `{state['meta'].get('headRefOid', 'unknown')}`
 - Attempt: {state.get('attempt', 1)}

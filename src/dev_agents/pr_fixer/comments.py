@@ -51,6 +51,38 @@ def _report_line(report_url: str | None) -> str:
     return f"- Report: [Open this run in dev-agents report]({report_url})\n" if report_url else ""
 
 
+def _feedback_items_markdown(keys: list[str], meta: dict[str, Any]) -> str:
+    """List the feedback a fix run picked up, one line per item, linked where GitHub allows."""
+    pr_url = str(meta.get("url") or "")
+    checks = {
+        f"check:{meta.get('headRefOid')}:{check.get('workflow', '')}:{check.get('name')}:{check.get('state')}": check
+        for check in meta.get("checks", [])
+    }
+    reviews = {str(review.get("id")): review for review in meta.get("reviews", [])}
+    lines = []
+    for key in keys:
+        kind, _, rest = key.partition(":")
+        if kind == "check":
+            check = checks.get(key)
+            if check:
+                name = " / ".join(part for part in (check.get("workflow"), check.get("name")) if part)
+                link = check.get("link")
+                lines.append(f"- Failing check **{name}**" + (f" ([log]({link}))" if link else ""))
+            else:
+                lines.append(f"- Failing check `{rest.split(':', 1)[-1]}`")
+        elif kind == "comment":
+            link = f"{pr_url}#discussion_r{rest}" if pr_url else ""
+            lines.append(f"- [Unresolved review thread]({link})" if link else f"- Unresolved review thread `{rest}`")
+        elif kind == "review":
+            author = (reviews.get(rest, {}).get("author") or {}).get("login")
+            lines.append(f"- Changes requested by `{author}`" if author else "- Change-request review")
+        elif kind == "conflict":
+            lines.append(f"- Merge conflict with `{meta.get('baseRefName') or 'the base branch'}`")
+        else:
+            lines.append(f"- `{key}`")
+    return "\n".join(lines)
+
+
 def _review_started_body(
     number: int,
     run_id: str,
