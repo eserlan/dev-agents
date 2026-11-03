@@ -129,6 +129,31 @@ def build_provider_pass(nodes: Mapping[str, Any]) -> Any:
     return graph.compile()
 
 
+def _interrupted_audit(previous: Any, head_sha: str, review_round: int | None) -> dict[str, Any]:
+    """The finished audit of a review run that a daemon restart cut off, to resume from.
+
+    Only a run marked interrupted at startup (its worker process was gone) qualifies, and only
+    when its audit completed for this same head and review round. Everything after the audit
+    (repair gate, fixer, verify) runs again; the audit, the slow read-only step, does not.
+    """
+    if previous is None or previous.status != "failed" or not previous.metadata.get("interrupted"):
+        return {}
+    report = previous.metadata.get("audit_report")
+    telemetry = previous.metadata.get("audit_telemetry") or {}
+    if (
+        not report
+        or telemetry.get("verdict") in {None, "failed"}
+        or telemetry.get("reviewed_head_sha") != head_sha
+        or telemetry.get("review_round") != (review_round or 0)
+    ):
+        return {}
+    resumed = {"audit_report": report, "audit_telemetry": telemetry, "resume_interrupted_audit": True}
+    # A fixer the restart cut off still counts against the PR's repair budget.
+    if "review_repair_attempts" in previous.metadata:
+        resumed["review_repair_attempts"] = previous.metadata["review_repair_attempts"]
+    return resumed
+
+
 class PrFixerRunState(TypedDict, total=False):
     """State carried through one webhook/reconciliation PR-fix run."""
 
@@ -609,6 +634,11 @@ class PrFixerService:
         )
         previous = self.state.get_run(workflow, run_id)
         pending = previous.metadata if previous and previous.metadata.get("repair_pending") else {}
+        resumed = (
+            _interrupted_audit(previous, head_sha, review_plan["round"] if review_plan else 0)
+            if review_only and not pending
+            else {}
+        )
         if pending:
             now = time.time()
             opened = float(pending["repair_opened_at"])
@@ -646,6 +676,7 @@ class PrFixerService:
             run_id,
             metadata={
                 **pending,
+                **resumed,
                 "pull_request": number,
                 "head_sha": head_sha,
                 "feedback": keys,
@@ -1420,7 +1451,10 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         return {"result": AgentResult(1, timed_out)}
 
                     saved = self.state.get_run("pr-review", run_id) if run_id else None
-                    resuming = bool(saved and saved.metadata.get("repair_pending"))
+                    # A run waiting out its claim window, or one a restart cut off after its
+                    # audit, reuses the saved audit instead of auditing the same head again.
+                    resuming = bool(saved and (
+                        saved.metadata.get("repair_pending") or saved.metadata.get("resume_interrupted_audit")))
                     if resuming and saved:
                         audit_path.write_text(json.dumps(saved.metadata["audit_report"]))
                         try:
@@ -1429,9 +1463,12 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             # Legacy pending reports lack contract evidence. Re-audit
                             # instead of retrying their invalid repair forever.
                             resuming = False
-                            self.state.update_run("pr-review", saved.run_id, metadata={"repair_pending": False})
+                            self.state.update_run("pr-review", saved.run_id, metadata={
+                                "repair_pending": False, "resume_interrupted_audit": False})
                     if resuming:
                         audit_result = AgentResult(0, False)
+                        record("auditor", "audit_resumed", reason=(
+                            "claim_window" if saved and saved.metadata.get("repair_pending") else "interrupted"))
                     else:
                         audit_result = run_agent(
                             provider, state["prompt"], cwd=worktree,

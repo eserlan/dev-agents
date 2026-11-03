@@ -110,8 +110,12 @@ the default is `~/.local/state/dev-agents/<project>/pr-fixer-state.db`. SQLite W
 Run claims record the owning process identity. On daemon startup, claims whose owner exited are
 marked failed and become retryable; periodic issue and PR reconciliation then resumes the work.
 Issue retries reuse an interrupted attempt's registered worktree when it is still available, so
-uncommitted edits survive a service restart. Older claims without process identity retain the
-one-hour stale-run fallback.
+uncommitted edits survive a service restart. A PR review whose audit had finished before the
+restart resumes from that audit when it is retried for the same head and round. The repair gate,
+fixer and verification run again, the audit does not, and a cut-off fixer still counts against
+the PR's repair budget. Older claims without process identity retain the one-hour stale-run
+fallback. There is no LangGraph checkpointer: restarts interrupt about 0.1% of PR runs, and the
+audit is the only slow step whose result is self-contained.
 
 The first PR-fixer run imports the previous `pr-fixer-state.json` file when it exists. The legacy file is
 left in place as a rollback copy; new writes use SQLite. A configured path ending in `.json` is
