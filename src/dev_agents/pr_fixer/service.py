@@ -356,6 +356,11 @@ class PrFixerService:
             return {"model": model or fallback, "effort": effort}
         return {"model": self.config.model or CODEX_MODEL, "effort": self.config.reasoning_effort}
 
+    def _review_pass_name(self) -> str:
+        """Name of the project-specific review pass: its skill directory, e.g. codex-review."""
+        skill_path, _ = _review_skill(self.project.repo, self.config.review_skill)
+        return Path(skill_path).parent.name
+
     def _providers(self) -> list[str]:
         fallback = self.config.fallback_provider
         return [PR_FIX_PROVIDER, *([fallback] if fallback and fallback != PR_FIX_PROVIDER else [])]
@@ -681,7 +686,7 @@ class PrFixerService:
             # Claiming now would only fail, count an attempt and post a failure comment.
             _log(f"quota-wait pr={number} until={blocked_until.isoformat()}")
             return {"meta": meta, "keys": keys, "skip": True}
-        review_skill_path, _ = _review_skill(self.project.repo)
+        review_skill_path, _ = _review_skill(self.project.repo, self.config.review_skill)
         claim = self.state.claim_run(
             workflow,
             run_id,
@@ -717,7 +722,7 @@ class PrFixerService:
                 "review_started" if review_only else "feedback_collected",
                 metadata=(
                     {
-                        "passes": ["general", "codex-review"]
+                        "passes": ["general", self._review_pass_name()]
                         if review_plan and review_plan["round"] == 0
                         else ["targeted-post-fix"],
                         "copilot_reviewed": False,
@@ -1027,7 +1032,7 @@ A follow-up comment will report the outcome.
                 return self._finish_superseded_review(state, new_sha)
             fix_pushed = agent_pushed_fix
             review_passes = (
-                ["general", "codex-review"]
+                ["general", self._review_pass_name()]
                 if review_round == 0
                 else ["targeted-post-fix"]
             )
@@ -1429,6 +1434,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                             review_round=review_round,
                             parent_sha=parent_sha,
                             prior_report=prior_report,
+                            review_skill=self.config.review_skill,
                         )
                         if review_only
                         else _prompt(worktree, number, keys, base, conflicts)
