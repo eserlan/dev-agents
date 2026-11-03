@@ -158,6 +158,19 @@ def test_an_oversized_change_is_not_pushed(sandbox, monkeypatch: pytest.MonkeyPa
     assert git(repo, "ls-remote", "origin", "refs/heads/bolt/*") == ""
 
 
+def test_a_push_rejected_by_a_hook_fails_without_a_pr(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts, _installs = sandbox
+    hook = Path(git(repo, "rev-parse", "--absolute-git-dir")) / "hooks/pre-push"
+    hook.write_text("#!/bin/sh\necho 'UI pattern check failed.' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Tidy"))
+
+    assert not result.succeeded and not created and result.pull_request_url is None
+    assert result.reason and result.reason.startswith("push rejected:") and "UI pattern check failed." in result.reason
+    assert "Never bypass git hooks" in prompts[0]
+
+
 def test_a_sweep_waits_while_the_persona_has_an_open_pr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sweep, "open_pull_request_with_prefix", lambda _repo, prefix: f"https://example.test/{prefix}")
     monkeypatch.setattr(committing_agent, "run_agent", lambda *_a, **_k: pytest.fail("agent must not run"))
