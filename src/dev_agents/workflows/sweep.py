@@ -8,6 +8,9 @@ the target repository, `<personas_dir>/<name>.md`, read from the freshly fetched
     journal: .agents/journal/bolt.md
     max_files: 6             # changed files, not counting the journal
     max_changed_lines: 150   # added + deleted lines, not counting the journal
+    timeout_minutes: 60      # optional: overrides the configured per-provider timeout
+    failing_workflow: daily-e2e.yml  # optional: only run when this workflow's latest run on
+                                     # the base failed, and hand its failures to the agent
     ---
     <what the persona looks for and how it judges a change worth making>
 
@@ -18,6 +21,7 @@ opens its PR against the base. It does nothing while one of the persona's PRs is
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -53,6 +57,8 @@ class Persona:
     max_files: int
     max_changed_lines: int
     instructions: str
+    timeout_minutes: int | None = None
+    failing_workflow: str | None = None
 
     @property
     def branch_prefix(self) -> str:
@@ -103,6 +109,8 @@ def parse_persona(name: str, text: str) -> Persona:
             max_files=int(meta.get("max_files", 6)),
             max_changed_lines=int(meta.get("max_changed_lines", 150)),
             instructions=instructions.strip(),
+            timeout_minutes=int(meta["timeout_minutes"]) if meta.get("timeout_minutes") else None,
+            failing_workflow=str(meta["failing_workflow"]) if meta.get("failing_workflow") else None,
         )
     except (yaml.YAMLError, KeyError, TypeError, ValueError, AttributeError) as error:
         raise PersonaError(f"persona {name!r} has invalid front matter: {error}") from error
@@ -141,14 +149,77 @@ def recent_persona_pull_requests(repo: Path, persona: Persona, limit: int) -> li
     return titles[:limit]
 
 
-def build_sweep_prompt(persona: Persona, branch: str, base_branch: str, recent: list[str], noop_path: Path) -> str:
+_LOG_PREFIX = re.compile(r"^[^\t]*\t[^\t]*\t(?:\d{4}-\d\d-\d\dT\S+ )?")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_TOTAL = re.compile(r"^ {2}(\d+) (failed|flaky|skipped|passed|did not run|interrupted)\b")
+MAX_FAILURE_LINES = 60
+
+
+def summarize_failed_log(log: str) -> str:
+    """Pull the Playwright-style totals and failed test titles out of `gh run view --log-failed`.
+
+    Falls back to the log's last lines when there is no recognisable summary.
+    """
+    lines = [_ANSI.sub("", _LOG_PREFIX.sub("", line)).rstrip() for line in log.splitlines()]
+    summary: list[str] = []
+    section: str | None = None
+    for line in lines:
+        if total := _TOTAL.match(line):
+            section = total.group(2)
+            summary.append(line.strip())
+        elif section is None:
+            continue
+        elif line.startswith("    ") and line.strip():
+            entry = f"  - {line.strip()}"
+            if section == "failed" and entry not in summary and len(summary) < MAX_FAILURE_LINES:
+                summary.append(entry)
+        else:
+            break  # the first summary block has ended
+    if summary:
+        return "\n".join(summary)
+    return "\n".join(line for line in lines[-80:] if line.strip())
+
+
+def failing_workflow_evidence(repo: Path, workflow: str, base_branch: str) -> tuple[str | None, str]:
+    """Return (why to skip, evidence). Evidence describes the latest failed run on the base."""
+    try:
+        runs = gh_json(
+            repo, "run", "list", "--workflow", workflow, "--branch", base_branch, "--limit", "1",
+            "--json", "databaseId,status,conclusion,url,createdAt",
+        )
+    except (GitHubError, TypeError) as error:
+        return f"could not read {workflow} runs: {error}", ""
+    if not isinstance(runs, list) or not runs:
+        return f"no {workflow} runs on {base_branch}", ""
+    run = runs[0]
+    if run.get("status") != "completed":
+        return f"latest {workflow} run on {base_branch} has not finished", ""
+    if run.get("conclusion") != "failure":
+        return f"latest {workflow} run on {base_branch} concluded {run.get('conclusion')}", ""
+    run_id = str(run.get("databaseId"))
+    try:
+        log = _gh(repo, "run", "view", run_id, "--log-failed", timeout=300)
+    except RuntimeError as error:
+        log = f"(could not download the failed log: {error})"
+    return None, (
+        f"The latest `{workflow}` run on `{base_branch}` failed: {run.get('url')} "
+        f"(started {run.get('createdAt')}).\n"
+        f"Full failure output: `gh run view {run_id} --log-failed`.\n\n"
+        f"Summary of that run:\n{summarize_failed_log(log)}"
+    )
+
+
+def build_sweep_prompt(
+    persona: Persona, branch: str, base_branch: str, recent: list[str], noop_path: Path, evidence: str = ""
+) -> str:
     history = "\n".join(f"- {title}" for title in recent) or "- (none yet)"
+    evidence_section = f"\n## Failing workflow\n\n{evidence}\n" if evidence else ""
     return f"""You are {persona.title}, running a scheduled improvement sweep on this repository.
 
 CURRENT BRANCH: {branch} (branched from {base_branch})
 
 {persona.instructions}
-
+{evidence_section}
 Before choosing a change:
 - Read the repository's agent instructions (AGENTS.md / CLAUDE.md) and follow them.
 - Read your journal at `{persona.journal}` (it may not exist yet) for earlier lessons.
@@ -226,6 +297,12 @@ def _run_sweep_impl(
         # Not a failure: the next change waits until the previous one has merged or closed.
         return SweepRunResult(persona.name, None, None, False, True, f"waiting for open {persona.name} PR {open_pull}")
 
+    evidence = ""
+    if persona.failing_workflow:
+        skip, evidence = failing_workflow_evidence(repo, persona.failing_workflow, base_branch)
+        if skip:
+            # Nothing to repair: do not start an agent.
+            return SweepRunResult(persona.name, None, None, False, True, f"nothing to fix: {skip}", noop=True)
     recent = recent_persona_pull_requests(repo, persona, recent_limit)
     with branch_worktree(repo, base_branch, branch, prefix=f"sweep-{persona.name}-") as worktree:
         noop_path = Path(_git(worktree, "rev-parse", "--path-format=absolute", "--git-path", NOOP_MARKER))
@@ -240,10 +317,11 @@ def _run_sweep_impl(
             )
 
         accepted, attempts = run_committing_agent(
-            worktree, base_branch, build_sweep_prompt(persona, branch, base_branch, recent, noop_path),
+            worktree, base_branch, build_sweep_prompt(persona, branch, base_branch, recent, noop_path, evidence),
             providers=providers or ["codex"], task=f"{persona.name} improvement",
             log_path=log_path or repo / ".dev-agents" / "sweep.log",
-            timeout_seconds=timeout_seconds, model=model, reasoning_effort=reasoning_effort,
+            timeout_seconds=persona.timeout_minutes * 60 if persona.timeout_minutes else timeout_seconds,
+            model=model, reasoning_effort=reasoning_effort,
             fallback_model=fallback_model, fallback_reasoning_effort=fallback_reasoning_effort,
             finished=finished, after_reset=lambda: install_dependencies(worktree), on_event=on_event,
         )

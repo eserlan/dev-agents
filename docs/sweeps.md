@@ -16,6 +16,8 @@ title: "⚡ Bolt"                      # PR title prefix
 journal: .agents/journal/bolt.md     # lessons file the agent reads and appends to
 max_files: 6                         # changed files, journal excluded
 max_changed_lines: 150               # added + deleted lines, journal excluded
+timeout_minutes: 60                  # optional: per-provider timeout for this persona
+failing_workflow: daily-e2e.yml      # optional: run only when this workflow's latest run failed
 ---
 What this persona looks for, what counts as worth a PR, and what to avoid.
 ```
@@ -28,16 +30,20 @@ What this persona looks for, what counts as worth a PR, and what to avoid.
 1. Load the persona from `origin/<base>`.
 2. If one of the persona's PRs (head branch `<name>/…`) is still open, record "waiting" and stop.
    Personas never stack PRs.
-3. Collect the titles of the persona's recent PRs, including the earlier Jules ones (matched by
+3. With `failing_workflow`, check that workflow's latest run on the base. If it passed, was
+   cancelled or is still running, record "nothing to fix" without starting an agent. If it failed,
+   add the run link and its failure summary (Playwright totals and failed test titles, or the log
+   tail) to the prompt. Vigil uses this to repair the daily E2E run.
+4. Collect the titles of the persona's recent PRs, including the earlier Jules ones (matched by
    title prefix), and put them in the prompt so it does not redo them.
-4. Branch `<name>/sweep-<timestamp>` from `origin/<base>` in a throwaway worktree. The base is
+5. Branch `<name>/sweep-<timestamp>` from `origin/<base>` in a throwaway worktree. The base is
    never merged back in, which avoids the drifting Jules branches.
-5. The agent makes one focused change and a single commit. The commit subject is the PR title
+6. The agent makes one focused change and a single commit. The commit subject is the PR title
    and the commit body is the PR description. If nothing is worth changing, it writes a reason to
    a marker file instead. That is a successful no-op and opens no PR.
-6. The diff must stay within `max_files` and `max_changed_lines`, journal excluded, or nothing
+7. The diff must stay within `max_files` and `max_changed_lines`, journal excluded, or nothing
    is pushed.
-7. Push and open the PR against the base (always `staging` by default, never `main`). After that
+8. Push and open the PR against the base (always `staging` by default, never `main`). After that
    the normal review, fix and auto-merge chain takes over.
 
 Provider fallback, continuations and per-provider deadlines are shared with degodify

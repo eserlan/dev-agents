@@ -178,3 +178,78 @@ def test_cli_dry_run_loads_the_persona_without_mutating(tmp_path: Path, capsys: 
     output = json.loads(capsys.readouterr().out)
     assert output["dryRun"] is True and output["persona"] == "bolt" and output["branch"].startswith("bolt/sweep-")
     assert git(repo, "branch", "--list", "bolt/*") == ""
+
+
+FAILED_LOG_LINES = [
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:40:00.0Z   1) [chromium] › tests/a.spec.ts:3:1 › A › first attempt noise",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:43.59Z   2 failed",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:43.59Z     [chromium] › tests/a.spec.ts:3:1 › A › opens the codex",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:43.59Z     [chromium] › tests/b.spec.ts:9:1 › B › switches vault",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:43.59Z   1 flaky",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:43.59Z     [chromium] › tests/c.spec.ts:1:1 › C › flaky one",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:43.59Z   \x1b[32m40 passed\x1b[39m (41.7m)",
+    "Run E2E Tests\tUNKNOWN STEP\t2026-11-02T03:53:44.06Z ##[notice]  2 failed",
+    "Run E2E Tests\tUNKNOWN STEP\t    [chromium] › tests/a.spec.ts:3:1 › A › opens the codex",
+]
+FAILED_LOG = "\n".join(FAILED_LOG_LINES)
+
+
+def test_failed_log_summary_keeps_totals_and_failed_titles_only() -> None:
+    assert sweep.summarize_failed_log(FAILED_LOG).splitlines() == [
+        "2 failed",
+        "  - [chromium] › tests/a.spec.ts:3:1 › A › opens the codex",
+        "  - [chromium] › tests/b.spec.ts:9:1 › B › switches vault",
+        "1 flaky",
+        "40 passed (41.7m)",
+    ]
+    assert sweep.summarize_failed_log("just\nsome\nlines") == "just\nsome\nlines"
+
+
+VIGIL_FILE = """---
+title: "🛡️ Vigil"
+timeout_minutes: 75
+failing_workflow: daily-e2e.yml
+---
+Fix one root cause of the failing E2E tests.
+"""
+
+
+@pytest.mark.parametrize(("runs", "reason"), [
+    ([], "no daily-e2e.yml runs on staging"),
+    ([{"status": "in_progress", "conclusion": None}], "latest daily-e2e.yml run on staging has not finished"),
+    ([{"status": "completed", "conclusion": "success"}], "latest daily-e2e.yml run on staging concluded success"),
+    ([{"status": "completed", "conclusion": "cancelled"}], "latest daily-e2e.yml run on staging concluded cancelled"),
+])
+def test_a_green_or_unfinished_workflow_skips_the_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runs, reason) -> None:
+    vigil = parse_persona("vigil", VIGIL_FILE)
+    assert (vigil.timeout_minutes, vigil.failing_workflow) == (75, "daily-e2e.yml")
+    monkeypatch.setattr(sweep, "open_pull_request_with_prefix", lambda _repo, _prefix: None)
+    monkeypatch.setattr(sweep, "gh_json", lambda *_args: runs)
+    monkeypatch.setattr(committing_agent, "run_agent", lambda *_a, **_k: pytest.fail("agent must not run"))
+
+    result = sweep._run_sweep_impl(tmp_path, vigil, dry_run=False)
+
+    assert result.succeeded and result.noop and result.reason == f"nothing to fix: {reason}"
+
+
+def test_a_failed_workflow_hands_its_failures_and_timeout_to_the_agent(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts, _installs = sandbox
+    vigil = parse_persona("vigil", VIGIL_FILE)
+    run = {"databaseId": 77, "status": "completed", "conclusion": "failure", "url": "https://example.test/run/77", "createdAt": "2026-11-02T03:11:24Z"}
+    monkeypatch.setattr(sweep, "gh_json", lambda _repo, *args: [run] if args[:2] == ("run", "list") else [])
+    monkeypatch.setattr(sweep, "_gh", lambda _repo, *args, **_kwargs: FAILED_LOG if args[:2] == ("run", "view") else created.append(args) or "https://example.test/pr/10")
+    budgets: list[float] = []
+
+    def agent(_name: str, prompt: str, **kwargs) -> AgentResult:
+        prompts.append(prompt)
+        budgets.append(kwargs["timeout_seconds"])
+        commit(kwargs["cwd"], "Disambiguate the Open Codex link\n\nFixes 2 failing specs.", journal=False)
+        return AgentResult(0, False)
+
+    monkeypatch.setattr(committing_agent, "run_agent", agent)
+    result = sweep._run_sweep_impl(repo, vigil, dry_run=False, log_path=repo.parent / "log", timeout_seconds=60)
+
+    assert result.succeeded and result.pull_request_url == "https://example.test/pr/10"
+    assert "https://example.test/run/77" in prompts[0] and "gh run view 77 --log-failed" in prompts[0]
+    assert "  - [chromium] › tests/b.spec.ts:9:1 › B › switches vault" in prompts[0]
+    assert budgets[0] > 60  # the persona's 75 minutes, not the configured minute
