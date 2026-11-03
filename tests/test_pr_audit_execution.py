@@ -134,6 +134,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
     assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop", "claude_attributed", "disputed"} else ["auditor"])
     if mode in {"disputed", "budget", "verification_only"}:
         assert report["review_halted"]
+        if mode in {"budget", "verification_only"}:
+            halted = [event for event in service.state.list_run_events("pr-review", run_id) if event.node == "repair_gate"]
+            assert [(event.event, event.status) for event in halted] == [("repair_budget_exhausted", "failed")]
         assert git(origin, "rev-parse", "feature") == head
         service._finalize({"number": 42, "claimed": True, "workflow": "pr-review",
                            "run_id": run_id, "review_only": True, "report": report})
@@ -156,7 +159,11 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert report["review_report"]["findings"][0]["evidence"] == "The new branch bypasses validation"
         assert service.state.get_run("pr-review", run_id).metadata["audit_telemetry"]["findings_count"] == 1
         assert service.state.get_run("pr-review", run_id).metadata["fixer_telemetry"]["returncode"] == 0
-        assert [event.node for event in service.state.list_run_events("pr-review", run_id)][-3:] == ["auditor", "fixer", "fixer"]
+        events = service.state.list_run_events("pr-review", run_id)
+        assert [event.node for event in events][-6:] == [
+            "start_provider", "auditor", "repair_gate", "fixer", "fixer", "verify"]
+        assert events[-4].metadata == {"repairs_used": 1, "repair_budget": 2}
+        assert (events[-1].event, events[-1].status) == ("accepted", "completed")
         phases = [phase for phase, _body in comments]
         assert phases.index("review-findings") < phases.index("review-fixes-started")
         findings_body = dict(comments)["review-findings"]

@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock
@@ -80,6 +81,52 @@ class _ProviderPassState(TypedDict, total=False):
     # Set by the step that ends the pass; verify then decides whether it is accepted.
     result: AgentResult | None
     accepted: str
+    review_only: bool
+    # The PR's repair budget, counted across all runs and heads in the state database.
+    repairs_used: int
+
+
+#: Nodes of one provider pass, in order. "auditor" and "fixer" match the event node names
+#: review runs have always recorded, so the flow report can light them up.
+PROVIDER_PASS_NODES = ("start_provider", "auditor", "repair_gate", "fixer", "verify")
+#: Fixer starts allowed per PR across all review runs and heads.
+MAX_REVIEW_REPAIRS = 2
+
+
+def _after_start(state: _ProviderPassState) -> str:
+    if state.get("skipped"):
+        return "verify"
+    return "auditor" if state.get("review_only") else "fixer"
+
+
+def _ends_pass(next_node: str) -> Callable[[_ProviderPassState], str]:
+    # A step that set a result ended the pass early; verify decides what it means.
+    return lambda state: "verify" if state.get("result") is not None else next_node
+
+
+def _after_verify(state: _ProviderPassState) -> str:
+    if state.get("accepted") or state.get("index", 0) >= len(state["providers"]):
+        return END
+    return "start_provider"
+
+
+def build_provider_pass(nodes: Mapping[str, Any]) -> Any:
+    """Compile one provider pass of a PR fix or review run from its node functions.
+
+    start_provider -> [auditor -> repair_gate] -> fixer -> verify, and verify back to
+    start_provider for the fallback provider. Review runs take the auditor path. The flow
+    report builds the same graph with stub nodes to draw it.
+    """
+    graph = StateGraph(_ProviderPassState)
+    for name in PROVIDER_PASS_NODES:
+        graph.add_node(name, nodes[name])
+    graph.add_edge(START, "start_provider")
+    graph.add_conditional_edges("start_provider", _after_start, ["auditor", "fixer", "verify"])
+    graph.add_conditional_edges("auditor", _ends_pass("repair_gate"), ["repair_gate", "verify"])
+    graph.add_conditional_edges("repair_gate", _ends_pass("fixer"), ["fixer", "verify"])
+    graph.add_edge("fixer", "verify")
+    graph.add_conditional_edges("verify", _after_verify, ["start_provider", END])
+    return graph.compile()
 
 
 class PrFixerRunState(TypedDict, total=False):
@@ -1275,9 +1322,16 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         _pkg._run(worktree, "git", "status", "--porcelain", check=False),
                     )
 
-                # One provider pass is a graph: start_provider -> [audit -> repair_gate] ->
+                pass_workflow = "pr-review" if review_only else "pr-fixer"
+
+                def record(node: str, event: str, *, status: str = "completed", **metadata: Any) -> None:
+                    # Node events let the flow report show which way the pass went.
+                    if run_id and self.state.get_run(pass_workflow, run_id):
+                        self.state.record_event(pass_workflow, run_id, node, event, status=status, metadata=metadata)
+
+                # One provider pass is a graph: start_provider -> [auditor -> repair_gate] ->
                 # fixer -> verify, with verify looping back to start_provider for the
-                # fallback. Review runs audit first; an audit or gate that ends the pass early
+                # fallback (see build_provider_pass). Review runs audit first; an audit or gate that ends the pass early
                 # goes straight to verify with its result. Mutable run facts (report,
                 # superseded_by, fixer_started) stay in this scope, shared by the nodes.
                 def on_progress(elapsed_seconds: int) -> None:
@@ -1308,6 +1362,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         touched = bool(before_codex) and worktree_snapshot() != before_codex[0]
                         if previous is not None and (previous.timed_out or touched) or superseded_by:
                             _log(f"fallback-skipped pr={number} provider={provider}")
+                            record("start_provider", "fallback_skipped", status="skipped", provider=provider,
+                                   codex_timed_out=bool(previous and previous.timed_out), codex_touched=touched,
+                                   superseded=bool(superseded_by))
                             return {"provider": provider, "skipped": True,
                                     "result": AgentResult(1, previous.timed_out if previous else False)}
                         _log(f"fallback-start pr={number} provider={provider}")
@@ -1333,6 +1390,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         else _prompt(worktree, number, keys, base, conflicts)
                     )
                     _log(f"agent-start pr={number} provider={provider} log={log}")
+                    record("start_provider", "provider_started", provider=provider, model=model, effort=effort)
                     return {
                         "provider": provider, "skipped": False, "model": model, "effort": effort,
                         "prompt": prompt, "deadline": time.monotonic() + self.config.timeout_minutes * 60,
@@ -1458,6 +1516,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                     if (original_head and latest_head != original_head) or (cancellation and cancellation.is_set()):
                         if latest_head and latest_head != original_head:
                             superseded_by.append(latest_head)
+                        record("repair_gate", "repair_not_started", status="skipped",
+                               superseded_by=latest_head if latest_head != original_head else None,
+                               cancelled=bool(cancellation and cancellation.is_set()))
                         return {"result": AgentResult(1, False)}
                     # Count writer starts across all heads/chains of this PR, including
                     # failed attempts. Bot pushes and retries cannot reset the budget.
@@ -1466,13 +1527,16 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
                         if run.metadata.get("pull_request") == number
                     )
-                    if repairs >= 2 or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
+                    if repairs >= MAX_REVIEW_REPAIRS or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
                         report["review_halted"] = "two repair attempts exhausted; unresolved findings retained"
-                        return {"result": AgentResult(1, False)}
+                        record("repair_gate", "repair_budget_exhausted", status="failed",
+                               repairs_used=repairs, repair_budget=MAX_REVIEW_REPAIRS, review_round=review_round)
+                        return {"result": AgentResult(1, False), "repairs_used": repairs}
                     current = self.state.get_run("pr-review", run_id) if run_id else None
                     if current is not None and run_id is not None:
                         attempts = int(current.metadata.get("review_repair_attempts", 0))
                         self.state.update_run("pr-review", run_id, metadata={"review_repair_attempts": attempts + 1})
+                    record("repair_gate", "repair_started", repairs_used=repairs + 1, repair_budget=MAX_REVIEW_REPAIRS)
                     prompt = _review_fix_prompt(worktree, number, audit.model_dump(), base, conflicts)
                     _log(f"fixer-start pr={number} audited_findings={len(audit.findings)}")
                     fixer_started.append(True)
@@ -1485,7 +1549,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                 **self._agent_identity(report),
                             ),
                         )
-                    return {"prompt": prompt}
+                    return {"prompt": prompt, "repairs_used": repairs + 1}
 
                 def fixer(state: _ProviderPassState) -> dict[str, Any]:
                     provider, model, effort, deadline = state["provider"], state["model"], state["effort"], state["deadline"]
@@ -1538,6 +1602,9 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         repair["verdict"] = "findings"
                         repair["findings"] = audit.review_report()["findings"]
                         repair["categories_checked"] = audit.categories_checked
+                    if not review_only:
+                        record("fixer", "fixer_completed", status="failed" if result.returncode or result.timed_out else "completed",
+                               provider=provider, returncode=result.returncode, timed_out=result.timed_out)
                     if result.timed_out:
                         _log(f"agent-timeout pr={number} provider={provider}")
                     _log(f"agent-finished pr={number} provider={provider} exit={result.returncode}")
@@ -1548,39 +1615,23 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                     assert result is not None
                     if not state.get("skipped"):
                         provider_results[provider] = result
-                    if accept_provider(provider, result):
+                    accepted_now = accept_provider(provider, result)
+                    record("verify", "accepted" if accepted_now else "not_accepted",
+                           status="completed" if accepted_now else "failed", provider=provider,
+                           returncode=result.returncode, timed_out=result.timed_out,
+                           superseded_by=superseded_by[-1] if superseded_by else None)
+                    if accepted_now:
                         return {"accepted": provider}
                     return {"index": state.get("index", 0) + 1}
 
-                def after_start(state: _ProviderPassState) -> str:
-                    if state.get("skipped"):
-                        return "verify"
-                    return "audit" if review_only else "fixer"
-
-                def ends_pass(next_node: str) -> Any:
-                    return lambda state: "verify" if state.get("result") is not None else next_node
-
-                def after_verify(state: _ProviderPassState) -> str:
-                    if state.get("accepted") or state.get("index", 0) >= len(state["providers"]):
-                        return END
-                    return "start_provider"
-
-                provider_pass = StateGraph(_ProviderPassState)
-                provider_pass.add_node("start_provider", start_provider)
-                provider_pass.add_node("audit", audit_step)
-                provider_pass.add_node("repair_gate", repair_gate)
-                provider_pass.add_node("fixer", fixer)
-                provider_pass.add_node("verify", verify)
-                provider_pass.add_edge(START, "start_provider")
-                provider_pass.add_conditional_edges("start_provider", after_start, ["audit", "fixer", "verify"])
-                provider_pass.add_conditional_edges("audit", ends_pass("repair_gate"), ["repair_gate", "verify"])
-                provider_pass.add_conditional_edges("repair_gate", ends_pass("fixer"), ["fixer", "verify"])
-                provider_pass.add_edge("fixer", "verify")
-                provider_pass.add_conditional_edges("verify", after_verify, ["start_provider", END])
+                provider_pass = build_provider_pass({
+                    "start_provider": start_provider, "auditor": audit_step, "repair_gate": repair_gate,
+                    "fixer": fixer, "verify": verify,
+                })
 
                 # The legacy providers field is ignored; PR code goes to Codex, then only to
                 # the configured fallback.
-                passed = provider_pass.compile().invoke({"providers": self._providers(), "index": 0})
+                passed = provider_pass.invoke({"providers": self._providers(), "index": 0, "review_only": review_only})
                 accepted = (passed["accepted"],) if passed.get("accepted") else None
                 # Remember which commits this run made before the worktree is removed, so the
                 # finalizer can still recognise its own push if the agent died before reporting.

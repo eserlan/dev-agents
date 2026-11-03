@@ -121,7 +121,15 @@ def test_fix_mode_provider_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         base_branch="staging", fallback_provider="claude", fallback_model="claude-sonnet-5-5",
     ))
 
-    succeeded, report = service._fix(42, BRANCH, ["review:1"], meta={"headRefOid": head})
+    run_id = f"pr-42-{head}"
+    service.state.claim_run("pr-fixer", run_id, metadata={"pull_request": 42})
+    succeeded, report = service._fix(42, BRANCH, ["review:1"], meta={"headRefOid": head}, run_id=run_id)
+    # Each provider pass leaves node events for the flow report: one start and verify per provider.
+    events = [(event.node, event.event) for event in service.state.list_run_events("pr-fixer", run_id)]
+    # The Claude fallback is verified too when it is skipped, as before.
+    codex_accepted = expected_success and expected_calls == ["codex"]
+    assert [node for node, _ in events].count("verify") == (1 if codex_accepted else 2)
+    assert (events[-1][1] == "accepted") is expected_success
 
     assert calls == expected_calls
     assert succeeded is expected_success
