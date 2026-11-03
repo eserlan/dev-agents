@@ -240,6 +240,11 @@ Rules for this run:
   line breaks; do not put `\\n` escapes in a `-m` argument.
 - If you find nothing clearly worth changing, do not invent work: leave the tree unchanged, make
   no commit, and write a one-line reason to `{noop_path}`.
+- Never bypass git hooks (`--no-verify`, `HUSKY=0`, or similar). The workflow pushes through the
+  repository's pre-push hook, which lints every file you changed; if it fails, the run is
+  discarded. Before committing, run the repository's changed-file lint and make it pass fully,
+  including problems that already existed in the files you touched. If the commit-message hook
+  rejects your message, fix the message rather than skipping the hook.
 - Do not push, open, or merge a pull request; the workflow does that."""
 
 
@@ -341,7 +346,12 @@ def _run_sweep_impl(
         body = _git(worktree, "log", "-1", "--format=%b", first)
         body = unescape_newlines(body)
         body = f"{body}\n\n---\n*Scheduled `{persona.name}` sweep by dev-agents · agent `{accepted}`*".lstrip()
-        _git(worktree, "push", "-u", "origin", branch)
+        try:
+            _git(worktree, "push", "-u", "origin", branch, timeout=900)
+        except RuntimeError as error:
+            # Usually the pre-push hook rejected the change; keep its last lines as the reason.
+            tail = "\n".join(str(error).splitlines()[-15:])
+            return SweepRunResult(persona.name, branch, None, False, False, f"push rejected: {tail}")
         pr_url = _gh(repo, "pr", "create", "--base", base_branch, "--head", branch, "--title", title, "--body", body)
         return SweepRunResult(persona.name, branch, pr_url, False, True)
 
