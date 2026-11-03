@@ -27,7 +27,6 @@ from dev_agents.runtime import (
     legacy_json_path,
     repo_git_lock,
     run_agent,
-    run_with_fallback,
 )
 from dev_agents.runtime.agent import CODEX_MODEL, AgentResult
 from dev_agents.runtime.quota import quota_blocked_until
@@ -60,6 +59,27 @@ from .github_ops import (
 )
 from .local_state import _load_state, _state_path
 from .prompts import _prompt, _review_fix_prompt, _review_prompt, _review_skill
+
+
+class _ProviderPassState(TypedDict, total=False):
+    """One provider pass of a PR fix or review run (see PrFixerService._fix)."""
+
+    providers: list[str]
+    index: int
+    provider: str
+    # The fallback provider was skipped: Codex touched the worktree, timed out, or the
+    # branch was superseded.
+    skipped: bool
+    model: str | None
+    effort: str | None
+    prompt: str
+    deadline: float
+    audit: Any
+    resuming: bool
+    before_head: str
+    # Set by the step that ends the pass; verify then decides whether it is accepted.
+    result: AgentResult | None
+    accepted: str
 
 
 class PrFixerRunState(TypedDict, total=False):
@@ -1153,242 +1173,6 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log = log_dir / f"pr-{number}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
 
-                def run_provider(provider: str) -> Any:
-                    deadline = time.monotonic() + self.config.timeout_minutes * 60
-                    model, effort = self._provider_options(provider)
-                    report.update(
-                        agent_provider=provider,
-                        agent_model=model or (CODEX_MODEL if provider == PR_FIX_PROVIDER else provider),
-                        agent_effort=effort,
-                    )
-                    prompt = (
-                        _review_prompt(
-                            worktree,
-                            number,
-                            meta or {},
-                            base,
-                            conflicts,
-                            run_id=run_id,
-                            review_round=review_round,
-                            parent_sha=parent_sha,
-                            prior_report=prior_report,
-                        )
-                        if review_only
-                        else _prompt(worktree, number, keys, base, conflicts)
-                    )
-                    _log(f"agent-start pr={number} provider={provider} log={log}")
-
-                    def on_progress(elapsed_seconds: int) -> None:
-                        # Fix-mode has no status comment to update, so progress
-                        # notes are review-only.
-                        if not review_only or run_id is None:
-                            return
-                        _pkg._publish_pr_run_comment(
-                            self.project.repo,
-                            number,
-                            run_id,
-                            "review-progress",
-                            _review_progress_body(
-                                number, run_id, meta or {}, None, review_round, elapsed_seconds,
-                                **self._agent_identity(report),
-                            ),
-                        )
-                        _log(f"review-progress pr={number} elapsed_minutes={elapsed_seconds // 60}")
-
-                    if review_only:
-                        before_head = _pkg._run(worktree, "git", "rev-parse", "HEAD")
-                        before_status = _pkg._run(worktree, "git", "status", "--porcelain")
-                        audit_path = log.with_suffix(".audit.json")
-                        schema_path = log.with_suffix(".audit.schema.json")
-                        schema_path.write_text(audit_json_schema(), encoding="utf-8")
-
-                        def audit_failed(error: str, *, timed_out: bool = False) -> AgentResult:
-                            failure: dict[str, Any] = {
-                                "run_id": run_id, "pr_number": number, "stage": "auditor",
-                                "reviewed_head_sha": str((meta or {}).get("headRefOid", before_head)),
-                                "review_round": review_round, "verdict": "failed", "findings_count": None,
-                                "categories_checked": [], "error": error, "timed_out": timed_out,
-                            }
-                            report.update(report_valid=False, report_error=error, audit_telemetry=failure)
-                            _log(f"audit-result {json.dumps(failure, sort_keys=True)}")
-                            if run_id and self.state.get_run("pr-review", run_id):
-                                self.state.update_run("pr-review", run_id, metadata={"audit_telemetry": failure})
-                                self.state.record_event("pr-review", run_id, "auditor", "audit_failed", status="failed", metadata=failure)
-                            return AgentResult(1, timed_out)
-
-                        saved = self.state.get_run("pr-review", run_id) if run_id else None
-                        resuming = bool(saved and saved.metadata.get("repair_pending"))
-                        if resuming and saved:
-                            audit_path.write_text(json.dumps(saved.metadata["audit_report"]))
-                            try:
-                                parse_audit_report(audit_path, initial=review_round == 0)
-                            except ValueError:
-                                # Legacy pending reports lack contract evidence. Re-audit
-                                # instead of retrying their invalid repair forever.
-                                resuming = False
-                                self.state.update_run("pr-review", saved.run_id, metadata={"repair_pending": False})
-                        if resuming:
-                            audit_result = AgentResult(0, False)
-                        else:
-                            audit_result = run_agent(
-                                provider, prompt, cwd=worktree,
-                                log_path=log.with_suffix(".audit.log"),
-                                timeout_seconds=self.config.timeout_minutes * 60,
-                                heartbeat_seconds=self.config.heartbeat_seconds,
-                                reasoning_effort=effort, model=model,
-                                on_progress=on_progress, cancel_event=self.cancel_events.get(number),
-                                last_message_path=audit_path, read_only=True,
-                                output_schema_path=schema_path,
-                            )
-                        if audit_result.returncode != 0 or audit_result.timed_out:
-                            return audit_failed("independent auditor did not complete", timed_out=audit_result.timed_out)
-                        if (
-                            _pkg._run(worktree, "git", "rev-parse", "HEAD") != before_head
-                            or _pkg._run(worktree, "git", "status", "--porcelain") != before_status
-                        ):
-                            return audit_failed("read-only auditor mutated the worktree")
-                        try:
-                            audit = parse_audit_report(audit_path, initial=review_round == 0)
-                        except (ValueError, OSError) as error:
-                            return audit_failed(f"invalid auditor report: {type(error).__name__}")
-                        telemetry = audit_telemetry(
-                            audit, run_id=run_id, number=number,
-                            head_sha=str((meta or {}).get("headRefOid", before_head)),
-                            review_round=review_round,
-                        )
-                        report.update(
-                            audit_report=audit.model_dump(), audit_telemetry=telemetry,
-                            review_report=audit.review_report(), report_valid=True,
-                            findings="; ".join(f"{finding.location}: {finding.impact}" for finding in audit.findings) or "none",
-                            fixes="none",
-                        )
-                        _log(f"audit-result {json.dumps(telemetry, sort_keys=True)}")
-                        if run_id and self.state.get_run("pr-review", run_id):
-                            self.state.update_run("pr-review", run_id, metadata={
-                                "audit_report": audit.model_dump(), "audit_telemetry": telemetry,
-                                "audit_report_path": str(audit_path),
-                            })
-                            self.state.record_event("pr-review", run_id, "auditor", "audit_completed", metadata=telemetry)
-                        # Incomplete coverage with concrete findings still gets those findings
-                        # fixed; the unverified checks are reported for a human, and the chain's
-                        # clean-verdict requirement keeps auto-merge blocked until they're resolved.
-                        if audit.verdict == "incomplete" and not audit.findings:
-                            report.update(report_valid=False, report_error="auditor coverage is incomplete")
-                            return AgentResult(1, False)
-                        if audit.verdict == "clean":
-                            return audit_result
-                        # Publish what the auditor found before any repair starts, so the PR shows
-                        # the findings themselves rather than only that fixing is under way.
-                        opened_at = time.time()
-                        if not resuming and run_id and self.state.get_run("pr-review", run_id):
-                            _pkg._publish_pr_run_comment(
-                                self.project.repo, number, run_id, "review-findings",
-                                _review_findings_body(
-                                    number, run_id, audit.model_dump(),
-                                    review_round=review_round, head_sha=original_head or None,
-                                    claim_window_seconds=self.config.review_claim_window_seconds,
-                                    **self._agent_identity(report),
-                                ),
-                            )
-                        if (not resuming and run_id and self.config.review_claim_window_seconds
-                                and self.state.get_run("pr-review", run_id)):
-                            self.state.update_run("pr-review", run_id, metadata={
-                                "repair_pending": True, "repair_opened_at": opened_at,
-                            })
-                            report["repair_pending"] = True
-                            return audit_result
-                        if resuming and run_id:
-                            self.state.update_run("pr-review", run_id, metadata={"repair_pending": False})
-                        # Do not hand findings to a writer after a concurrent push changed their
-                        # source. Cancellation and normal final supersession handling still apply.
-                        with repo_git_lock(self.project.repo):
-                            _pkg._run(worktree, "git", "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", check=False)
-                        latest_head = _pkg._run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
-                        cancellation = self.cancel_events.get(number)
-                        if (original_head and latest_head != original_head) or (cancellation and cancellation.is_set()):
-                            if latest_head and latest_head != original_head:
-                                superseded_by.append(latest_head)
-                            return AgentResult(1, False)
-                        # Count writer starts across all heads/chains of this PR, including
-                        # failed attempts. Bot pushes and retries cannot reset the budget.
-                        repairs = sum(
-                            int(run.metadata.get("review_repair_attempts", bool(run.metadata.get("review_fix_pushed"))))
-                            for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
-                            if run.metadata.get("pull_request") == number
-                        )
-                        if repairs >= 2 or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
-                            report["review_halted"] = "two repair attempts exhausted; unresolved findings retained"
-                            return AgentResult(1, False)
-                        current = self.state.get_run("pr-review", run_id) if run_id else None
-                        if current is not None and run_id is not None:
-                            attempts = int(current.metadata.get("review_repair_attempts", 0))
-                            self.state.update_run("pr-review", run_id, metadata={"review_repair_attempts": attempts + 1})
-                        prompt = _review_fix_prompt(worktree, number, audit.model_dump(), base, conflicts)
-                        _log(f"fixer-start pr={number} audited_findings={len(audit.findings)}")
-                        fixer_started.append(True)
-                        if run_id and self.state.get_run("pr-review", run_id):
-                            self.state.record_event("pr-review", run_id, "fixer", "fixer_started", metadata={"findings_count": len(audit.findings)})
-                            _pkg._publish_pr_run_comment(
-                                self.project.repo, number, run_id, "review-fixes-started",
-                                _review_fixes_started_body(
-                                    number, run_id, audit.model_dump(), review_round=review_round,
-                                    **self._agent_identity(report),
-                                ),
-                            )
-
-                    final_message = log.with_suffix(".fixer.txt")
-                    if time.monotonic() >= deadline:
-                        report.update(report_valid=False, report_error="run budget expired before repair")
-                        return AgentResult(1, True)
-                    result = run_agent(
-                        provider,
-                        prompt,
-                        cwd=worktree,
-                        log_path=log,
-                        timeout_seconds=max(1.0, deadline - time.monotonic()),
-                        heartbeat_seconds=self.config.heartbeat_seconds,
-                        reasoning_effort=effort,
-                        model=model,
-                        on_progress=on_progress,
-                        cancel_event=self.cancel_events.get(number),
-                        last_message_path=final_message,
-                    )
-                    if review_only:
-                        fixer_telemetry = {
-                            "stage": "fixer", "run_id": run_id, "pr_number": number,
-                            "reviewed_head_sha": str((meta or {}).get("headRefOid", before_head)),
-                            "review_round": review_round, "returncode": result.returncode,
-                            "timed_out": result.timed_out,
-                        }
-                        _log(f"fixer-result {json.dumps(fixer_telemetry, sort_keys=True)}")
-                        if run_id and self.state.get_run("pr-review", run_id):
-                            self.state.update_run("pr-review", run_id, metadata={"fixer_telemetry": fixer_telemetry})
-                            self.state.record_event(
-                                "pr-review", run_id, "fixer", "fixer_completed",
-                                status="failed" if result.returncode or result.timed_out else "completed",
-                                metadata=fixer_telemetry,
-                            )
-                    report.update(_agent_report(final_message if final_message.is_file() else log))
-                    if review_only:
-                        repair = report.get("review_report", {})
-                        if repair.get("verdict") == "disputed":
-                            repair["findings"] = audit.review_report()["findings"]
-                            report["review_halted"] = "fixer disputed audit: " + "; ".join(repair["validation"])
-                            return AgentResult(1, result.timed_out)
-                        if not report.get("report_valid") or not repair.get("fixes"):
-                            report.update(report_valid=False, report_error="fixer did not report repairs for audited findings")
-                            return AgentResult(1, result.timed_out)
-                        # Preserve the independent findings; fixing them is not an independent
-                        # clean audit. The existing bounded post-fix round verifies the repairs.
-                        repair["verdict"] = "findings"
-                        repair["findings"] = audit.review_report()["findings"]
-                        repair["categories_checked"] = audit.categories_checked
-                    result_code = result.returncode
-                    if result.timed_out:
-                        _log(f"agent-timeout pr={number} provider={provider}")
-                    _log(f"agent-finished pr={number} provider={provider} exit={result_code}")
-                    return result
-
                 original_head = str((meta or {}).get("headRefOid", ""))
                 superseded_by: list[str] = []
                 # Set once a review run hands its findings to the fixer. Until then the run is a
@@ -1491,7 +1275,30 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         _pkg._run(worktree, "git", "status", "--porcelain", check=False),
                     )
 
-                def run_provider_or_fallback(provider: str) -> Any:
+                # One provider pass is a graph: start_provider -> [audit -> repair_gate] ->
+                # fixer -> verify, with verify looping back to start_provider for the
+                # fallback. Review runs audit first; an audit or gate that ends the pass early
+                # goes straight to verify with its result. Mutable run facts (report,
+                # superseded_by, fixer_started) stay in this scope, shared by the nodes.
+                def on_progress(elapsed_seconds: int) -> None:
+                    # Fix-mode has no status comment to update, so progress
+                    # notes are review-only.
+                    if not review_only or run_id is None:
+                        return
+                    _pkg._publish_pr_run_comment(
+                        self.project.repo,
+                        number,
+                        run_id,
+                        "review-progress",
+                        _review_progress_body(
+                            number, run_id, meta or {}, None, review_round, elapsed_seconds,
+                            **self._agent_identity(report),
+                        ),
+                    )
+                    _log(f"review-progress pr={number} elapsed_minutes={elapsed_seconds // 60}")
+
+                def start_provider(state: _ProviderPassState) -> dict[str, Any]:
+                    provider = state["providers"][state.get("index", 0)]
                     if provider == PR_FIX_PROVIDER:
                         before_codex.append(worktree_snapshot())
                     else:
@@ -1501,15 +1308,280 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         touched = bool(before_codex) and worktree_snapshot() != before_codex[0]
                         if previous is not None and (previous.timed_out or touched) or superseded_by:
                             _log(f"fallback-skipped pr={number} provider={provider}")
-                            return AgentResult(1, previous.timed_out if previous else False)
+                            return {"provider": provider, "skipped": True,
+                                    "result": AgentResult(1, previous.timed_out if previous else False)}
                         _log(f"fallback-start pr={number} provider={provider}")
-                    result = run_provider(provider)
-                    provider_results[provider] = result
-                    return result
+                    model, effort = self._provider_options(provider)
+                    report.update(
+                        agent_provider=provider,
+                        agent_model=model or (CODEX_MODEL if provider == PR_FIX_PROVIDER else provider),
+                        agent_effort=effort,
+                    )
+                    prompt = (
+                        _review_prompt(
+                            worktree,
+                            number,
+                            meta or {},
+                            base,
+                            conflicts,
+                            run_id=run_id,
+                            review_round=review_round,
+                            parent_sha=parent_sha,
+                            prior_report=prior_report,
+                        )
+                        if review_only
+                        else _prompt(worktree, number, keys, base, conflicts)
+                    )
+                    _log(f"agent-start pr={number} provider={provider} log={log}")
+                    return {
+                        "provider": provider, "skipped": False, "model": model, "effort": effort,
+                        "prompt": prompt, "deadline": time.monotonic() + self.config.timeout_minutes * 60,
+                        "audit": None, "result": None,
+                    }
+
+                def audit_step(state: _ProviderPassState) -> dict[str, Any]:
+                    provider, model, effort = state["provider"], state["model"], state["effort"]
+                    before_head = _pkg._run(worktree, "git", "rev-parse", "HEAD")
+                    before_status = _pkg._run(worktree, "git", "status", "--porcelain")
+                    audit_path = log.with_suffix(".audit.json")
+                    schema_path = log.with_suffix(".audit.schema.json")
+                    schema_path.write_text(audit_json_schema(), encoding="utf-8")
+
+                    def audit_failed(error: str, *, timed_out: bool = False) -> dict[str, Any]:
+                        failure: dict[str, Any] = {
+                            "run_id": run_id, "pr_number": number, "stage": "auditor",
+                            "reviewed_head_sha": str((meta or {}).get("headRefOid", before_head)),
+                            "review_round": review_round, "verdict": "failed", "findings_count": None,
+                            "categories_checked": [], "error": error, "timed_out": timed_out,
+                        }
+                        report.update(report_valid=False, report_error=error, audit_telemetry=failure)
+                        _log(f"audit-result {json.dumps(failure, sort_keys=True)}")
+                        if run_id and self.state.get_run("pr-review", run_id):
+                            self.state.update_run("pr-review", run_id, metadata={"audit_telemetry": failure})
+                            self.state.record_event("pr-review", run_id, "auditor", "audit_failed", status="failed", metadata=failure)
+                        return {"result": AgentResult(1, timed_out)}
+
+                    saved = self.state.get_run("pr-review", run_id) if run_id else None
+                    resuming = bool(saved and saved.metadata.get("repair_pending"))
+                    if resuming and saved:
+                        audit_path.write_text(json.dumps(saved.metadata["audit_report"]))
+                        try:
+                            parse_audit_report(audit_path, initial=review_round == 0)
+                        except ValueError:
+                            # Legacy pending reports lack contract evidence. Re-audit
+                            # instead of retrying their invalid repair forever.
+                            resuming = False
+                            self.state.update_run("pr-review", saved.run_id, metadata={"repair_pending": False})
+                    if resuming:
+                        audit_result = AgentResult(0, False)
+                    else:
+                        audit_result = run_agent(
+                            provider, state["prompt"], cwd=worktree,
+                            log_path=log.with_suffix(".audit.log"),
+                            timeout_seconds=self.config.timeout_minutes * 60,
+                            heartbeat_seconds=self.config.heartbeat_seconds,
+                            reasoning_effort=effort, model=model,
+                            on_progress=on_progress, cancel_event=self.cancel_events.get(number),
+                            last_message_path=audit_path, read_only=True,
+                            output_schema_path=schema_path,
+                        )
+                    if audit_result.returncode != 0 or audit_result.timed_out:
+                        return audit_failed("independent auditor did not complete", timed_out=audit_result.timed_out)
+                    if (
+                        _pkg._run(worktree, "git", "rev-parse", "HEAD") != before_head
+                        or _pkg._run(worktree, "git", "status", "--porcelain") != before_status
+                    ):
+                        return audit_failed("read-only auditor mutated the worktree")
+                    try:
+                        audit = parse_audit_report(audit_path, initial=review_round == 0)
+                    except (ValueError, OSError) as error:
+                        return audit_failed(f"invalid auditor report: {type(error).__name__}")
+                    telemetry = audit_telemetry(
+                        audit, run_id=run_id, number=number,
+                        head_sha=str((meta or {}).get("headRefOid", before_head)),
+                        review_round=review_round,
+                    )
+                    report.update(
+                        audit_report=audit.model_dump(), audit_telemetry=telemetry,
+                        review_report=audit.review_report(), report_valid=True,
+                        findings="; ".join(f"{finding.location}: {finding.impact}" for finding in audit.findings) or "none",
+                        fixes="none",
+                    )
+                    _log(f"audit-result {json.dumps(telemetry, sort_keys=True)}")
+                    if run_id and self.state.get_run("pr-review", run_id):
+                        self.state.update_run("pr-review", run_id, metadata={
+                            "audit_report": audit.model_dump(), "audit_telemetry": telemetry,
+                            "audit_report_path": str(audit_path),
+                        })
+                        self.state.record_event("pr-review", run_id, "auditor", "audit_completed", metadata=telemetry)
+                    # Incomplete coverage with concrete findings still gets those findings
+                    # fixed; the unverified checks are reported for a human, and the chain's
+                    # clean-verdict requirement keeps auto-merge blocked until they're resolved.
+                    if audit.verdict == "incomplete" and not audit.findings:
+                        report.update(report_valid=False, report_error="auditor coverage is incomplete")
+                        return {"result": AgentResult(1, False)}
+                    if audit.verdict == "clean":
+                        return {"result": audit_result}
+                    # Publish what the auditor found before any repair starts, so the PR shows
+                    # the findings themselves rather than only that fixing is under way.
+                    opened_at = time.time()
+                    if not resuming and run_id and self.state.get_run("pr-review", run_id):
+                        _pkg._publish_pr_run_comment(
+                            self.project.repo, number, run_id, "review-findings",
+                            _review_findings_body(
+                                number, run_id, audit.model_dump(),
+                                review_round=review_round, head_sha=original_head or None,
+                                claim_window_seconds=self.config.review_claim_window_seconds,
+                                **self._agent_identity(report),
+                            ),
+                        )
+                    if (not resuming and run_id and self.config.review_claim_window_seconds
+                            and self.state.get_run("pr-review", run_id)):
+                        self.state.update_run("pr-review", run_id, metadata={
+                            "repair_pending": True, "repair_opened_at": opened_at,
+                        })
+                        report["repair_pending"] = True
+                        return {"result": audit_result}
+                    return {"audit": audit, "resuming": resuming, "before_head": before_head}
+
+                def repair_gate(state: _ProviderPassState) -> dict[str, Any]:
+                    audit = state["audit"]
+                    assert audit is not None
+                    if state.get("resuming") and run_id:
+                        self.state.update_run("pr-review", run_id, metadata={"repair_pending": False})
+                    # Do not hand findings to a writer after a concurrent push changed their
+                    # source. Cancellation and normal final supersession handling still apply.
+                    with repo_git_lock(self.project.repo):
+                        _pkg._run(worktree, "git", "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", check=False)
+                    latest_head = _pkg._run(worktree, "git", "rev-parse", f"origin/{branch}", check=False)
+                    cancellation = self.cancel_events.get(number)
+                    if (original_head and latest_head != original_head) or (cancellation and cancellation.is_set()):
+                        if latest_head and latest_head != original_head:
+                            superseded_by.append(latest_head)
+                        return {"result": AgentResult(1, False)}
+                    # Count writer starts across all heads/chains of this PR, including
+                    # failed attempts. Bot pushes and retries cannot reset the budget.
+                    repairs = sum(
+                        int(run.metadata.get("review_repair_attempts", bool(run.metadata.get("review_fix_pushed"))))
+                        for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
+                        if run.metadata.get("pull_request") == number
+                    )
+                    if repairs >= 2 or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
+                        report["review_halted"] = "two repair attempts exhausted; unresolved findings retained"
+                        return {"result": AgentResult(1, False)}
+                    current = self.state.get_run("pr-review", run_id) if run_id else None
+                    if current is not None and run_id is not None:
+                        attempts = int(current.metadata.get("review_repair_attempts", 0))
+                        self.state.update_run("pr-review", run_id, metadata={"review_repair_attempts": attempts + 1})
+                    prompt = _review_fix_prompt(worktree, number, audit.model_dump(), base, conflicts)
+                    _log(f"fixer-start pr={number} audited_findings={len(audit.findings)}")
+                    fixer_started.append(True)
+                    if run_id and self.state.get_run("pr-review", run_id):
+                        self.state.record_event("pr-review", run_id, "fixer", "fixer_started", metadata={"findings_count": len(audit.findings)})
+                        _pkg._publish_pr_run_comment(
+                            self.project.repo, number, run_id, "review-fixes-started",
+                            _review_fixes_started_body(
+                                number, run_id, audit.model_dump(), review_round=review_round,
+                                **self._agent_identity(report),
+                            ),
+                        )
+                    return {"prompt": prompt}
+
+                def fixer(state: _ProviderPassState) -> dict[str, Any]:
+                    provider, model, effort, deadline = state["provider"], state["model"], state["effort"], state["deadline"]
+                    audit = state.get("audit")
+                    final_message = log.with_suffix(".fixer.txt")
+                    if time.monotonic() >= deadline:
+                        report.update(report_valid=False, report_error="run budget expired before repair")
+                        return {"result": AgentResult(1, True)}
+                    result = run_agent(
+                        provider,
+                        state["prompt"],
+                        cwd=worktree,
+                        log_path=log,
+                        timeout_seconds=max(1.0, deadline - time.monotonic()),
+                        heartbeat_seconds=self.config.heartbeat_seconds,
+                        reasoning_effort=effort,
+                        model=model,
+                        on_progress=on_progress,
+                        cancel_event=self.cancel_events.get(number),
+                        last_message_path=final_message,
+                    )
+                    if review_only:
+                        fixer_telemetry = {
+                            "stage": "fixer", "run_id": run_id, "pr_number": number,
+                            "reviewed_head_sha": str((meta or {}).get("headRefOid", state.get("before_head"))),
+                            "review_round": review_round, "returncode": result.returncode,
+                            "timed_out": result.timed_out,
+                        }
+                        _log(f"fixer-result {json.dumps(fixer_telemetry, sort_keys=True)}")
+                        if run_id and self.state.get_run("pr-review", run_id):
+                            self.state.update_run("pr-review", run_id, metadata={"fixer_telemetry": fixer_telemetry})
+                            self.state.record_event(
+                                "pr-review", run_id, "fixer", "fixer_completed",
+                                status="failed" if result.returncode or result.timed_out else "completed",
+                                metadata=fixer_telemetry,
+                            )
+                    report.update(_agent_report(final_message if final_message.is_file() else log))
+                    if review_only:
+                        assert audit is not None
+                        repair = report.get("review_report", {})
+                        if repair.get("verdict") == "disputed":
+                            repair["findings"] = audit.review_report()["findings"]
+                            report["review_halted"] = "fixer disputed audit: " + "; ".join(repair["validation"])
+                            return {"result": AgentResult(1, result.timed_out)}
+                        if not report.get("report_valid") or not repair.get("fixes"):
+                            report.update(report_valid=False, report_error="fixer did not report repairs for audited findings")
+                            return {"result": AgentResult(1, result.timed_out)}
+                        # Preserve the independent findings; fixing them is not an independent
+                        # clean audit. The existing bounded post-fix round verifies the repairs.
+                        repair["verdict"] = "findings"
+                        repair["findings"] = audit.review_report()["findings"]
+                        repair["categories_checked"] = audit.categories_checked
+                    if result.timed_out:
+                        _log(f"agent-timeout pr={number} provider={provider}")
+                    _log(f"agent-finished pr={number} provider={provider} exit={result.returncode}")
+                    return {"result": result}
+
+                def verify(state: _ProviderPassState) -> dict[str, Any]:
+                    provider, result = state["provider"], state["result"]
+                    assert result is not None
+                    if not state.get("skipped"):
+                        provider_results[provider] = result
+                    if accept_provider(provider, result):
+                        return {"accepted": provider}
+                    return {"index": state.get("index", 0) + 1}
+
+                def after_start(state: _ProviderPassState) -> str:
+                    if state.get("skipped"):
+                        return "verify"
+                    return "audit" if review_only else "fixer"
+
+                def ends_pass(next_node: str) -> Any:
+                    return lambda state: "verify" if state.get("result") is not None else next_node
+
+                def after_verify(state: _ProviderPassState) -> str:
+                    if state.get("accepted") or state.get("index", 0) >= len(state["providers"]):
+                        return END
+                    return "start_provider"
+
+                provider_pass = StateGraph(_ProviderPassState)
+                provider_pass.add_node("start_provider", start_provider)
+                provider_pass.add_node("audit", audit_step)
+                provider_pass.add_node("repair_gate", repair_gate)
+                provider_pass.add_node("fixer", fixer)
+                provider_pass.add_node("verify", verify)
+                provider_pass.add_edge(START, "start_provider")
+                provider_pass.add_conditional_edges("start_provider", after_start, ["audit", "fixer", "verify"])
+                provider_pass.add_conditional_edges("audit", ends_pass("repair_gate"), ["repair_gate", "verify"])
+                provider_pass.add_conditional_edges("repair_gate", ends_pass("fixer"), ["fixer", "verify"])
+                provider_pass.add_edge("fixer", "verify")
+                provider_pass.add_conditional_edges("verify", after_verify, ["start_provider", END])
 
                 # The legacy providers field is ignored; PR code goes to Codex, then only to
                 # the configured fallback.
-                accepted = run_with_fallback(self._providers(), run_provider_or_fallback, accept_provider)
+                passed = provider_pass.compile().invoke({"providers": self._providers(), "index": 0})
+                accepted = (passed["accepted"],) if passed.get("accepted") else None
                 # Remember which commits this run made before the worktree is removed, so the
                 # finalizer can still recognise its own push if the agent died before reporting.
                 own_range = f"{original_head}..HEAD" if original_head else "HEAD^!"
