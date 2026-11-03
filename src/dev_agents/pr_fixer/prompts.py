@@ -88,6 +88,10 @@ Merge-conflict paths (resolve, stage, commit, and push them before testing):
 {conflict_text}
 
 Validation protocol:
+Validate only what you change. If the feedback needs no code change (for example a check that
+failed for a reason outside the code, such as a deploy provider's account or permissions), make no
+commit, say why in the report, and skip local validation. Do not rerun a suite locally only to
+confirm a job that already passed on CI for this same head; that CI result is valid evidence.
 {validation_instructions}
 
 Commit and push HEAD to the PR branch.

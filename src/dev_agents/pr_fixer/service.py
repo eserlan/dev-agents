@@ -55,6 +55,7 @@ from .github_ops import (
     _agent_report,
     _external_agent_commit,
     _has_copilot_review,
+    _infrastructure_failures,
     _is_issue_fix_pr,
     _review_is_due,
 )
@@ -558,6 +559,15 @@ class PrFixerService:
     def _collect_feedback(self, state: PrFixerRunState) -> dict[str, Any]:
         number = state["number"]
         meta, keys = _pkg._feedback(self.project.repo, number)
+        infrastructure = _infrastructure_failures(meta, keys, self.config.infrastructure_failure_patterns)
+        if infrastructure:
+            # Nothing in the PR can fix these, so they neither start a fix nor block a review.
+            keys = [key for key in keys if key not in infrastructure]
+            new = self.state.unprocessed_feedback("pr-fixer", str(number), list(infrastructure))
+            for key in new:
+                _log(f"infrastructure-failure-ignored pr={number} check={key} pattern={infrastructure[key]!r}")
+            if new:
+                self.state.mark_feedback_processed("pr-fixer", str(number), new)
         self._track_audit_comparison(number, meta)
         with self.lock:
             self.active_heads[number] = str(meta.get("headRefOid", "unknown"))

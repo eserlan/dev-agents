@@ -200,6 +200,12 @@ logins of any external coding agents), all review, fix, and auto-merge activity 
 one idempotent pause comment per head. Apply the configured `external_agent_resume_label`
 (`dev-agents-resume` by default) when the external agent is finished and automation should resume.
 
+A failing check whose failed-job log matches one of `infrastructure_failure_patterns` failed for a
+reason outside the code: a Cloudflare account feature gate or API token, or a lost GitHub runner.
+It does not start a fix, because the fixer could only report that there is nothing to change. The
+daemon logs `infrastructure-failure-ignored` once per check and head. The check still blocks
+auto-merge until it passes, for example after a rerun. Add patterns per project for other providers.
+
 ## Issue fixer
 
 Projects may also opt in to the label-driven issue fixer:

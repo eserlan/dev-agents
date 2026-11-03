@@ -1647,3 +1647,43 @@ def test_fix_summary_states_validation_once() -> None:
 
     assert body.count("- Validation:") == 1
     assert "- What changed: Fixed it\n- Validation:" in body
+
+
+@pytest.mark.parametrize(("details", "starts_fix"), [
+    (("✘ [ERROR] Deployment failed!\n  Failed to publish your Function. Got error: You do not have "
+      "access to this feature. Please ensure it is enabled."), False),
+    ("✘ [ERROR] Build failed: src/routes/+page.svelte:12:3 Unexpected token", True),
+])
+def test_infrastructure_check_failures_do_not_start_a_fix(
+    monkeypatch, tmp_path: Path, details: str, starts_fix: bool
+) -> None:
+    from dev_agents.pr_fixer.github_ops import _infrastructure_failures
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    deploy = {"name": "deploy", "workflow": "Deploy to Cloudflare Pages", "state": "FAILURE",
+              "bucket": "fail", "failureDetails": details}
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging", "headRefName": "feature/x", "headRefOid": "abc123", "state": "OPEN",
+        "isDraft": False, "mergeable": "MERGEABLE", "reviewDecision": "", "labels": [], "reviews": [],
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}, deploy],
+    }
+    key = "check:abc123:Deploy to Cloudflare Pages:deploy:FAILURE"
+    keys = ["comment:7", key]
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, list(keys)))
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), config)
+
+    state = service._collect_feedback({"number": 42})
+
+    assert (key in state["keys"]) is starts_fix
+    assert "comment:7" in state["keys"]  # only check failures are ever treated as infrastructure
+    assert (key in service.state.unprocessed_feedback("pr-fixer", "42", [key])) is starts_fix
+    matched = _infrastructure_failures(metadata, keys, config.infrastructure_failure_patterns)
+    assert matched == ({} if starts_fix else {key: "You do not have access to this feature"})
+
+
+def test_fix_prompt_skips_validation_when_nothing_changes(tmp_path: Path) -> None:
+    prompt = _prompt(tmp_path, 42, ["check:abc:deploy:FAILURE"], "staging", [])
+    assert "Validate only what you change." in prompt
+    assert "already passed on CI for this same head" in prompt
