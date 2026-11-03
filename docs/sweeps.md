@@ -53,13 +53,19 @@ commit. That happens at most `MAX_REPAIRS` (2) times. A repair never falls back 
 provider, because a fallback starts from a clean checkout of the base.
 
 ```text
-load_persona → prepare → run_agent → check_change → push_branch → open_pull_request → publish_result
-                            ↑______________|______________|
-                         (repair: over the limits, or push rejected)
+load_persona → prepare → commit_loop → open_pull_request → publish_result
+
+commit_loop (shared with degodify, `committing_agent.build_commit_loop`):
+  run_agent → check_change → push_branch
+      ↑___________|______________|   (repair: over the limits, or push rejected)
 ```
 
-`prepare`, `run_agent`, `check_change` and `push_branch` go straight to `publish_result` when they
-finish the run (waiting, no-op, exhausted provider or repair budget). `run_sweep` removes the
+`push_branch` and `open_pull_request` retry up to 3 times on network or GitHub errors
+(`NETWORK_RETRY`); a hook rejection is never retried, only repaired. `open_pull_request` first
+looks for an existing PR from the branch, so a retry after a lost response does not open a second
+one.
+
+`prepare` and `commit_loop` go straight to `publish_result` when they finish the run (waiting, no-op, exhausted provider or repair budget). `run_sweep` removes the
 worktree and any unpushed branch afterwards, even if a step raised.
 
 Provider fallback, continuations and per-provider deadlines are shared with degodify

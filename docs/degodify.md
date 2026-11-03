@@ -17,7 +17,11 @@ The `degodify` workflow identifies oversized files in target repositories and pe
    imports and behaviour are unchanged. It deletes the dead code, breaks up the complex functions,
    merges duplicates and adds focused tests.
 4. **Gate**: A PR opens only when the target shrank by at least 25% and `fallow audit --base
-   origin/<base>` does not fail. Otherwise the run fails with the reason and nothing is pushed.
+   origin/<base>` does not fail. Otherwise the reason goes back to the same agent, which keeps
+   splitting and commits again, at most twice. The run fails with the reason if that does not help.
+   The agent does not push. The workflow pushes through the repository's pre-push hook, and a
+   rejection is repaired the same way. This is the shared commit loop in
+   `workflows/committing_agent.py`, also used by [sweeps](sweeps.md).
 5. **Publication**: Pushes `curator/degod-<slug>-<timestamp>` and opens a PR against `staging`
    with before/after line counts and the new modules.
 
