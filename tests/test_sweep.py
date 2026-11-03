@@ -149,26 +149,86 @@ def test_nothing_worth_changing_opens_no_pr(sandbox, monkeypatch: pytest.MonkeyP
     assert len(prompts) == 1
 
 
-def test_an_oversized_change_is_not_pushed(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_oversized_change_is_handed_back_and_shrunk_before_pushing(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
     repo, created, prompts, _installs = sandbox
-    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Big", lines=20, journal=False))
+
+    def behaviour(worktree: Path, prompt: str) -> None:
+        if "could not publish" not in prompt:
+            commit(worktree, "Big", lines=20, journal=False)
+            return
+        (worktree / "src/a.ts").write_text("export const a = 1;\n")
+        git(worktree, "commit", "-a", "--amend", "-m", "Small")
+
+    result = run(repo, monkeypatch, prompts, behaviour)
+
+    assert result.succeeded and result.pull_request_url == "https://example.test/pr/9"
+    assert len(prompts) == 2 and "changed 21 lines (limit 10)" in prompts[1]
+    title = created[0][created[0].index("--title") + 1]
+    assert title == "⚡ Bolt: Small"
+
+
+def test_an_oversized_change_that_is_not_shrunk_is_not_pushed(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts, _installs = sandbox
+
+    def behaviour(worktree: Path, prompt: str) -> None:
+        if "could not publish" not in prompt:
+            commit(worktree, "Big", lines=20, journal=False)
+
+    result = run(repo, monkeypatch, prompts, behaviour)
 
     assert not result.succeeded and not created
-    assert result.reason == "changed 21 lines (limit 10)"
+    assert result.reason == "changed 21 lines (limit 10) (not repaired after 1 attempt(s))"
+    # The repair keeps the change: one first turn, then a repair turn and its continuation.
+    assert len(prompts) == 3
     assert git(repo, "ls-remote", "origin", "refs/heads/bolt/*") == ""
+    assert git(repo, "branch", "--list", "bolt/*") == ""
 
 
-def test_a_push_rejected_by_a_hook_fails_without_a_pr(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo, created, prompts, _installs = sandbox
+def install_pre_push(repo: Path) -> None:
     hook = Path(git(repo, "rev-parse", "--absolute-git-dir")) / "hooks/pre-push"
-    hook.write_text("#!/bin/sh\necho 'UI pattern check failed.' >&2\nexit 1\n")
+    hook.write_text("#!/bin/sh\nif git grep -q BAD HEAD -- src; then echo 'UI pattern check failed.' >&2; exit 1; fi\n")
     hook.chmod(0o755)
 
-    result = run(repo, monkeypatch, prompts, lambda wt, _p: commit(wt, "Tidy"))
+
+def test_a_push_rejected_by_a_hook_goes_back_to_the_agent(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, _created, prompts, _installs = sandbox
+    install_pre_push(repo)
+
+    def behaviour(worktree: Path, prompt: str) -> None:
+        if "could not publish" not in prompt:
+            (worktree / "src/a.ts").write_text("export const a = 'BAD';\n")
+            git(worktree, "commit", "-am", "Tidy")
+            return
+        (worktree / "src/a.ts").write_text("export const a = 'good';\n")
+        git(worktree, "commit", "-a", "--amend", "-m", "Tidy")
+
+    result = run(repo, monkeypatch, prompts, behaviour)
+
+    assert result.succeeded and result.pull_request_url == "https://example.test/pr/9"
+    assert "Never bypass git hooks" in prompts[0]
+    assert "UI pattern check failed." in prompts[1] and "pre-push hook" in prompts[1]
+    assert "good" in git(repo, "show", f"origin/{result.branch}:src/a.ts")
+
+
+def test_a_push_still_rejected_after_repairs_fails_without_a_pr(sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, created, prompts, _installs = sandbox
+    install_pre_push(repo)
+    amends: list[int] = []
+
+    def behaviour(worktree: Path, prompt: str) -> None:
+        if "could not publish" not in prompt:
+            (worktree / "src/a.ts").write_text("export const a = 'BAD';\n")
+            git(worktree, "commit", "-am", "Tidy")
+            return
+        amends.append(1)
+        git(worktree, "commit", "--amend", "-m", f"Tidy {len(amends)}")
+
+    result = run(repo, monkeypatch, prompts, behaviour)
 
     assert not result.succeeded and not created and result.pull_request_url is None
     assert result.reason and result.reason.startswith("push rejected:") and "UI pattern check failed." in result.reason
-    assert "Never bypass git hooks" in prompts[0]
+    assert result.reason.endswith(f"(still failing after {sweep.MAX_REPAIRS} repair(s))")
+    assert len(amends) == sweep.MAX_REPAIRS
 
 
 def test_a_sweep_waits_while_the_persona_has_an_open_pr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

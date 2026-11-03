@@ -41,10 +41,26 @@ What this persona looks for, what counts as worth a PR, and what to avoid.
 6. The agent makes one focused change and a single commit. The commit subject is the PR title
    and the commit body is the PR description. If nothing is worth changing, it writes a reason to
    a marker file instead. That is a successful no-op and opens no PR.
-7. The diff must stay within `max_files` and `max_changed_lines`, journal excluded, or nothing
-   is pushed.
-8. Push and open the PR against the base (always `staging` by default, never `main`). After that
-   the normal review, fix and auto-merge chain takes over.
+7. The diff must stay within `max_files` and `max_changed_lines`, journal excluded.
+8. Push. The push goes through the repository's pre-push hook, and the prompt forbids bypassing
+   hooks.
+9. Open the PR against the base (always `staging` by default, never `main`). After that the
+   normal review, fix and auto-merge chain takes over.
+
+If step 7 or 8 fails, the work is not thrown away. The graph hands the problem (the size limit,
+or the last lines of the hook output) back to the provider that made the change, which amends its
+commit. That happens at most `MAX_REPAIRS` (2) times. A repair never falls back to another
+provider, because a fallback starts from a clean checkout of the base.
+
+```text
+load_persona → prepare → run_agent → check_change → push_branch → open_pull_request → publish_result
+                            ↑______________|______________|
+                         (repair: over the limits, or push rejected)
+```
+
+`prepare`, `run_agent`, `check_change` and `push_branch` go straight to `publish_result` when they
+finish the run (waiting, no-op, exhausted provider or repair budget). `run_sweep` removes the
+worktree and any unpushed branch afterwards, even if a step raised.
 
 Provider fallback, continuations and per-provider deadlines are shared with degodify
 (`workflows/committing_agent.py`).
@@ -61,7 +77,7 @@ uv run dev-agents sweep run codex-cryptica --persona bolt --execute
 
 Executed runs are recorded as workflow `sweep` in the PR-fixer state database, so they appear in
 the flow report. Exit status 1 means the run produced no PR because of a failure, an exhausted
-provider or the size gate. Waiting and no-op runs exit 0.
+provider, or a size or push problem that repairs did not fix. Waiting and no-op runs exit 0.
 
 Schedule them with the templated systemd units in `ops/systemd/dev-agents-sweep@.{service,timer}.example`,
 one timer per persona.
