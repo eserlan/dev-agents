@@ -115,6 +115,22 @@ The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.
 It no longer needs a listener, publisher script, or daemon systemd unit.
 
+## Per-channel publishing and retries
+
+Each release-comms run publishes one message (one feature or page). `publish_destinations` plans
+that message and sends one LangGraph branch per channel (`Send` to `publish_channel`); the branches
+run in parallel and `finish_publication` joins them, so one slow or failing channel never blocks the
+others. Every receipt is still persisted as soon as it arrives, and a later run skips channels that
+already published, so a run with a failed channel retries only that channel.
+
+Within a run, a channel is retried up to three attempts in total (10 s, then 20 s apart) only when
+the failure certainly left no post behind: HTTP 429, 502, 503 or 504, or a connection that was never
+established. Timeouts, dropped connections and other errors are not retried, because the platform
+may already have the post. Only Bluesky, Instagram, X and Pinterest are retried in-run; Discord
+(several destinations), Threads (resumable containers), Reddit and podcast staging, and GitHub
+Discussions rely on the next run instead. The journal records `channel_published`,
+`channel_retry` and `channel_failed` events with the attempt number.
+
 ## Threads publishing
 
 Threads is an opt-in release-comms destination. The workflow adapts the short

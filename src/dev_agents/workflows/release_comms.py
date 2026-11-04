@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import operator
 import os
 import random
 import re
@@ -12,9 +13,11 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Annotated, Any, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
+from langgraph.types import RetryPolicy, Send
 
 from dev_agents.config import ProjectConfig, ReleaseCommsConfig
 from dev_agents.runtime import DuplicateRunError, StateRepository, state_database_path
@@ -49,16 +52,21 @@ from dev_agents.workflows.release_history import (
     repeated_publication_keys,
 )
 from dev_agents.workflows.release_publish import (
+    RESULT_CHANNELS,
+    RETRYABLE_CHANNELS,
     SOCIAL_PUBLISHERS,
+    PublicationBatch,
     PublicationError,
     PublicationReceipt,
     SocialPost,
     comment_tracking_issue,
+    is_transient_publication_error,
+    next_publication_batch,
     pending_publication_count,
     podcast_answer_slug,
     publication_key,
+    publish_channel_job,
     publish_internal_note,
-    publish_release_drafts,
     resolve_image,
     upload_release_image,
 )
@@ -124,6 +132,11 @@ class ReleaseCommsState(TypedDict, total=False):
     scheduled: bool
     next_publication_at: str | None
     remaining_publications: int
+    # The message being published this run and what its channel branches share.
+    publication_batch: PublicationBatch | None
+    publication_context: dict[str, Any]
+    # One entry per channel branch, gathered by the reducer when the branches join.
+    channel_results: Annotated[list[dict[str, Any]], operator.add]
 
 
 def _emit(state: ReleaseCommsState, event: str, payload: dict[str, Any]) -> None:
@@ -258,6 +271,21 @@ def _draft_counts(drafts: WriterResult) -> dict[str, Any]:
         "instagram": len(drafts.instagram),
         "discord": bool(drafts.bluesky) or bool(drafts.discord and drafts.discord.strip()),
     }
+
+
+class TransientChannelError(RuntimeError):
+    """A channel failed before posting; its branch is rerun by CHANNEL_RETRY."""
+
+
+# Each channel branch gets three attempts, 10 s then 20 s apart. Only errors that certainly left
+# no post behind are retried (see is_transient_publication_error), so a retry cannot duplicate.
+CHANNEL_ATTEMPTS = 3
+CHANNEL_RETRY = RetryPolicy(
+    max_attempts=CHANNEL_ATTEMPTS,
+    initial_interval=10.0,
+    backoff_factor=2.0,
+    retry_on=TransientChannelError,
+)
 
 
 def build_release_comms_workflow() -> Any:
@@ -862,25 +890,108 @@ def build_release_comms_workflow() -> Any:
                     )
             except PublicationError as error:
                 _emit(state, "internal_note_failed", {"error": str(error)[:200]})
-        published, errors = publish_release_drafts(
-            project=state["project"],
-            drafts=drafts_dict or {},
+        drafts = drafts_dict or {}
+        batch = next_publication_batch(
+            repo=state["project"].repo,
+            drafts=drafts,
             recommended_channels=recommended_channels,
-            env=os.environ,
-            dry_run=False,
             already_published=already_published,
             image_overrides=state.get("image_overrides"),
-            publication_delay_min_seconds=0,
-            publication_delay_max_seconds=0,
-            max_publications=1,
-            on_receipt=state["publication_sink"],
-            pending_provider_ids=pending_provider_ids,
-            source_id=str(state["promote_run_id"]),
-            devvit_app_dir=(state["config"].devvit_app_dir),
-            devvit_subreddit=(state["config"].devvit_subreddit or state["config"].subreddit),
-            release_sha=str(state.get("new_sha") or ""),
         )
+        _emit(state, "publication_planned", {
+            "page_url": batch.page_url if batch else "",
+            "channels": ",".join(job.channel for job in batch.jobs) if batch else "",
+        })
+        return {
+            "publications": publications,
+            "publication_batch": batch,
+            "publication_context": {
+                "drafts": drafts,
+                "recommended_channels": recommended_channels,
+                "already_published": already_published,
+                "pending_provider_ids": pending_provider_ids,
+            },
+        }
+
+    def fan_out_channels(state: ReleaseCommsState) -> Any:
+        """One parallel branch per channel of the planned message (LangGraph Send)."""
+        if state.get("result") is not None:
+            return END
+        batch = state.get("publication_batch")
+        if batch is None or not batch.jobs:
+            return "finish_publication"
+        context = state["publication_context"]
+        shared = {
+            "project": state["project"],
+            "config": state["config"],
+            "already_published": set(context["already_published"]),
+            "pending_provider_ids": context["pending_provider_ids"],
+            "image_overrides": state.get("image_overrides"),
+            "publication_sink": state["publication_sink"],
+            "on_event": state.get("on_event"),
+            "source_id": str(state["promote_run_id"]),
+            "release_sha": str(state.get("new_sha") or ""),
+        }
+        return [Send("publish_channel", {**shared, "job": job}) for job in batch.jobs]
+
+    def publish_channel(branch: dict[str, Any], runtime: Runtime) -> dict[str, Any]:
+        """Publish one channel; retry a safe transient failure, otherwise report it as data."""
+        job = branch["job"]
+        attempt = runtime.execution_info.node_attempt if runtime.execution_info else 1
+        config: ReleaseCommsConfig = branch["config"]
+        try:
+            receipts = publish_channel_job(
+                job,
+                project=branch["project"],
+                env=os.environ,
+                dry_run=False,
+                already_published=branch["already_published"],
+                on_receipt=branch["publication_sink"],
+                image_overrides=branch["image_overrides"],
+                pending_provider_ids=branch["pending_provider_ids"],
+                source_id=branch["source_id"],
+                devvit_app_dir=config.devvit_app_dir,
+                devvit_subreddit=config.devvit_subreddit or config.subreddit,
+                release_sha=branch["release_sha"],
+            )
+        except Exception as error:
+            retry = (
+                job.channel in RETRYABLE_CHANNELS
+                and attempt < CHANNEL_ATTEMPTS
+                and is_transient_publication_error(error)
+            )
+            _emit(branch, "channel_retry" if retry else "channel_failed", {
+                "channel": job.channel, "attempt": attempt, "error": str(error)[:200],
+            })
+            if retry:
+                raise TransientChannelError(str(error)) from error
+            return {"channel_results": [{
+                "channel": job.channel, "receipts": [], "error": f"{job.channel} {job.page_url}: {error}",
+            }]}
+        _emit(branch, "channel_published", {"channel": job.channel, "attempt": attempt})
+        return {"channel_results": [{"channel": job.channel, "receipts": receipts, "error": ""}]}
+
+    def finish_publication(state: ReleaseCommsState) -> dict[str, Any]:
+        """Join the channel branches: gather receipts, then schedule the next message or report."""
+        publications: dict[str, Any] = state.get("publications") or {}
+        context = state.get("publication_context") or {}
+        drafts_dict = context.get("drafts") or {}
+        recommended_channels = context.get("recommended_channels") or []
+        already_published = set(context.get("already_published") or set())
+        batch = state.get("publication_batch")
+        published: dict[str, list[dict[str, Any]]] = {name: [] for name in RESULT_CHANNELS}
+        errors = list(batch.errors) if batch is not None else []
+        for outcome in state.get("channel_results") or []:
+            published[outcome["channel"]].extend(outcome["receipts"])
+            if outcome["error"]:
+                errors.append(outcome["error"])
+            for receipt in outcome["receipts"]:
+                already_published.add(publication_key(
+                    receipt["channel"], receipt["destination"], receipt["page_url"],
+                    receipt.get("message_id") or "",
+                ))
         publications.update(published)
+        evaluation = state.get("evaluator_result")
         completed = not errors
         postworthy = bool(state["evaluator_result"] and state["evaluator_result"].postworthy)
         remaining = pending_publication_count(
@@ -964,6 +1075,8 @@ def build_release_comms_workflow() -> Any:
     graph.add_node("adapt_threads", adapt_threads)
     graph.add_node("generate_art", generate_art)
     graph.add_node("publish_destinations", publish_destinations)
+    graph.add_node("publish_channel", publish_channel, retry_policy=CHANNEL_RETRY)
+    graph.add_node("finish_publication", finish_publication)
     graph.add_node("schedule_publication", schedule_publication)
 
     graph.add_edge(START, "resolve_context")
@@ -975,7 +1088,11 @@ def build_release_comms_workflow() -> Any:
     graph.add_edge("merge_drafts", "adapt_threads")
     graph.add_conditional_edges("adapt_threads", pick_art)
     graph.add_edge("generate_art", "publish_destinations")
-    graph.add_conditional_edges("publish_destinations", route_after_publish)
+    graph.add_conditional_edges(
+        "publish_destinations", fan_out_channels, ["publish_channel", "finish_publication", END]
+    )
+    graph.add_edge("publish_channel", "finish_publication")
+    graph.add_conditional_edges("finish_publication", route_after_publish)
     graph.add_edge("schedule_publication", END)
 
     return graph.compile()

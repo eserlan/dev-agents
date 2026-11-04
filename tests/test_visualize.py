@@ -285,16 +285,14 @@ def test_release_comms_graph_branches_to_publication_channels() -> None:
         "channel:github_discussions",
         "channel:x",
     }
-    assert all(
-        {"source": "publish_destinations", "target": channel, "conditional": False}
-        in graph["edges"]
-        for channel in channel_ids
-    )
+    for channel in channel_ids:
+        assert {"source": "publish_destinations", "target": channel, "conditional": True} in graph["edges"]
+        assert {"source": channel, "target": "finish_publication", "conditional": False} in graph["edges"]
     assert {"id": "schedule_publication", "label": "schedule_publication", "kind": "node"} in graph[
         "nodes"
     ]
     assert {
-        "source": "publish_destinations",
+        "source": "finish_publication",
         "target": "schedule_publication",
         "conditional": True,
     } in graph["edges"]

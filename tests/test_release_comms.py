@@ -608,13 +608,16 @@ def test_exact_channels_keeps_discord_out_of_injected_bluesky_drafts(
     monkeypatch.setattr(
         "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
     )
-    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_publish._discord_config", lambda repo: [{"id": "main-community"}]
+    )
+    seen: list[str] = []
 
-    def fake_publish(**kwargs: Any) -> tuple[dict[str, Any], list[str]]:
-        seen.append(list(kwargs["recommended_channels"]))
-        return {}, []
+    def fake_publish(job: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        seen.append(job.channel)
+        return []
 
-    monkeypatch.setattr("dev_agents.workflows.release_comms.publish_release_drafts", fake_publish)
+    monkeypatch.setattr("dev_agents.workflows.release_comms.publish_channel_job", fake_publish)
 
     run_release_comms(
         project,
@@ -625,11 +628,13 @@ def test_exact_channels_keeps_discord_out_of_injected_bluesky_drafts(
         evaluator_result=EvaluatorResult(
             postworthy=True, reason="Reminder", recommended_channels=channels
         ),
-        writer_result=WriterResult(bluesky=[{"pageUrl": "https://example.com/a", "text": "A"}]),
+        writer_result=WriterResult(
+            bluesky=[{"pageUrl": "https://example.com/a", "text": "A", "image": "https://example.com/a.png"}]
+        ),
         new_sha="sha",
         previous_sha="sha",
         notify_tracking_issue=False,
         exact_channels=exact_channels,
     )
 
-    assert seen == [expected]
+    assert sorted(seen) == sorted(expected)
