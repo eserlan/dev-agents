@@ -581,3 +581,55 @@ def test_answer_content_posts_reach_podcast_only_when_enabled(
     assert result.scheduled is True
     assert podcast_pages == ([answer] if enabled else [])
     assert [item["page_url"] for item in result.published["instagram"]] == [answer]
+
+
+@pytest.mark.parametrize(
+    ("channels", "exact_channels", "expected"),
+    [
+        (["bluesky"], False, ["bluesky", "discord"]),
+        (["bluesky"], True, ["bluesky"]),
+        (["bluesky", "instagram"], True, ["bluesky", "instagram"]),
+    ],
+)
+def test_exact_channels_keeps_discord_out_of_injected_bluesky_drafts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    channels: list[str],
+    exact_channels: bool,
+    expected: list[str],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(state_path=tmp_path / "release.db", image_generation=False),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
+    )
+    seen: list[list[str]] = []
+
+    def fake_publish(**kwargs: Any) -> tuple[dict[str, Any], list[str]]:
+        seen.append(list(kwargs["recommended_channels"]))
+        return {}, []
+
+    monkeypatch.setattr("dev_agents.workflows.release_comms.publish_release_drafts", fake_publish)
+
+    run_release_comms(
+        project,
+        "demo",
+        "reminder-1",
+        dry_run=False,
+        publish_approved=True,
+        evaluator_result=EvaluatorResult(
+            postworthy=True, reason="Reminder", recommended_channels=channels
+        ),
+        writer_result=WriterResult(bluesky=[{"pageUrl": "https://example.com/a", "text": "A"}]),
+        new_sha="sha",
+        previous_sha="sha",
+        notify_tracking_issue=False,
+        exact_channels=exact_channels,
+    )
+
+    assert seen == [expected]

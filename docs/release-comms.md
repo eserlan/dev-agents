@@ -96,6 +96,21 @@ the same image was published through its article page). The scheduler publishes 
 interval, rotates past failed images while unused assets remain, and uses the last stored gallery
 inventory if the gallery cannot be reached during a refresh.
 
+Bluesky reminders (`release_comms.bluesky_reminders`) resurface existing blog, answer and `/for/`
+pages on Bluesky. A page is eligible once it has a title and has never been published to Bluesky,
+whether by a release announcement or an earlier reminder; query strings are ignored when
+comparing pages. A reminder is posted only when the configured interval (default 24 hours,
+12–168) has passed since the last Bluesky post of any kind, so reminders never crowd a release
+announcement. Answers lead with their question, blog posts are prefixed "From the blog:", and the
+configured hashtags and the page link follow. Reminders go to Bluesky only: unlike other injected
+Bluesky drafts, they are not mirrored to Discord. Pages whose last attempt failed are retried only
+after every fresh page has been used.
+
+With `mirror_to_instagram: true` (and `instagram` in `destinations`), each reminder posts the same
+text and image to Instagram in the same run. A page is then eligible only if it has been posted to
+neither channel. Pacing still follows Bluesky; the Instagram gallery backfill keeps running and its
+spacing counts the mirrored posts, so the two never stack.
+
 The target repository only supplies repository-specific inputs: the GitHub
 slug, `.social/discord-destinations.yaml`, and release copy/image metadata.
 It no longer needs a listener, publisher script, or daemon systemd unit.

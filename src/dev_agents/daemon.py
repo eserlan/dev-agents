@@ -42,6 +42,10 @@ from dev_agents.pr_fixer import (
 )
 from dev_agents.runtime import StateRepository, state_database_path
 from dev_agents.runtime.github import gh
+from dev_agents.workflows.bluesky_reminders import (
+    latest_publication_time,
+    select_bluesky_reminder,
+)
 from dev_agents.workflows.content_queue import (
     draft_backlog_item,
     next_backlog_item,
@@ -703,20 +707,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
         interval = max(60, backfill_config.poll_seconds)
         minimum_spacing = timedelta(hours=backfill_config.interval_hours)
         last_attempt_slot: int | None = None
-
-        def latest_instagram_post(records: list[Any]) -> datetime | None:
-            times: list[datetime] = []
-            for record in records:
-                if record.status not in ("published", "staged"):
-                    continue
-                try:
-                    posted_at = datetime.fromisoformat(record.published_at)
-                except ValueError:
-                    continue
-                if posted_at.tzinfo is None:
-                    posted_at = posted_at.replace(tzinfo=UTC)
-                times.append(posted_at.astimezone(UTC))
-            return max(times, default=None)
+        latest_instagram_post = latest_publication_time
 
         while True:
             time.sleep(interval)
@@ -865,6 +856,107 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
 
             Thread(target=run_backfill, daemon=True).start()
 
+    def bluesky_reminder_scheduler() -> None:
+        """Resurface one article or answer page on Bluesky when the interval is due."""
+        comms_config = project.release_comms
+        reminder_config = comms_config.bluesky_reminders if comms_config is not None else None
+        if (
+            comms_config is None
+            or reminder_config is None
+            or not reminder_config.enabled
+            or not comms_config.auto_publish
+            or "bluesky" not in comms_config.destinations
+        ):
+            return
+        workflow = "bluesky-reminder"
+        state_path = state_database_path(
+            comms_config.state_path, project.repo / ".dev-agents/release-comms-state.db"
+        )
+        claims = StateRepository(state_path, project_name, project.repo)
+        interval = max(60, reminder_config.poll_seconds)
+        minimum_spacing = timedelta(hours=reminder_config.interval_hours)
+        last_attempt_slot: int | None = None
+        channels = ["bluesky"]
+        if reminder_config.mirror_to_instagram and "instagram" in comms_config.destinations:
+            channels.append("instagram")
+
+        def spacing_elapsed() -> bool:
+            # Release posts count too, so a reminder never lands right after an announcement.
+            latest = latest_publication_time(
+                claims.list_publications(channel="bluesky", limit=10000)
+            )
+            return latest is None or datetime.now(UTC) - latest >= minimum_spacing
+
+        while True:
+            time.sleep(interval)
+            slot = int(datetime.now(UTC).timestamp() // minimum_spacing.total_seconds())
+            if last_attempt_slot == slot or not spacing_elapsed():
+                continue
+            run_id = f"{workflow}-{slot}"
+            claim = claims.claim_run(workflow, run_id, metadata={})
+            last_attempt_slot = slot
+            if not claim.claimed:
+                continue
+
+            def run_reminder(run_id: str = run_id, slot: int = slot) -> None:
+                try:
+                    if not spacing_elapsed():
+                        claims.complete_run(
+                            workflow, run_id, metadata={"skipped": "bluesky-spacing-interval-not-elapsed"}
+                        )
+                        return
+                    if project.github is None:
+                        raise RuntimeError("Bluesky reminders require a GitHub repository")
+                    production_sha = gh(
+                        project.repo, "api", f"repos/{project.github}/commits/main", "--jq", ".sha"
+                    )
+                    ensure_shas_present(project.repo, production_sha)
+                    candidate = select_bluesky_reminder(
+                        collect_content_image_posts(project.repo, production_sha, None, include_all=True),
+                        [
+                            record
+                            for channel in channels
+                            for record in claims.list_publications(channel=channel, limit=10000)
+                        ],
+                        slot,
+                        reminder_config.hashtags,
+                    )
+                    if candidate is None:
+                        claims.complete_run(
+                            workflow, run_id, metadata={"completed": "no-unposted-pages"}
+                        )
+                        return
+                    result = run_release_comms(
+                        project,
+                        project_name,
+                        run_id,
+                        dry_run=False,
+                        publish_approved=True,
+                        evaluator_result=EvaluatorResult(
+                            postworthy=True,
+                            reason="scheduled Bluesky page reminder",
+                            importance="low",
+                            features=[{"name": "Existing article or answer page"}],
+                            recommended_channels=channels,
+                        ),
+                        writer_result=WriterResult(bluesky=[candidate]),
+                        new_sha=production_sha,
+                        previous_sha=production_sha,
+                        notify_tracking_issue=False,
+                        exact_channels=True,
+                    )
+                    claims.complete_run(
+                        workflow,
+                        run_id,
+                        metadata={"page_url": candidate["pageUrl"], "completed": result.completed},
+                    )
+                    _log(f"{workflow} page={candidate['pageUrl']} completed={result.completed}")
+                except Exception as error:  # noqa: BLE001 - the scheduler must keep serving
+                    claims.complete_run(workflow, run_id, status="failed", error=str(error))
+                    _log(f"{workflow} error: {error}")
+
+            Thread(target=run_reminder, daemon=True).start()
+
     _log(f"listening on 127.0.0.1:{config.port}{config.webhook_path} for {project.github}")
     Thread(target=service.reconcile_loop, daemon=True).start()
     for issue_service in issue_services:
@@ -873,6 +965,7 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
     Thread(target=release_comms_scheduler, daemon=True).start()
     Thread(target=content_queue_scheduler, daemon=True).start()
     Thread(target=instagram_image_backfill_scheduler, daemon=True).start()
+    Thread(target=bluesky_reminder_scheduler, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", config.port), Handler).serve_forever()
 
 

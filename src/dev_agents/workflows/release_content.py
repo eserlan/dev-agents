@@ -311,6 +311,7 @@ def collect_content_image_posts(
             "text": f"New from Codex Cryptica: {title}. Read the guide: {page_url}",
             "pageUrl": page_url,
             "image": image_url,
+            "title": title,
         })
     return posts
 
