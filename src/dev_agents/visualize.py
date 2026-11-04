@@ -538,9 +538,9 @@ def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
             ],
         }
     if workflow == "release-comms":
-        # The platform calls happen inside the target publisher subprocess rather than as
-        # separate Python LangGraph nodes. These channel nodes are an explicit observability
-        # projection, populated with receipts from the publications table at render time.
+        # Each channel of a message is its own LangGraph branch (one `publish_channel` task per
+        # channel, sent from `publish_destinations`). They are drawn per channel rather than as the
+        # single `publish_channel` node and are coloured from the publications table at render time.
         channel_nodes = [
             {"id": f"channel:{channel}", "label": label, "kind": "channel"}
             for channel, label in (
@@ -562,8 +562,9 @@ def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
             {"id": "merge_drafts", "label": "merge_drafts", "kind": "node"},
             {"id": "generate_art", "label": "generate_art", "kind": "node"},
             {"id": "publish_destinations", "label": "publish_destinations", "kind": "node"},
-            {"id": "schedule_publication", "label": "schedule_publication", "kind": "node"},
             *channel_nodes,
+            {"id": "finish_publication", "label": "finish_publication", "kind": "node"},
+            {"id": "schedule_publication", "label": "schedule_publication", "kind": "node"},
             {"id": "__end__", "label": "END", "kind": "end"},
         ]
         edge_specs: list[tuple[str, str, bool]] = [
@@ -578,10 +579,13 @@ def workflow_graph(workflow: str) -> dict[str, list[dict[str, Any]]]:
             ("merge_drafts", "generate_art", True),
             ("merge_drafts", "publish_destinations", True),
             ("generate_art", "publish_destinations", False),
-            ("publish_destinations", "schedule_publication", True),
+            *[("publish_destinations", node["id"], True) for node in channel_nodes],
+            *[(node["id"], "finish_publication", False) for node in channel_nodes],
+            ("publish_destinations", "finish_publication", True),
+            ("publish_destinations", "__end__", True),
+            ("finish_publication", "schedule_publication", True),
+            ("finish_publication", "__end__", True),
             ("schedule_publication", "__end__", False),
-            *[("publish_destinations", node["id"], False) for node in channel_nodes],
-            *[(node["id"], "__end__", False) for node in channel_nodes],
         ]
         edges = [
             {"source": source, "target": target, "conditional": conditional}

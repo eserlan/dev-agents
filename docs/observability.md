@@ -20,8 +20,9 @@ Open the generated HTML file in a browser. It contains an interactive canvas exp
   arranged side-by-side;
 - inspect the `pr-review` flow, including the initial general/Codex-Cryptica passes and any bounded
   targeted post-fix verification used when a green PR has no submitted Copilot review;
-- see release-comms fan out from `publish_destinations` into platform branches; these branches are
-  colored from persisted publication receipts and show their public destination when clicked;
+- see release-comms fan out from `publish_destinations` into one LangGraph branch per platform, joined
+  by `finish_publication`; these branches are colored from persisted publication receipts and show
+  their public destination when clicked;
 - click a node to inspect every event recorded for that node, including timestamps and metadata;
 - click an event in the timeline to focus its node;
 - drag to pan, scroll to zoom, and reset the view when needed;

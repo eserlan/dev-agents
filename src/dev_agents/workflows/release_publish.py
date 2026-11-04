@@ -13,6 +13,7 @@ import json
 import random
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -952,79 +953,81 @@ def resolve_image(
     return image_url, f"A tabletop roleplaying illustration for {page_url}"
 
 
-def publish_release_drafts(
-    *,
-    project: ProjectConfig,
-    drafts: Mapping[str, Any],
-    recommended_channels: list[str],
-    env: Mapping[str, str],
-    dry_run: bool,
-    already_published: set[tuple[str, str]],
-    image_overrides: Mapping[str, str] | None = None,
-    publication_delay_min_seconds: float = 900.0,
-    publication_delay_max_seconds: float = 1800.0,
-    max_publications: int | None = None,
-    on_receipt: Callable[[PublicationReceipt], None],
-    pending_provider_ids: Mapping[tuple[str, str], str] | None = None,
-    source_id: str = "",
-    devvit_app_dir: Path | None = None,
-    devvit_subreddit: str | None = None,
-    release_sha: str = "",
-) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
-    """Publish channel variants in message batches, checkpointing each receipt.
+RESULT_CHANNELS = (
+    "bluesky",
+    "threads",
+    "github_discussions",
+    "instagram",
+    "x",
+    "pinterest",
+    "discord",
+    "reddit",
+    "podcast",
+)
+# Channels whose adapter is safe to rerun after a transient failure: a failed attempt leaves no
+# partial post that a retry could duplicate. Discord (several destinations), Threads (resumable
+# container), Reddit and podcast staging, and GitHub Discussions are excluded.
+RETRYABLE_CHANNELS = frozenset({"bluesky", "instagram", "x", "pinterest"})
+TRANSIENT_HTTP_STATUSES = frozenset({429, 502, 503, 504})
 
-    A batch represents one feature/page message. All enabled channel variants
-    of that message are attempted without an inter-channel delay. The delay,
-    when enabled, is only applied before a subsequent distinct message.
+MessageBatch = tuple[
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]
+
+
+def is_transient_publication_error(error: BaseException) -> bool:
+    """Whether a failure certainly happened before the post was created, so a retry is safe.
+
+    Only rate limiting, gateway errors and connections that were never established qualify. A
+    timeout or a dropped connection may have reached the platform, so it is never retried.
     """
-    result: dict[str, list[dict[str, Any]]] = {
-        name: []
-        for name in (
-            "bluesky",
-            "threads",
-            "github_discussions",
-            "instagram",
-            "x",
-            "pinterest",
-            "discord",
-            "reddit",
-            "podcast",
-        )
-    }
-    from .release_coverage import prepare_messages
-    prepare_messages(drafts)
-    errors: list[str] = []
-    message_batches_published = 0
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, urllib.error.HTTPError):
+            return current.code in TRANSIENT_HTTP_STATUSES
+        if isinstance(current, urllib.error.URLError):
+            reason = current.reason
+            return isinstance(reason, ConnectionRefusedError | socket.gaierror)
+        if isinstance(current, ConnectionRefusedError | socket.gaierror):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
-    active_message_id = ""
-    active_feature_ids: list[str] = []
 
-    def attributed(receipt: PublicationReceipt) -> PublicationReceipt:
-        return replace(receipt, message_id=active_message_id, metadata={
-            **(receipt.metadata or {}), "feature_ids": active_feature_ids,
-        })
+@dataclass(frozen=True)
+class ChannelJob:
+    """One channel variant of one message, with everything needed to publish it."""
 
-    def record_receipt(receipt: PublicationReceipt) -> None:
-        receipt = attributed(receipt)
-        on_receipt(receipt)
-        already_published.add(
-            publication_key(receipt.channel, receipt.destination, receipt.page_url, receipt.message_id)
-        )
+    channel: str
+    page_url: str
+    message_id: str
+    feature_ids: tuple[str, ...]
+    draft: dict[str, Any] | None
+    discussion: dict[str, Any] | None
+    thread: dict[str, Any] | None
+    instagram_draft: dict[str, Any] | None
+    image_url: str = ""
+    image_alt: str = ""
+    discord_skip: frozenset[str] = frozenset()
 
-    def batch_limit_reached() -> bool:
-        return (
-            max_publications is not None
-            and message_batches_published >= max_publications
-        )
 
-    def wait_before_message() -> None:
-        if not dry_run and message_batches_published:
-            delay_min = max(0.0, publication_delay_min_seconds)
-            delay_max = max(delay_min, publication_delay_max_seconds)
-            delay = random.uniform(delay_min, delay_max)
-            if delay > 0:
-                time.sleep(delay)
+@dataclass(frozen=True)
+class PublicationBatch:
+    """The next pending message: its channel jobs and any image error that blocked some."""
 
+    index: int
+    page_url: str
+    jobs: tuple[ChannelJob, ...]
+    errors: tuple[str, ...]
+
+
+def _message_batches(drafts: Mapping[str, Any]) -> list[MessageBatch]:
+    """Group channel variants into messages (one feature or page each), in publishing order."""
     bluesky_drafts = drafts.get("bluesky") or []
     discussion_drafts = [
         draft for draft in (drafts.get("github_discussions") or []) if isinstance(draft, dict)
@@ -1033,14 +1036,7 @@ def publish_release_drafts(
     instagram_drafts = [draft for draft in (drafts.get("instagram") or []) if isinstance(draft, dict)]
     used_discussions: set[int] = set()
     used_threads: set[int] = set()
-    batches: list[
-        tuple[
-            dict[str, Any] | None,
-            dict[str, Any] | None,
-            dict[str, Any] | None,
-            dict[str, Any] | None,
-        ]
-    ] = []
+    batches: list[MessageBatch] = []
 
     for index, draft in enumerate(bluesky_drafts):
         if not isinstance(draft, dict):
@@ -1106,44 +1102,60 @@ def publish_release_drafts(
     if not batches and drafts.get("discord"):
         batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None, None))
 
-    # Destinations come from a file on disk; read them once per run, not per batch.
+    # Backwards-compatible fallback for manually injected legacy state that
+    # has only a combined Discord draft and no Bluesky drafts.
+    if not batches and drafts.get("discord"):
+        batches.append((None, {"text": str(drafts["discord"]), "pageUrl": ""}, None, None))
+    return batches
+
+
+def next_publication_batch(
+    *,
+    repo: Path,
+    drafts: Mapping[str, Any],
+    recommended_channels: list[str],
+    already_published: set[tuple[str, str]],
+    image_overrides: Mapping[str, str] | None = None,
+    start: int = 0,
+) -> PublicationBatch | None:
+    """Plan the first message at or after ``start`` that still has a channel to publish."""
+    from .release_coverage import feature_ids, message_id, prepare_messages
+
+    prepare_messages(drafts)
+    batches = _message_batches(drafts)
     discord_destination_ids = (
-        [str(destination.get("id", "main-community")) for destination in _discord_config(project.repo)]
+        [str(destination.get("id", "main-community")) for destination in _discord_config(repo)]
         if "discord" in recommended_channels and batches
         else []
     )
-    for draft, discussion, thread, instagram_draft in batches:
-        page_url = str((draft or instagram_draft or thread or discussion or {}).get("pageUrl", ""))
-        from .release_coverage import feature_ids, message_id
+
+    def unpublished(channel: str, page_url: str, identity: str, destination: str | None = None) -> bool:
+        return publication_key(channel, destination or channel, page_url, identity) not in already_published
+
+    for index in range(start, len(batches)):
+        draft, discussion, thread, instagram_draft = batches[index]
         identity_draft = draft or instagram_draft or thread or discussion or {}
-        active_message_id = message_id(identity_draft)
-        active_feature_ids = feature_ids(identity_draft)
-        draft_text = str((draft or {}).get("text", ""))
+        page_url = str(identity_draft.get("pageUrl", ""))
+        identity = message_id(identity_draft)
         pending = False
         if draft is not None:
             pending = any(
-                channel in recommended_channels
-                and publication_key(channel, channel, page_url, active_message_id) not in already_published
+                channel in recommended_channels and unpublished(channel, page_url, identity)
                 for channel in ("bluesky", "instagram", "x", "pinterest")
             )
         if instagram_draft is not None and "instagram" in recommended_channels:
-            pending = pending or publication_key("instagram", "instagram", page_url, active_message_id) not in already_published
+            pending = pending or unpublished("instagram", page_url, identity)
         if instagram_draft is not None and "podcast" in recommended_channels and podcast_answer_slug(page_url):
-            pending = pending or publication_key("podcast", "podcast", page_url, active_message_id) not in already_published
+            pending = pending or unpublished("podcast", page_url, identity)
         if discussion is not None and "github_discussions" in recommended_channels:
-            pending = pending or publication_key(
-                "github_discussions", "github_discussions", page_url, active_message_id) not in already_published
+            pending = pending or unpublished("github_discussions", page_url, identity)
         if discussion is not None and "reddit" in recommended_channels:
-            pending = pending or publication_key(
-                "reddit", "reddit", page_url, active_message_id) not in already_published
+            pending = pending or unpublished("reddit", page_url, identity)
         if thread is not None and "threads" in recommended_channels:
-            pending = (
-                pending or publication_key("threads", "threads", page_url, active_message_id) not in already_published
-            )
+            pending = pending or unpublished("threads", page_url, identity)
         if "discord" in recommended_channels and draft is not None:
             pending = pending or any(
-                publication_key("discord", destination_id, page_url, active_message_id)
-                not in already_published
+                unpublished("discord", page_url, identity, destination_id)
                 for destination_id in discord_destination_ids
             )
         if draft is None and discussion is None and thread is None and instagram_draft is None:
@@ -1151,8 +1163,7 @@ def publish_release_drafts(
         if not pending:
             continue
 
-        wait_before_message()
-        errors_before_batch = len(errors)
+        errors: list[str] = []
         image_url = image_alt = ""
         image_draft = draft or instagram_draft
         if image_draft is not None:
@@ -1161,172 +1172,263 @@ def publish_release_drafts(
             except Exception as error:  # noqa: BLE001
                 errors.append(f"image {page_url}: {error}")
 
-        if (
-            thread is not None
-            and "threads" in recommended_channels
-            and publication_key("threads", "threads", page_url, active_message_id) not in already_published
-        ):
-            try:
-                thread_image_url = ""
-                thread_image_alt = ""
-                if str(thread.get("image", "")).strip():
-                    thread_image_url, thread_image_alt = resolve_image(thread, image_overrides)
-                provider = SOCIAL_PUBLISHERS["threads"]
+        message = ChannelJob(
+            channel="",
+            page_url=page_url,
+            message_id=identity,
+            feature_ids=tuple(feature_ids(identity_draft)),
+            draft=draft,
+            discussion=discussion,
+            thread=thread,
+            instagram_draft=instagram_draft,
+            image_url=image_url,
+            image_alt=image_alt,
+        )
 
-                def checkpoint_external_id(
-                    container_id: str, metadata: dict[str, Any], *, source_url: str = page_url
-                ) -> None:
-                    on_receipt(attributed(
-                        PublicationReceipt(
-                            "threads",
-                            "threads",
-                            source_url,
-                            external_id=container_id,
-                            metadata={**metadata, "source_id": source_id, "status": "pending"},
-                        )
-                    ))
-
-                receipt = provider.publish(
-                    SocialPost(
-                        text=str(thread.get("text", "")),
-                        canonical_url=page_url,
-                        source_id=source_id,
-                        image_url=thread_image_url,
-                        image_alt=thread_image_alt,
-                        topic_tag=str(thread.get("topic_tag", "")),
-                    ),
-                    options=(
-                        project.release_comms.destination_options.get("threads", {})
-                        if project.release_comms is not None
-                        else {}
-                    ),
-                    env=env,
-                    dry_run=dry_run,
-                    pending_external_id=(pending_provider_ids or {}).get(("threads", active_message_id or page_url)),
-                    on_checkpoint=checkpoint_external_id,
-                )
-                record_receipt(receipt)
-                result["threads"].append(receipt.__dict__)
-            except Exception as error:  # noqa: BLE001
-                errors.append(f"threads {page_url}: {error}")
-
+        jobs: list[ChannelJob] = []
+        if thread is not None and "threads" in recommended_channels and unpublished("threads", page_url, identity):
+            jobs.append(replace(message, channel="threads"))
         if (draft is not None or instagram_draft is not None) and image_url:
-            if draft is not None and "bluesky" in recommended_channels and publication_key("bluesky", "bluesky", page_url, active_message_id) not in already_published:
-                try:
-                    receipt = publish_bluesky(text=draft_text, page_url=page_url, image_url=image_url, image_alt=image_alt, env=env, dry_run=dry_run)
-                    record_receipt(receipt)
-                    result["bluesky"].append(receipt.__dict__)
-                except Exception as error:  # noqa: BLE001
-                    errors.append(f"bluesky {page_url}: {error}")
-            if "instagram" in recommended_channels and publication_key("instagram", "instagram", page_url, active_message_id) not in already_published:
-                try:
-                    caption_source = str((instagram_draft or draft or {}).get("text", ""))
-                    caption = (
-                        caption_source
-                        if instagram_draft is not None
-                        and instagram_draft.get("galleryAsset") == "true"
-                        else prepare_bluesky_text(caption_source, page_url)
-                    )
-                    receipt = publish_instagram(caption=caption, page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
-                    record_receipt(receipt)
-                    result["instagram"].append(receipt.__dict__)
-                except Exception as error:  # noqa: BLE001
-                    errors.append(f"instagram {page_url}: {error}")
-            if draft is not None and "x" in recommended_channels and publication_key("x", "x", page_url, active_message_id) not in already_published:
-                try:
-                    receipt = publish_x(text=prepare_bluesky_text(draft_text, page_url), page_url=page_url, env=env, dry_run=dry_run)
-                    record_receipt(receipt)
-                    result["x"].append(receipt.__dict__)
-                except Exception as error:  # noqa: BLE001
-                    errors.append(f"x {page_url}: {error}")
-            if draft is not None and "pinterest" in recommended_channels and publication_key("pinterest", "pinterest", page_url, active_message_id) not in already_published:
-                try:
-                    pin_title = str((discussion or {}).get("title", "")) or draft_text.strip().split(".")[0][:100]
-                    receipt = publish_pinterest(title=pin_title, description=prepare_bluesky_text(draft_text, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run)
-                    record_receipt(receipt)
-                    result["pinterest"].append(receipt.__dict__)
-                except Exception as error:  # noqa: BLE001
-                    errors.append(f"pinterest {page_url}: {error}")
+            for channel in ("bluesky", "instagram", "x", "pinterest"):
+                needs_draft = channel != "instagram"
+                if (
+                    (draft is not None or not needs_draft)
+                    and channel in recommended_channels
+                    and unpublished(channel, page_url, identity)
+                ):
+                    jobs.append(replace(message, channel=channel))
             if draft is not None and "discord" in recommended_channels:
-                try:
-                    for receipt in publish_discord(
-                        repo=project.repo,
-                        message=derive_discord_message(prepare_bluesky_text(draft_text, page_url)),
-                        env=env,
-                        dry_run=dry_run,
-                        page_url=page_url,
-                        skip_destinations={
-                            destination_id for destination_id in discord_destination_ids
-                            if publication_key("discord", destination_id,
-                                               page_url, active_message_id) in already_published},
-                        on_receipt=record_receipt,
-                    ):
-                        if publication_key("discord", receipt.destination, page_url, active_message_id) not in already_published:
-                            record_receipt(receipt)
-                        result["discord"].append(receipt.__dict__)
-                except Exception as error:  # noqa: BLE001
-                    errors.append(f"discord {page_url}: {error}")
-
-        if discussion is not None and "github_discussions" in recommended_channels and publication_key("github_discussions", "github_discussions", page_url, active_message_id) not in already_published:
-            try:
-                discussion_image, discussion_alt = resolve_image(discussion, image_overrides)
-                body = f"{discussion.get('body', '').strip()}\n\n![{discussion_alt}]({discussion_image})"
-                receipt = publish_github_discussion(repo=project.repo, github=project.github or "", title=str(discussion.get("title", "Release update")), body=body, page_url=page_url, dry_run=dry_run)
-                record_receipt(receipt)
-                result["github_discussions"].append(receipt.__dict__)
-            except Exception as error:  # noqa: BLE001
-                errors.append(f"github_discussions {page_url}: {error}")
-
-        if discussion is not None and "reddit" in recommended_channels and publication_key("reddit", "reddit", page_url, active_message_id) not in already_published:
-            try:
-                from dev_agents.workflows.reddit import (
-                    format_reddit_post,
-                    stage_reddit_candidate,
-                )
-
-                discussion_image, _ = resolve_image(discussion, image_overrides)
-                candidate = format_reddit_post(
-                    title=str(discussion.get("title", "Release update")),
-                    body=str(discussion.get("body", "")),
-                    page_url=page_url,
-                    source_id=source_id,
-                    image_url=discussion_image,
-                )
-                receipt = stage_reddit_candidate(
-                    repo=project.repo,
-                    candidate=candidate,
-                    env=env,
-                    dry_run=dry_run,
-                    github=project.github,
-                    devvit_app_dir=devvit_app_dir,
-                    devvit_subreddit=devvit_subreddit,
-                )
-                record_receipt(receipt)
-                result["reddit"].append(receipt.__dict__)
-            except Exception as error:  # noqa: BLE001
-                errors.append(f"reddit {page_url}: {error}")
-
+                jobs.append(replace(message, channel="discord", discord_skip=frozenset(
+                    destination_id for destination_id in discord_destination_ids
+                    if not unpublished("discord", page_url, identity, destination_id)
+                )))
+        for channel in ("github_discussions", "reddit"):
+            if discussion is not None and channel in recommended_channels and unpublished(channel, page_url, identity):
+                jobs.append(replace(message, channel=channel))
         # Answer content posts become podcast episodes; the target command needs no image.
         if (
             instagram_draft is not None
             and "podcast" in recommended_channels
             and podcast_answer_slug(page_url)
-            and publication_key("podcast", "podcast", page_url, active_message_id) not in already_published
+            and unpublished("podcast", page_url, identity)
         ):
-            try:
-                receipt = publish_podcast(
-                    repo=project.repo, page_url=page_url, release_sha=release_sha, env=env, dry_run=dry_run
-                )
-                record_receipt(receipt)
-                result["podcast"].append(receipt.__dict__)
-            except Exception as error:  # noqa: BLE001
-                errors.append(f"podcast {page_url}: {error}")
+            jobs.append(replace(message, channel="podcast"))
+        return PublicationBatch(index=index, page_url=page_url, jobs=tuple(jobs), errors=tuple(errors))
+    return None
 
-        if len(errors) > errors_before_batch:
+
+def publish_channel_job(
+    job: ChannelJob,
+    *,
+    project: ProjectConfig,
+    env: Mapping[str, str],
+    dry_run: bool,
+    already_published: set[tuple[str, str]],
+    on_receipt: Callable[[PublicationReceipt], None],
+    image_overrides: Mapping[str, str] | None = None,
+    pending_provider_ids: Mapping[tuple[str, str], str] | None = None,
+    source_id: str = "",
+    devvit_app_dir: Path | None = None,
+    devvit_subreddit: str | None = None,
+    release_sha: str = "",
+) -> list[dict[str, Any]]:
+    """Publish one channel variant, checkpointing each receipt; raise if the channel fails."""
+    page_url = job.page_url
+    draft, discussion, thread, instagram_draft = job.draft, job.discussion, job.thread, job.instagram_draft
+    draft_text = str((draft or {}).get("text", ""))
+    image_url, image_alt = job.image_url, job.image_alt
+    published: list[dict[str, Any]] = []
+
+    def attributed(receipt: PublicationReceipt) -> PublicationReceipt:
+        return replace(receipt, message_id=job.message_id, metadata={
+            **(receipt.metadata or {}), "feature_ids": list(job.feature_ids),
+        })
+
+    def record_receipt(receipt: PublicationReceipt) -> None:
+        receipt = attributed(receipt)
+        on_receipt(receipt)
+        already_published.add(
+            publication_key(receipt.channel, receipt.destination, receipt.page_url, receipt.message_id)
+        )
+
+    def record(receipt: PublicationReceipt) -> None:
+        record_receipt(receipt)
+        published.append(receipt.__dict__)
+
+    if job.channel == "threads":
+        assert thread is not None
+        thread_image_url = ""
+        thread_image_alt = ""
+        if str(thread.get("image", "")).strip():
+            thread_image_url, thread_image_alt = resolve_image(thread, image_overrides)
+
+        def checkpoint_external_id(
+            container_id: str, metadata: dict[str, Any], *, source_url: str = page_url
+        ) -> None:
+            on_receipt(attributed(
+                PublicationReceipt(
+                    "threads",
+                    "threads",
+                    source_url,
+                    external_id=container_id,
+                    metadata={**metadata, "source_id": source_id, "status": "pending"},
+                )
+            ))
+
+        record(SOCIAL_PUBLISHERS["threads"].publish(
+            SocialPost(
+                text=str(thread.get("text", "")),
+                canonical_url=page_url,
+                source_id=source_id,
+                image_url=thread_image_url,
+                image_alt=thread_image_alt,
+                topic_tag=str(thread.get("topic_tag", "")),
+            ),
+            options=(
+                project.release_comms.destination_options.get("threads", {})
+                if project.release_comms is not None
+                else {}
+            ),
+            env=env,
+            dry_run=dry_run,
+            pending_external_id=(pending_provider_ids or {}).get(("threads", job.message_id or page_url)),
+            on_checkpoint=checkpoint_external_id,
+        ))
+    elif job.channel == "bluesky":
+        record(publish_bluesky(text=draft_text, page_url=page_url, image_url=image_url, image_alt=image_alt, env=env, dry_run=dry_run))
+    elif job.channel == "instagram":
+        caption_source = str((instagram_draft or draft or {}).get("text", ""))
+        caption = (
+            caption_source
+            if instagram_draft is not None
+            and instagram_draft.get("galleryAsset") == "true"
+            else prepare_bluesky_text(caption_source, page_url)
+        )
+        record(publish_instagram(caption=caption, page_url=page_url, image_url=image_url, env=env, dry_run=dry_run))
+    elif job.channel == "x":
+        record(publish_x(text=prepare_bluesky_text(draft_text, page_url), page_url=page_url, env=env, dry_run=dry_run))
+    elif job.channel == "pinterest":
+        pin_title = str((discussion or {}).get("title", "")) or draft_text.strip().split(".")[0][:100]
+        record(publish_pinterest(title=pin_title, description=prepare_bluesky_text(draft_text, page_url), page_url=page_url, image_url=image_url, env=env, dry_run=dry_run))
+    elif job.channel == "discord":
+        for receipt in publish_discord(
+            repo=project.repo,
+            message=derive_discord_message(prepare_bluesky_text(draft_text, page_url)),
+            env=env,
+            dry_run=dry_run,
+            page_url=page_url,
+            skip_destinations=set(job.discord_skip),
+            on_receipt=record_receipt,
+        ):
+            if publication_key("discord", receipt.destination, page_url, job.message_id) not in already_published:
+                record_receipt(receipt)
+            published.append(receipt.__dict__)
+    elif job.channel == "github_discussions":
+        assert discussion is not None
+        discussion_image, discussion_alt = resolve_image(discussion, image_overrides)
+        body = f"{discussion.get('body', '').strip()}\n\n![{discussion_alt}]({discussion_image})"
+        record(publish_github_discussion(repo=project.repo, github=project.github or "", title=str(discussion.get("title", "Release update")), body=body, page_url=page_url, dry_run=dry_run))
+    elif job.channel == "reddit":
+        assert discussion is not None
+        from dev_agents.workflows.reddit import (
+            format_reddit_post,
+            stage_reddit_candidate,
+        )
+
+        discussion_image, _ = resolve_image(discussion, image_overrides)
+        candidate = format_reddit_post(
+            title=str(discussion.get("title", "Release update")),
+            body=str(discussion.get("body", "")),
+            page_url=page_url,
+            source_id=source_id,
+            image_url=discussion_image,
+        )
+        record(stage_reddit_candidate(
+            repo=project.repo,
+            candidate=candidate,
+            env=env,
+            dry_run=dry_run,
+            github=project.github,
+            devvit_app_dir=devvit_app_dir,
+            devvit_subreddit=devvit_subreddit,
+        ))
+    elif job.channel == "podcast":
+        record(publish_podcast(repo=project.repo, page_url=page_url, release_sha=release_sha, env=env, dry_run=dry_run))
+    else:
+        raise PublicationError(f"unknown channel {job.channel}")
+    return published
+
+
+def publish_release_drafts(
+    *,
+    project: ProjectConfig,
+    drafts: Mapping[str, Any],
+    recommended_channels: list[str],
+    env: Mapping[str, str],
+    dry_run: bool,
+    already_published: set[tuple[str, str]],
+    image_overrides: Mapping[str, str] | None = None,
+    publication_delay_min_seconds: float = 900.0,
+    publication_delay_max_seconds: float = 1800.0,
+    max_publications: int | None = None,
+    on_receipt: Callable[[PublicationReceipt], None],
+    pending_provider_ids: Mapping[tuple[str, str], str] | None = None,
+    source_id: str = "",
+    devvit_app_dir: Path | None = None,
+    devvit_subreddit: str | None = None,
+    release_sha: str = "",
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """Publish channel variants in message batches, checkpointing each receipt.
+
+    A batch represents one feature/page message. All enabled channel variants
+    of that message are attempted without an inter-channel delay. The delay,
+    when enabled, is only applied before a subsequent distinct message. The
+    release-comms graph runs the same plan with one parallel branch per channel.
+    """
+    result: dict[str, list[dict[str, Any]]] = {name: [] for name in RESULT_CHANNELS}
+    errors: list[str] = []
+    message_batches_published = 0
+    start = 0
+    while max_publications is None or message_batches_published < max_publications:
+        batch = next_publication_batch(
+            repo=project.repo,
+            drafts=drafts,
+            recommended_channels=recommended_channels,
+            already_published=already_published,
+            image_overrides=image_overrides,
+            start=start,
+        )
+        if batch is None:
+            break
+        start = batch.index + 1
+        if not dry_run and message_batches_published:
+            delay_min = max(0.0, publication_delay_min_seconds)
+            delay_max = max(delay_min, publication_delay_max_seconds)
+            delay = random.uniform(delay_min, delay_max)
+            if delay > 0:
+                time.sleep(delay)
+        errors.extend(batch.errors)
+        for job in batch.jobs:
+            try:
+                result[job.channel].extend(publish_channel_job(
+                    job,
+                    project=project,
+                    env=env,
+                    dry_run=dry_run,
+                    already_published=already_published,
+                    on_receipt=on_receipt,
+                    image_overrides=image_overrides,
+                    pending_provider_ids=pending_provider_ids,
+                    source_id=source_id,
+                    devvit_app_dir=devvit_app_dir,
+                    devvit_subreddit=devvit_subreddit,
+                    release_sha=release_sha,
+                ))
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"{job.channel} {job.page_url}: {error}")
+        if errors:
             return result, errors
         message_batches_published += 1
-        if batch_limit_reached():
-            return result, errors
     return result, errors
 
 
