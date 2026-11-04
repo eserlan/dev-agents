@@ -31,6 +31,15 @@ def latest_publication_time(records: Iterable[Any]) -> datetime | None:
     return max(times, default=None)
 
 
+def _gallery_asset_key(url: str) -> str:
+    """The asset path a gallery post names (``…/gallery?asset=og%2Fx.jpg`` -> ``og/x.jpg``)."""
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("asset", [""])[0]
+
+
+def _image_key(url: str) -> str:
+    return urllib.parse.urlsplit(url.strip()).path.lstrip("/")
+
+
 def _page_key(url: str) -> str:
     """Compare pages without query strings or fragments (UTM tags, anchors)."""
     parts = urllib.parse.urlsplit(url.strip())
@@ -55,7 +64,9 @@ def select_bluesky_reminder(
     """Pick a page never posted to any reminder channel, scattered by slot.
 
     ``history`` holds the publication records of every channel the reminder posts to, so a page
-    already on Bluesky or Instagram is skipped and both channels always receive a fresh page.
+    already on Bluesky or Instagram is skipped and both channels always receive a fresh page. A
+    page whose cover image was already posted as a gallery asset is skipped too: the Instagram
+    gallery backfill posts article cover images under a gallery URL, not the page URL.
 
     Content arrives in path order, so ``slot % len(pool)`` would post neighbouring pages
     ("How do you keep notes…", "How do you keep track…") on consecutive days. Hashing the slot with
@@ -64,17 +75,22 @@ def select_bluesky_reminder(
     one broken image cannot block the queue.
     """
     posted: set[str] = set()
+    posted_images: set[str] = set()
     failed: set[str] = set()
     for record in history:
         key = _page_key(record.page_url or "")
         if record.status in POSTED_STATUSES:
             posted.add(key)
+            if asset := _gallery_asset_key(record.page_url or ""):
+                posted_images.add(asset)
         elif record.status == "failed":
             failed.add(key)
     available = [
         post
         for post in content_posts
-        if post.get("title", "").strip() and _page_key(post.get("pageUrl", "")) not in posted
+        if post.get("title", "").strip()
+        and _page_key(post.get("pageUrl", "")) not in posted
+        and _image_key(post.get("image", "")) not in posted_images
     ]
     fresh = [post for post in available if _page_key(post["pageUrl"]) not in failed]
     pool = fresh or available

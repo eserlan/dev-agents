@@ -77,6 +77,17 @@ def test_page_posted_on_either_mirrored_channel_is_skipped() -> None:
         assert select_bluesky_reminder([ANSWER, BLOG], instagram_only, slot)["pageUrl"] == BLOG["pageUrl"]  # type: ignore[index]
 
 
+def test_page_whose_image_was_posted_as_a_gallery_asset_is_skipped() -> None:
+    # The Instagram gallery backfill posted ANSWER's cover image under a gallery URL.
+    gallery = [
+        record("https://assets.codexcryptica.com/gallery?asset=" + "og%2Fgods.jpg"),
+        record("https://assets.codexcryptica.com/gallery?asset=og%2Fimport.jpg", status="failed"),
+    ]
+
+    picks = {select_bluesky_reminder([ANSWER, BLOG], gallery, slot)["pageUrl"] for slot in range(4)}  # type: ignore[index]
+    assert picks == {BLOG["pageUrl"]}
+
+
 def test_failed_pages_wait_until_fresh_pages_are_used() -> None:
     failed = [record(ANSWER["pageUrl"], status="failed")]
 
