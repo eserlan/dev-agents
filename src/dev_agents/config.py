@@ -160,6 +160,22 @@ class InstagramImageBackfillConfig(BaseModel):
     poll_seconds: int = 300
 
 
+class BlueskyRemindersConfig(BaseModel):
+    """Paced Bluesky posts that resurface existing article and answer pages."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    # Minimum spacing since the last Bluesky post of any kind, release posts included.
+    interval_hours: int = Field(default=24, ge=12, le=168)
+    poll_seconds: int = 300
+    # Appended as Bluesky hashtags, e.g. ["TTRPG", "worldbuilding"].
+    hashtags: list[str] = Field(default_factory=list)
+    # Post the same text and image to Instagram too (when instagram is a destination). Pages
+    # already posted to either channel are skipped; pacing still follows Bluesky.
+    mirror_to_instagram: bool = False
+
+
 class ReleaseCommsConfig(BaseModel):
     """Opt-in configuration for the release communications workflow."""
 
@@ -205,6 +221,7 @@ class ReleaseCommsConfig(BaseModel):
     recent_posts_days: int = 14
     content_queue: ContentQueueConfig | None = None
     instagram_image_backfill: InstagramImageBackfillConfig | None = None
+    bluesky_reminders: BlueskyRemindersConfig | None = None
 
 
 class PrFixerConfig(BaseModel):

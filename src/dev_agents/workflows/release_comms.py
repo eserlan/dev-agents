@@ -103,6 +103,8 @@ class ReleaseCommsState(TypedDict, total=False):
     previous_sha: str | None
     evaluator_result: EvaluatorResult | None
     writer_result: WriterResult | None
+    # Publish injected drafts only to the evaluator's channels, without derived ones (Discord).
+    exact_channels: bool
     forms: list[str]
     short_drafts: list[dict[str, str]]
     long_drafts: list[dict[str, str]]
@@ -537,7 +539,8 @@ def build_release_comms_workflow() -> Any:
                     discord=injected.discord,
                 )
             injected = align_discussion_images(injected)
-            eval_res = with_derived_channels(eval_res, injected, state["config"].destinations)
+            if not state.get("exact_channels"):
+                eval_res = with_derived_channels(eval_res, injected, state["config"].destinations)
             _emit(state, "drafted", _draft_counts(injected))
             _emit(state, "feature_inventory", {"features": eval_res.features,
                   "drafts": asdict(injected), "channels": eval_res.recommended_channels})
@@ -992,6 +995,7 @@ def run_release_comms(
     notify_tracking_issue: bool = True,
     on_event: ProgressEvent | None = None,
     delivery_id: str | None = None,
+    exact_channels: bool = False,
 ) -> ReleaseCommsRunResult:
     """Execute the release communications workflow."""
     config = project.release_comms or ReleaseCommsConfig()
@@ -1121,6 +1125,7 @@ def run_release_comms(
             "notify_tracking_issue": notify_tracking_issue,
             "evaluator_result": evaluator_result,
             "writer_result": writer_result,
+            "exact_channels": exact_channels,
             "image_overrides": (
                 resume_metadata.get("image_overrides", {})
                 if isinstance(resume_metadata.get("image_overrides", {}), dict)

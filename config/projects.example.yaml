@@ -118,6 +118,15 @@ projects:
       # Pick a random 15–30 minute delay between distinct live messages.
       publication_delay_min_seconds: 900
       publication_delay_max_seconds: 1800
+      # Optional paced Bluesky posts for existing article, answer and /for/ pages that have never
+      # been posted to Bluesky. Needs auto_publish and bluesky in destinations; Discord is not
+      # notified. The interval counts from the last Bluesky post of any kind.
+      # bluesky_reminders:
+      #   enabled: true
+      #   interval_hours: 24
+      #   hashtags: [TTRPG, worldbuilding]
+      #   # Same text and image to Instagram; pacing still follows Bluesky.
+      #   mirror_to_instagram: true
       scheduler_poll_seconds: 30
       webhook_path: /release-comms
       webhook_secret_env: RELEASE_COMMS_SECRET
