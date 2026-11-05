@@ -255,18 +255,17 @@ head will receive a full review.
 MAX_LISTED_FINDINGS = 10
 MAX_LISTED_FILES = 30
 
-# GitHub's Primer palette: danger-emphasis darker for critical, then danger, attention, accent.
-SEVERITY_COLOURS = {"critical": "82071e", "high": "cf222e", "medium": "bf8700", "low": "0969da"}
+# Outlined pills served from this repository's assets/review (light and dark tones in each SVG).
+SEVERITY_PILL_URL = "https://raw.githubusercontent.com/eserlan/dev-agents/main/assets/review/severity-{name}.svg"
 SEVERITY_ORDER = ("critical", "high", "medium", "low")
 
 
-def _severity_badge(severity: object) -> str:
-    """A coloured severity label; unknown severities fall back to plain bold text."""
+def _severity_label(severity: object) -> str:
+    """An outlined severity pill; unknown severities fall back to bold text."""
     name = str(severity or "unknown").lower()
-    colour = SEVERITY_COLOURS.get(name)
-    if not colour:
-        return f"**{name.upper()}**"
-    return f"![{name.upper()}](https://img.shields.io/badge/{name.upper()}-{colour}?style=flat-square)"
+    if name not in SEVERITY_ORDER:
+        return f"**{name.capitalize()}**"
+    return f"![{name.capitalize()}]({SEVERITY_PILL_URL.format(name=name)})"
 
 
 def _verdict_line(findings: list[dict[str, Any]]) -> str:
@@ -280,7 +279,7 @@ def _verdict_line(findings: list[dict[str, Any]]) -> str:
 
 def _severity_counts(findings: list[dict[str, Any]]) -> str:
     counts = [
-        f"{sum(1 for item in findings if str(item.get('severity') or '').lower() == name)} {_severity_badge(name)}"
+        f"{sum(1 for item in findings if str(item.get('severity') or '').lower() == name)} {_severity_label(name)}"
         for name in SEVERITY_ORDER
         if any(str(item.get("severity") or "").lower() == name for item in findings)
     ]
@@ -297,12 +296,13 @@ def _findings_markdown(report: dict[str, Any]) -> str:
     lines = []
     for index, item in enumerate(findings[:MAX_LISTED_FINDINGS], start=1):
         category = f" **{item['category']}**" if item.get("category") else ""
-        lines.append(f"{index}. {_severity_badge(item.get('severity'))}{category} — `{item.get('location', '?')}`")
-        lines.append(f"   - Impact: {item.get('impact', '')}")
+        lines.append(f"{index}. {_severity_label(item.get('severity'))}{category}")
+        lines.append(f"   - **Where:** `{item.get('location', '?')}`")
+        lines.append(f"   - **Impact:** {item.get('impact', '')}")
         if item.get("evidence"):
-            lines.append(f"   - Evidence: {item['evidence']}")
+            lines.append(f"   - **Evidence:** {item['evidence']}")
         if item.get("remediation"):
-            lines.append(f"   - Suggested fix: {item['remediation']}")
+            lines.append(f"   - **Suggested fix:** {item['remediation']}")
     if len(findings) > MAX_LISTED_FINDINGS:
         lines.append(f"\n…and {len(findings) - MAX_LISTED_FINDINGS} more in the run report.")
     return "\n".join(lines) + "\n"

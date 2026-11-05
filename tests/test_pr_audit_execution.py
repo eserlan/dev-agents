@@ -167,10 +167,10 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         phases = [phase for phase, _body in comments]
         assert phases.index("review-findings") < phases.index("review-fixes-started")
         findings_body = dict(comments)["review-findings"]
-        assert "![HIGH](https://img.shields.io/badge/HIGH-cf222e?style=flat-square) **security-privacy** — `feature.txt:1`" in findings_body
+        assert "![High](https://raw.githubusercontent.com/eserlan/dev-agents/main/assets/review/severity-high.svg) **security-privacy**\n   - **Where:** `feature.txt:1`" in findings_body
         assert "#### 🔴 Changes required" in findings_body
         assert "| `feature.txt` | Adds the new branch |" in findings_body
-        assert "Suggested fix: Validate before use" in findings_body
+        assert "**Suggested fix:** Validate before use" in findings_body
         assert "in the findings comment" in dict(comments)["review-fixes-started"]
     if mode == "handoff":
         assert report["handoff_agent"] == "claude"
