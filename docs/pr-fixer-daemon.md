@@ -391,7 +391,7 @@ pushes the latest commit, all automation pauses for that PR until the resume lab
 
 After a successful remediation run, the daemon also creates or updates top-level PR comments for
 that run. Each review run has one status comment (marker `<!-- dev-agents:pr-review run=… -->`)
-that is edited in place as the run moves through started, in progress, fixes started and its final
+that is edited in place as the run moves through started, in progress, fixing findings and its final
 outcome, with a collapsed run history of those steps; retries of the same run update it too. A
 fix push starts a new run and so a new status comment. The review agent must also emit a validated structured
 `REPORT_JSON` containing the verdict, findings with severity/category/location, the categories
