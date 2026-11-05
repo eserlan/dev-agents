@@ -1823,6 +1823,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
         if meta.get("autoMergeRequest"):
             _log(f"auto-merge-already-requested pr={number}")
             return
+        meta = self._lift_fix_pause_after_clean_review(number, meta)
         if not self._auto_merge_eligible(meta, keys):
             return
         if self.config.review_without_copilot and not _has_copilot_review(meta):
@@ -1872,6 +1873,34 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
             metadata={"requested": True},
         )
         _log(f"auto-merge-requested pr={number} mode=squash head={head_sha[:12]}")
+
+    def _lift_fix_pause_after_clean_review(self, number: int, meta: dict[str, Any]) -> dict[str, Any]:
+        """Remove the fix-pause label once a clean review covers the current head.
+
+        The label only keeps dev-agents from changing a branch someone is working on, and a
+        clean review leaves nothing to change, so it would only block auto-merge. A review with
+        findings halts its head under the label (see repair_gate) and never counts as clean.
+        """
+        head_sha = str(meta.get("headRefOid", "unknown"))
+        if not self._fix_paused(meta) or not self._has_completed_internal_review(number, head_sha):
+            return meta
+        label = self.config.fix_pause_label
+        try:
+            _pkg._run(self.project.repo, "gh", "pr", "edit", str(number), "--remove-label", label)
+        except RuntimeError as error:
+            _log(f"fix-pause-lift-failed pr={number} error={error}")
+            return meta
+        _log(f"fix-pause-lifted pr={number} head={head_sha[:12]}")
+        _pkg._publish_pr_run_comment(
+            self.project.repo, number, f"pr-review-{number}-{head_sha}", "fix-pause-lifted",
+            f"### 🤖 `{label}` removed\n\nThe review of `{head_sha[:12]}` came back clean, so there is "
+            "nothing left for dev-agents to fix. Auto-merge can go ahead once its other conditions hold.\n",
+        )
+        labels = [
+            item for item in meta.get("labels") or []
+            if not (isinstance(item, dict) and str(item.get("name", "")).lower() == label.strip().lower())
+        ]
+        return {**meta, "labels": labels}
 
     def _has_completed_internal_review(self, number: int, head_sha: str) -> bool:
         """Return whether the current head is covered by a completed review chain.

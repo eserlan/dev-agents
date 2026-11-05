@@ -84,6 +84,8 @@ fresh budget. Previously saved audits without the new required evidence fields m
   starting a fixer, and the fallback provider is skipped. CI-failure and comment fixes are skipped,
   and auto-merge is blocked. The next push from a person gets a fresh review. Remove the label
   before that push if dev-agents should fix what the review finds.
+  When a review of the current head comes back clean, dev-agents removes `pause:fix` itself
+  (there is nothing left to fix), comments on the PR, and auto-merge proceeds as usual.
 
 ## Provider usage limits
 
