@@ -37,11 +37,11 @@ def setup_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return origin, repo, head
 
 
-@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "claude_attributed", "claim_wait", "disputed", "budget", "verification_only"])
+@pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "claude_attributed", "claim_wait", "disputed", "budget", "verification_only", "fix_paused"])
 def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     origin, repo, head = setup_repository(tmp_path)
     service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
-        review_claim_window_seconds=60 if mode == "claim_wait" else 0,
+        review_claim_window_seconds=60 if mode in {"claim_wait", "fix_paused"} else 0,
         state_path=tmp_path / "state.db", worktree_dir=tmp_path / "worktrees", log_dir=tmp_path / "logs",
         review_handoff_branch_prefixes=["claude/"] if mode == "handoff" else [],
         # A halted repair gate must not hand the same head to the fallback for a second audit.
@@ -116,6 +116,8 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
 
     monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", agent)
     meta = {"headRefOid": head, **({"headRefName": "claude/feature"} if mode == "handoff" else {})}
+    if mode == "fix_paused":
+        meta["labels"] = [{"name": "pause:fix"}]
     if mode == "claude_attributed":
         meta.update(headRefName="claude/feature", commits=[
             {"authors": [{"login": "eserlan"}, {"login": "claude"}]},
@@ -135,7 +137,15 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
     succeeded, report = service._fix(42, "feature", [], review_only=True, meta=meta, run_id=run_id, review_round=2 if mode == "verification_only" else 0)
     assert succeeded == (mode in {"clean", "findings", "incomplete_findings", "claude_attributed", "claim_wait"})
     assert calls == (["auditor", "fixer"] if mode in {"findings", "incomplete_findings", "fix_noop", "claude_attributed", "disputed"} else ["auditor"])
-    if mode in {"disputed", "budget", "verification_only"}:
+    if mode == "fix_paused":
+        # Findings are posted at once (no claim window) and nothing is handed to a writer.
+        assert report["review_fix_paused"] is True and not report.get("repair_pending")
+        gate = [event.event for event in service.state.list_run_events("pr-review", run_id) if event.node == "repair_gate"]
+        assert gate == ["fix_paused"]
+        findings_body = dict(comments)["review-findings"]
+        assert "Fixing is paused by the `pause:fix` label" in findings_body
+        assert "/dev-agents claim" not in findings_body
+    if mode in {"disputed", "budget", "verification_only", "fix_paused"}:
         assert report["review_halted"]
         if mode in {"budget", "verification_only"}:
             halted = [event for event in service.state.list_run_events("pr-review", run_id) if event.node == "repair_gate"]

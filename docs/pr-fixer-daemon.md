@@ -76,6 +76,15 @@ new pushes or daemon restarts. Human adjudication is required. There is no autom
 operator must deliberately clear the halted metadata and repair-attempt history to authorize a
 fresh budget. Previously saved audits without the new required evidence fields must be re-audited.
 
+## Pausing a PR
+
+- `paused` stops all PR automation: no reviews, no fixes, no auto-merge.
+- `pause:fix` (`fix_pause_label`) is for a PR someone is working on by hand. Reviews still run and
+  post their findings straight away, without the claim window. The review then halts instead of
+  starting a fixer, and the fallback provider is skipped. CI-failure and comment fixes are skipped,
+  and auto-merge is blocked. The next push from a person gets a fresh review. Remove the label
+  before that push if dev-agents should fix what the review finds.
+
 ## Provider usage limits
 
 When a Codex run fails with "You've hit your usage limit ... try again at 11:20 PM", the runtime

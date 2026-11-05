@@ -1739,3 +1739,42 @@ def test_fix_started_lists_each_feedback_item() -> None:
         "- Changes requested by `octo`",
         "- Merge conflict with `staging`",
     ]
+
+
+def _green_pr(labels: list[str]) -> dict[str, Any]:
+    return {
+        "baseRefName": "staging", "headRefName": "feature/manual", "headRefOid": "abc123",
+        "state": "OPEN", "isDraft": False, "mergeable": "MERGEABLE", "reviewDecision": "",
+        "labels": [{"name": name} for name in labels], "reviews": [],
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+    }
+
+
+def test_fix_pause_label_still_allows_reviews(monkeypatch, tmp_path: Path) -> None:
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (_green_pr(["Pause:Fix"]), []))
+
+    state = PrFixerService("demo", project, config)._collect_feedback({"number": 42})
+
+    assert state["review_only"] is True and state["workflow"] == "pr-review"
+
+
+def test_fix_pause_label_skips_ci_and_comment_fixes(monkeypatch, tmp_path: Path) -> None:
+    project = ProjectConfig(repo=tmp_path, github="owner/repo")
+    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    metadata = {**_green_pr(["pause:fix"]), "checks": [{"name": "tests", "state": "FAILURE", "bucket": "fail"}]}
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, ["check:tests:1"]))
+
+    state = PrFixerService("demo", project, config)._collect_feedback({"number": 42})
+
+    assert state["skip"] is True and state["skip_reason"] == "fix-paused"
+
+
+def test_fix_pause_label_blocks_auto_merge(tmp_path: Path) -> None:
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=tmp_path, github="owner/repo"), PrFixerConfig(state_path=tmp_path / "state.db")
+    )
+
+    assert service._auto_merge_eligible(_green_pr([]), []) is True
+    assert service._auto_merge_eligible(_green_pr(["pause:fix"]), []) is False
