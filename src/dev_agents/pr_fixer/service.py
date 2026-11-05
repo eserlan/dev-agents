@@ -156,6 +156,30 @@ def _interrupted_audit(previous: Any, head_sha: str, review_round: int | None) -
     return resumed
 
 
+def _review_repairs_used(runs: list[Any], number: int, current_run_id: str | None) -> int:
+    """Writer starts that count against a PR's review repair budget.
+
+    Repairs count across every head and chain, including failed attempts, so bot pushes and
+    retries cannot reset the budget. A halt is the exception: only a person's own push lifts it
+    (see _review_plan), and that push opens a fresh budget. Repairs before the latest halt are
+    therefore not counted. Timestamps have one-second resolution, so a run started in the same
+    second as the halt still counts, which can only make the budget stricter.
+    """
+    runs = [run for run in runs if run.metadata.get("pull_request") == number]
+    halts = [
+        run.started_at or ""
+        for run in runs
+        if run.metadata.get("review_halted") and run.run_id != current_run_id
+    ]
+    since = max(halts, default="")
+    return sum(
+        int(run.metadata.get("review_repair_attempts", bool(run.metadata.get("review_fix_pushed"))))
+        for run in runs
+        if (run.started_at or "") >= since
+        and not (run.metadata.get("review_halted") and run.run_id != current_run_id)
+    )
+
+
 class PrFixerRunState(TypedDict, total=False):
     """State carried through one webhook/reconciliation PR-fix run."""
 
@@ -1274,6 +1298,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 # Set once a review run hands its findings to the fixer. Until then the run is a
                 # read-only audit, which must not push anything (see accept_provider).
                 fixer_started: list[bool] = []
+                gate_halted: list[bool] = []
 
                 def accept_provider(_provider: str, result: Any) -> bool:
                     # A worktree shares refs/remotes/* with the common .git dir, so this
@@ -1409,11 +1434,13 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         # untouched; partial Codex edits or pushes are not handed over.
                         previous = provider_results.get(PR_FIX_PROVIDER)
                         touched = bool(before_codex) and worktree_snapshot() != before_codex[0]
-                        if previous is not None and (previous.timed_out or touched) or superseded_by:
+                        # A halted repair gate is a decision, not a Codex failure: a fallback
+                        # would only re-audit the same head and post a second findings comment.
+                        if previous is not None and (previous.timed_out or touched) or superseded_by or gate_halted:
                             _log(f"fallback-skipped pr={number} provider={provider}")
                             record("start_provider", "fallback_skipped", status="skipped", provider=provider,
                                    codex_timed_out=bool(previous and previous.timed_out), codex_touched=touched,
-                                   superseded=bool(superseded_by))
+                                   superseded=bool(superseded_by), review_halted=bool(gate_halted))
                             return {"provider": provider, "skipped": True,
                                     "result": AgentResult(1, previous.timed_out if previous else False)}
                         _log(f"fallback-start pr={number} provider={provider}")
@@ -1576,14 +1603,11 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                superseded_by=latest_head if latest_head != original_head else None,
                                cancelled=bool(cancellation and cancellation.is_set()))
                         return {"result": AgentResult(1, False)}
-                    # Count writer starts across all heads/chains of this PR, including
-                    # failed attempts. Bot pushes and retries cannot reset the budget.
-                    repairs = sum(
-                        int(run.metadata.get("review_repair_attempts", bool(run.metadata.get("review_fix_pushed"))))
-                        for run in self.state.list_runs("pr-review", limit=None, pull_request=number)
-                        if run.metadata.get("pull_request") == number
+                    repairs = _review_repairs_used(
+                        self.state.list_runs("pr-review", limit=None, pull_request=number), number, run_id
                     )
                     if repairs >= MAX_REVIEW_REPAIRS or review_round >= MAX_INTERNAL_REVIEW_ROUNDS - 1:
+                        gate_halted.append(True)
                         report["review_halted"] = "two repair attempts exhausted; unresolved findings retained"
                         record("repair_gate", "repair_budget_exhausted", status="failed",
                                repairs_used=repairs, repair_budget=MAX_REVIEW_REPAIRS, review_round=review_round)

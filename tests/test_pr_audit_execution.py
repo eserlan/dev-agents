@@ -1,12 +1,13 @@
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from dev_agents.config import PrFixerConfig, ProjectConfig
 from dev_agents.pr_fixer.audit import AUDIT_LENSES
-from dev_agents.pr_fixer.service import PrFixerService
+from dev_agents.pr_fixer.service import PrFixerService, _review_repairs_used
 from dev_agents.runtime.agent import AgentResult
 
 
@@ -43,6 +44,8 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         review_claim_window_seconds=60 if mode == "claim_wait" else 0,
         state_path=tmp_path / "state.db", worktree_dir=tmp_path / "worktrees", log_dir=tmp_path / "logs",
         review_handoff_branch_prefixes=["claude/"] if mode == "handoff" else [],
+        # A halted repair gate must not hand the same head to the fallback for a second audit.
+        fallback_provider="claude" if mode == "budget" else None,
     ))
     run_id = f"pr-review-42-{head}"
     service.state.claim_run("pr-review", run_id, metadata={"pull_request": 42, "head_sha": head})
@@ -137,6 +140,9 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         if mode in {"budget", "verification_only"}:
             halted = [event for event in service.state.list_run_events("pr-review", run_id) if event.node == "repair_gate"]
             assert [(event.event, event.status) for event in halted] == [("repair_budget_exhausted", "failed")]
+        if mode == "budget":
+            skipped = [event for event in service.state.list_run_events("pr-review", run_id) if event.event == "fallback_skipped"]
+            assert len(skipped) == 1 and skipped[0].metadata["review_halted"] is True
         assert git(origin, "rev-parse", "feature") == head
         service._finalize({"number": 42, "claimed": True, "workflow": "pr-review",
                            "run_id": run_id, "review_only": True, "report": report})
@@ -312,3 +318,28 @@ def test_final_comment_explains_handed_off_findings() -> None:
     body = _review_completed_body(9, "run-9", report, old_sha="a" * 40, new_sha="a" * 40)
     assert "### 🤖 gpt-6-luna review completed — findings left for claude" in body
     assert "Its next push gets a fresh review" in body
+
+
+def _run(run_id: str, started_at: str, **metadata: object) -> SimpleNamespace:
+    return SimpleNamespace(run_id=run_id, started_at=started_at, metadata={"pull_request": 42, **metadata})
+
+
+def test_repair_budget_counts_every_head_until_a_halt() -> None:
+    runs = [
+        _run("bot-head-1", "2026-11-05T07:00:00+00:00", review_repair_attempts=1),
+        _run("bot-head-2", "2026-11-05T07:10:00+00:00", review_fix_pushed=True),
+        _run("other-pr", "2026-11-05T07:20:00+00:00", pull_request=99, review_repair_attempts=5),
+    ]
+
+    assert _review_repairs_used(runs, 42, "current") == 2
+
+
+def test_human_push_after_a_halt_opens_a_fresh_repair_budget() -> None:
+    runs = [
+        _run("bot-head-1", "2026-11-05T07:00:00+00:00", review_repair_attempts=1),
+        _run("bot-head-2", "2026-11-05T07:10:00+00:00", review_repair_attempts=1),
+        _run("halted", "2026-11-05T07:30:00+00:00", review_halted="two repair attempts exhausted"),
+        _run("human-head", "2026-11-05T08:55:00+00:00", review_repair_attempts=1),
+    ]
+
+    assert _review_repairs_used(runs, 42, "human-head") == 1
