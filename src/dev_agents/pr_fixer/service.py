@@ -835,12 +835,18 @@ class PrFixerService:
             f"starting pr={number} mode={'review' if review_only else 'fix'} "
             f"actionable_items={len(unseen)}"
         )
+        resumed = False
         if review_only:
             from dev_agents.visualize import refresh_report_run_url
 
             report_url = refresh_report_run_url(
                 self.project_name, self.project, workflow, state["run_id"]
             )
+            run = self.state.get_run(workflow, state["run_id"])
+            resumed = bool(run and (run.metadata.get("repair_pending") or run.metadata.get("resume_interrupted_audit")))
+        if review_only and not resumed:
+            # A run resuming after the claim window (or a restart) already announced its start;
+            # announcing it again would overwrite the start time in the status history.
             _pkg._publish_pr_run_comment(
                 self.project.repo,
                 number,
@@ -855,7 +861,7 @@ class PrFixerService:
                     **self._agent_identity(),
                 ),
             )
-        else:
+        elif not review_only:
             report_url = None
             _pkg._publish_pr_run_comment(
                 self.project.repo,

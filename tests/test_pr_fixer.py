@@ -28,6 +28,7 @@ from dev_agents.pr_fixer import (
 from dev_agents.pr_fixer.comments import (
     _review_completed_body,
     _review_findings_body,
+    _review_fixes_started_body,
     _with_history,
 )
 from dev_agents.runtime import StateRepository
@@ -1778,3 +1779,39 @@ def test_fix_pause_label_blocks_auto_merge(tmp_path: Path) -> None:
 
     assert service._auto_merge_eligible(_green_pr([]), []) is True
     assert service._auto_merge_eligible(_green_pr(["pause:fix"]), []) is False
+
+
+@pytest.mark.parametrize(("metadata", "announced"), [
+    ({}, True),
+    ({"repair_pending": True}, False),
+    ({"resume_interrupted_audit": True}, False),
+])
+def test_review_start_is_announced_once_per_run(
+    monkeypatch, tmp_path: Path, metadata: dict[str, Any], announced: bool
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=repo), PrFixerConfig(state_path=tmp_path / "state.db")
+    )
+    service.state.claim_run("pr-review", "pr-review-42-abc123", metadata={"pull_request": 42, **metadata})
+    published: list[tuple[Any, ...]] = []
+    monkeypatch.setattr("dev_agents.pr_fixer._publish_pr_run_comment", lambda *args: published.append(args) or True)
+    monkeypatch.setattr("dev_agents.visualize.refresh_report_run_url", lambda *args: None)
+    monkeypatch.setattr(service, "_fix", lambda *args, **kwargs: (True, {}))
+    monkeypatch.setattr(service.state, "record_event", lambda *args, **kwargs: None)
+
+    service._remediate({
+        "number": 42, "unseen": [], "review_only": True, "workflow": "pr-review",
+        "run_id": "pr-review-42-abc123", "meta": {"headRefName": "feature", "headRefOid": "abc123"},
+    })
+
+    assert ("review-started" in [call[3] for call in published]) is announced
+
+
+def test_fixes_started_reads_as_a_stage_of_the_review() -> None:
+    body = _review_fixes_started_body(42, "run-1", {"findings": [{"severity": "low", "location": "a.ts:1", "impact": "x"}]})
+
+    assert "review: fixing findings\n" in body
+    assert "The review is done." in body
+    assert "the 1 finding in the review findings comment below" in body

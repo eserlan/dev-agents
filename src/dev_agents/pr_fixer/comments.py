@@ -418,14 +418,16 @@ def _review_fixes_started_body(
 ) -> str:
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
     subject = (
-        f"the {count} finding{'' if count == 1 else 's'} in the findings comment"
+        f"the {count} finding{'' if count == 1 else 's'} in the review findings comment below"
         if count
         else "the concrete findings identified during the review"
     )
+    # This edits the status comment opened when the review started, which sits above the
+    # findings comment, so it reads as a stage of the review rather than a separate fix run.
     return f"""<!-- dev-agents:pr-review run={run_id} -->
-### 🤖 {model} fixes started
+### 🤖 {model} review: fixing findings
 
-{model} is applying the smallest correct fixes for {subject} on PR #{number}.
+The review is done. {model} is now applying the smallest correct fixes for {subject} on PR #{number}.
 
 - Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
 {_model_line(model, effort)}- Run: `{run_id}`
