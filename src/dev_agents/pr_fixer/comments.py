@@ -345,6 +345,7 @@ def _review_findings_body(
     *,
     model: str = CODEX_MODEL,
     effort: str | None = None,
+    fix_paused_label: str | None = None,
 ) -> str:
     scope = "independent audit" if review_round == 0 else "targeted post-fix verification"
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
@@ -377,7 +378,18 @@ def _review_findings_body(
 </details>
 
 {_what_changed_section(report.get("summary"), report.get("files"))}
-{unverified_section}Dev-agents fixes these findings by default.
+{unverified_section}{_fix_ownership_section(run_id, claim_window_seconds, fix_paused_label)}
+{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
+{_model_line(model, effort)}- Run: `{run_id}`
+{_report_line(report_url)}
+"""
+
+
+def _fix_ownership_section(run_id: str, claim_window_seconds: int, fix_paused_label: str | None) -> str:
+    """Who fixes the findings: dev-agents by default, or nobody automatic under the pause label."""
+    if fix_paused_label:
+        return f"Fixing is paused by the `{fix_paused_label}` label, so dev-agents will not change this PR.\n"
+    return f"""Dev-agents fixes these findings by default.
 
 <details>
 <summary>Claim this run for an external agent</summary>
@@ -391,10 +403,6 @@ Claims from repository owners, members or collaborators pause the fixer for up t
 A push starts a fresh review; without a push, dev-agents resumes fixing. Attribution alone
 does not claim the work.
 </details>
-
-{head_line}- Review round: `{review_round + 1}/{MAX_INTERNAL_REVIEW_ROUNDS}`
-{_model_line(model, effort)}- Run: `{run_id}`
-{_report_line(report_url)}
 """
 
 

@@ -346,6 +346,15 @@ class PrFixerService:
         graph.add_edge("finalize", END)
         return graph.compile()
 
+    def _fix_paused(self, meta: dict[str, Any] | None) -> bool:
+        """Whether the PR carries the label that allows reviews but no fixes."""
+        label = self.config.fix_pause_label.strip().lower()
+        return bool(label) and any(
+            str(item.get("name", "")).lower() == label
+            for item in (meta or {}).get("labels") or []
+            if isinstance(item, dict)
+        )
+
     def _human_authored_head(self, meta: dict[str, Any]) -> bool:
         """Whether the PR head's latest commit was written only by people, not agents."""
         commits = meta.get("commits")
@@ -665,6 +674,9 @@ class PrFixerService:
             and not _has_copilot_review(meta)
             and review_plan is not None
         )
+        if not review_only and self._fix_paused(meta):
+            # CI and comment fixes are writes; with fixing paused only reviews may run.
+            return {"meta": meta, "keys": keys, "skip": True, "skip_reason": "fix-paused"}
         fingerprint = hashlib.sha256("\0".join(sorted(keys)).encode()).hexdigest()[:16]
         workflow = "pr-review" if review_only else "pr-fixer"
         run_id = (
@@ -954,11 +966,19 @@ A follow-up comment will report the outcome.
                 "review_report": report.get("review_report"), "review_report_valid": False,
                 "repair_pending": False, "own_commits": report.get("own_commits") or [],
             })
-            _pkg._publish_pr_run_comment(
-                self.project.repo, number, state["run_id"], "review-halted",
-                f"Automatic review repairs stopped: {report['review_halted']}. Human adjudication required.\n\n"
-                + json.dumps(report.get("review_report", {}), ensure_ascii=False),
-            )
+            if report.get("review_fix_paused"):
+                label = self.config.fix_pause_label
+                body = (
+                    f"### 🤖 Fixing paused\n\nThe `{label}` label is set, so dev-agents left the findings "
+                    "above for you and did not change this PR. Your next push gets a fresh review; remove "
+                    f"`{label}` before it if you want dev-agents to fix what that review finds.\n"
+                )
+            else:
+                body = (
+                    f"Automatic review repairs stopped: {report['review_halted']}. Human adjudication required.\n\n"
+                    + json.dumps(report.get("review_report", {}), ensure_ascii=False)
+                )
+            _pkg._publish_pr_run_comment(self.project.repo, number, state["run_id"], "review-halted", body)
             self.state.complete_run(workflow, state["run_id"])
             return {"started": False}
         if state.get("review_only") and state.get("report", {}).get("repair_pending"):
@@ -1299,6 +1319,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                 # read-only audit, which must not push anything (see accept_provider).
                 fixer_started: list[bool] = []
                 gate_halted: list[bool] = []
+                fix_paused = self._fix_paused(meta)
 
                 def accept_provider(_provider: str, result: Any) -> bool:
                     # A worktree shares refs/remotes/* with the common .git dir, so this
@@ -1573,10 +1594,12 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                 number, run_id, audit.model_dump(),
                                 review_round=review_round, head_sha=original_head or None,
                                 claim_window_seconds=self.config.review_claim_window_seconds,
+                                fix_paused_label=self.config.fix_pause_label if fix_paused else None,
                                 **self._agent_identity(report),
                             ),
                         )
                     if (not resuming and run_id and self.config.review_claim_window_seconds
+                            and not fix_paused
                             and self.state.get_run("pr-review", run_id)):
                         self.state.update_run("pr-review", run_id, metadata={
                             "repair_pending": True, "repair_opened_at": opened_at,
@@ -1602,6 +1625,12 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         record("repair_gate", "repair_not_started", status="skipped",
                                superseded_by=latest_head if latest_head != original_head else None,
                                cancelled=bool(cancellation and cancellation.is_set()))
+                        return {"result": AgentResult(1, False)}
+                    if fix_paused:
+                        gate_halted.append(True)
+                        report["review_halted"] = f"fixing paused by the {self.config.fix_pause_label} label; findings retained"
+                        report["review_fix_paused"] = True
+                        record("repair_gate", "fix_paused", status="skipped", label=self.config.fix_pause_label)
                         return {"result": AgentResult(1, False)}
                     repairs = _review_repairs_used(
                         self.state.list_runs("pr-review", limit=None, pull_request=number), number, run_id
@@ -1754,6 +1783,8 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
             and meta.get("baseRefName") == self.config.base_branch
             and not meta.get("isDraft")
             and "paused" not in labels
+            # Someone is still working on the branch by hand.
+            and not self._fix_paused(meta)
             and meta.get("mergeable") == "MERGEABLE"
             and meta.get("reviewDecision") != "CHANGES_REQUESTED"
             and not any(

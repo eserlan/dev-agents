@@ -263,6 +263,9 @@ class PrFixerConfig(BaseModel):
     # Bot logins whose pushes pause automation on a PR until the resume label is applied.
     external_agent_logins: list[str] = []
     external_agent_resume_label: str = "dev-agents-resume"
+    # Reviews still run and post findings on a PR with this label, but nothing is fixed or
+    # pushed: someone is working on the branch by hand. ``paused`` stops reviews too.
+    fix_pause_label: str = "pause:fix"
     # A failing check whose failed-job log contains one of these (case-insensitive) failed for
     # reasons outside the code, such as a deploy provider's account or a lost runner. It is not
     # handed to the fixer, which could only report that there is nothing to change.
