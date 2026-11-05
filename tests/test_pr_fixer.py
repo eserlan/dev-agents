@@ -1602,12 +1602,12 @@ def test_findings_overview_orders_by_severity_with_badges_and_counts() -> None:
         "files": [{"path": "a.ts", "description": "Tracks | the inset"}],
     })
 
-    high = "![HIGH](https://img.shields.io/badge/HIGH-cf222e?style=flat-square)"
-    low = "![LOW](https://img.shields.io/badge/LOW-0969da?style=flat-square)"
     assert "#### 🔴 Changes required" in body
+    high = "![High](https://raw.githubusercontent.com/eserlan/dev-agents/main/assets/review/severity-high.svg)"
+    low = "![Low](https://raw.githubusercontent.com/eserlan/dev-agents/main/assets/review/severity-low.svg)"
     assert f"**Findings:** 1 {high} · 2 {low}" in body
     assert body.index("`b.ts:2`") < body.index("`a.ts:1`") < body.index("`c.ts:3`")
-    assert f"1. {high} **lifecycle** — `b.ts:2`" in body
+    assert f"1. {high} **lifecycle**\n   - **Where:** `b.ts:2`\n   - **Impact:** Leaks a listener" in body
     assert "<summary><strong>What changed in this PR</strong></summary>" in body
     assert "| `a.ts` | Tracks \\| the inset |" in body
     assert "`/dev-agents claim run-1`" in body
@@ -1624,11 +1624,11 @@ def test_findings_overview_verdict_follows_the_worst_severity(severities: list[s
     assert f"#### {verdict}" in _review_findings_body(42, "run-1", {"findings": findings})
 
 
-def test_unknown_severity_falls_back_to_plain_label() -> None:
+def test_unknown_severity_falls_back_to_bold_text() -> None:
     body = _review_findings_body(42, "run-1", {"findings": [{"severity": "odd", "location": "a.ts:1", "impact": "x"}]})
 
-    assert "1. **ODD** — `a.ts:1`" in body
-    assert "shields.io/badge/ODD" not in body
+    assert "1. **Odd**\n   - **Where:** `a.ts:1`" in body
+    assert "severity-odd" not in body
 
 
 def test_clean_review_final_describes_what_changed() -> None:
