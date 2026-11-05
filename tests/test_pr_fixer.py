@@ -1815,3 +1815,38 @@ def test_fixes_started_reads_as_a_stage_of_the_review() -> None:
     assert "review: fixing findings\n" in body
     assert "The review is done." in body
     assert "the 1 finding in the review findings comment below" in body
+
+
+@pytest.mark.parametrize(("review", "lifted"), [("clean", True), ("halted", False), ("none", False)])
+def test_clean_review_lifts_fix_pause_and_auto_merges(
+    monkeypatch, tmp_path: Path, review: str, lifted: bool
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = tmp_path / "state.db"
+    metadata = {**_green_pr(["pause:fix"]), "autoMergeRequest": None}
+    commands: list[tuple[str, ...]] = []
+    published: list[tuple[Any, ...]] = []
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+    monkeypatch.setattr("dev_agents.pr_fixer._publish_pr_run_comment", lambda *args: published.append(args) or True)
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
+        commands.append(args)
+        if args[:3] == ("gh", "pr", "view"):
+            return '{"state":"OPEN","autoMergeRequest":{"enabledAt":"now"}}'
+        return ""
+
+    monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(state_path=database, auto_merge=True))
+    if review != "none":
+        service.state.claim_run("pr-review", "pr-review-42-abc123", metadata={
+            "pull_request": 42, "head_sha": "abc123",
+            **({"review_halted": "fixing paused by the pause:fix label; findings retained"} if review == "halted" else {}),
+        })
+        service.state.complete_run("pr-review", "pr-review-42-abc123")
+
+    service._ensure_auto_merge(42)
+
+    assert (("gh", "pr", "edit", "42", "--remove-label", "pause:fix") in commands) is lifted
+    assert (("gh", "pr", "merge", "42", "--auto", "--squash") in commands) is lifted
+    assert (["fix-pause-lifted"] if lifted else []) == [call[3] for call in published]
