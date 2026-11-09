@@ -772,6 +772,14 @@ class IssueFixerService:
             or "paused" in labels
         ):
             return {"issue": issue, "skip": True}
+        queue_labels = self._queue_labels()
+        if len(matched := [label for label in queue_labels if label in labels]) > 1:
+            # Every queue sees the issue and they share one run_id, so two labels would
+            # alternate or double up the work. Wait until a person keeps exactly one.
+            if matched[0] == self.config.label.strip().lower():
+                self._report_queue_conflict(number, issue, matched)
+            _log(f"issue-fixer issue={number} skipped=multiple-queue-labels labels={','.join(matched)}")
+            return {"issue": issue, "skip": True}
         if _existing_issue_pr(self.project.repo, number) is not None:
             return {"issue": issue, "skip": True}
         identity = f"{issue.get('title', '')}\0{issue.get('body', '')}"
@@ -813,6 +821,32 @@ class IssueFixerService:
             "claimed": True,
             "attempt": claim.record.attempt,
         }
+
+    def _queue_labels(self) -> list[str]:
+        """Every issue queue label for this project, in configuration order."""
+        configs = [self.project.issue_fixer, *self.project.issue_fixers, self.config]
+        labels: list[str] = []
+        for config in configs:
+            if config is not None and (label := config.label.strip().lower()) not in labels:
+                labels.append(label)
+        return labels
+
+    def _report_queue_conflict(
+        self, number: int, issue: dict[str, Any], matched: list[str]
+    ) -> None:
+        """Ask once, per label combination, for the issue to keep a single queue label."""
+        marker = f"<!-- dev-agents:issue-queue-conflict issue={number} labels={','.join(matched)} -->"
+        if any(marker in str(comment.get("body", "")) for comment in issue.get("comments") or []):
+            return
+        names = ", ".join(f"`{label}`" for label in matched)
+        _publish_issue_comment(
+            self.project.repo,
+            number,
+            f"{marker}\n### 🤖 Dev-agents is waiting for one queue label\n\n"
+            f"This issue has more than one dev-agents queue label ({names}). Each label "
+            "starts its own fixer, so automation is skipped until exactly one is left. "
+            "Remove the others to start it.",
+        )
 
     def _remediate(self, state: IssueFixerRunState) -> dict[str, Any]:
         if state.get("skip") or not state.get("claimed"):
