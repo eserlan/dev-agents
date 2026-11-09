@@ -971,3 +971,70 @@ def test_codex_resume_command_continues_the_session() -> None:
 
     assert command[:3] == ["codex", "exec", "resume"]
     assert command[-2:] == ["abc", "-"]
+
+
+def _two_queue_services(tmp_path: Path) -> tuple[StateRepository, list[IssueFixerService]]:
+    project = ProjectConfig(
+        repo=tmp_path,
+        github="owner/repo",
+        issue_fixer=IssueFixerConfig(label="bug"),
+        issue_fixers=[IssueFixerConfig(label="gui-fix", kind="enhancement", branch_prefix="dev-agents/gui-")],
+    )
+    state = StateRepository(tmp_path / "state.db", "lear-bear", tmp_path)
+    services = [
+        IssueFixerService("lear-bear", project, queue, PrFixerConfig(), state)
+        for queue in (project.issue_fixer, *project.issue_fixers)
+        if queue is not None
+    ]
+    return state, services
+
+
+def test_issue_with_two_queue_labels_is_skipped_by_every_queue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state, services = _two_queue_services(tmp_path)
+    issue = {
+        "number": 560,
+        "state": "OPEN",
+        "title": "Teacher Teacher",
+        "body": "Wrong name",
+        "labels": [{"name": "bug"}, {"name": "GUI-fix"}],
+        "comments": [],
+    }
+    comments: list[str] = []
+    monkeypatch.setattr("dev_agents.issue_fixer._issue", lambda *_args: issue)
+    monkeypatch.setattr("dev_agents.issue_fixer._existing_issue_pr", lambda *_args: None)
+    monkeypatch.setattr(
+        "dev_agents.issue_fixer._publish_issue_comment",
+        lambda _repo, _number, body: comments.append(body) or True,
+    )
+
+    assert all(service._collect_issue({"number": 560})["skip"] for service in services)
+    assert state.list_runs("issue-fixer") == []
+    # Only the first configured queue asks, and only once per label combination.
+    assert len(comments) == 1
+    assert "`bug`, `gui-fix`" in comments[0]
+    issue["comments"] = [{"body": comments[0]}]
+    assert all(service._collect_issue({"number": 560})["skip"] for service in services)
+    assert len(comments) == 1
+
+
+def test_issue_left_with_one_queue_label_is_claimed_by_that_queue_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _state, (bug, gui) = _two_queue_services(tmp_path)
+    issue = {
+        "number": 560,
+        "state": "OPEN",
+        "title": "Teacher Teacher",
+        "body": "Wrong name",
+        "labels": [{"name": "gui-fix"}],
+        "comments": [],
+    }
+    monkeypatch.setattr("dev_agents.issue_fixer._issue", lambda *_args: issue)
+    monkeypatch.setattr("dev_agents.issue_fixer._existing_issue_pr", lambda *_args: None)
+
+    assert bug._collect_issue({"number": 560})["skip"] is True
+    result = gui._collect_issue({"number": 560})
+    assert result["claimed"] is True
+    assert result["branch"] == "dev-agents/gui-560"
