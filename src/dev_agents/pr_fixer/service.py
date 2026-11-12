@@ -1004,6 +1004,13 @@ A follow-up comment will report the outcome.
         if state.get("review_only") and state.get("report", {}).get("repair_pending"):
             self.state.update_run(workflow, state["run_id"], status="waiting",
                                     metadata={"repair_pending": True})
+            # Resume the fixer as soon as the claim window closes, rather than on the next
+            # webhook or reconcile pass. Reconcile still covers a restart in between.
+            delay = self.config.review_claim_window_seconds + 1
+            timer = _pkg.Timer(delay, self._handle_reconciled, args=(number,))
+            timer.daemon = True
+            timer.start()
+            _log(f"repair-resume-scheduled pr={number} delay={delay}s")
             return {"started": False}
         if state.get("review_only"):
             superseded_head = state.get("report", {}).get("superseded_by")

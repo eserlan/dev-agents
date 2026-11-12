@@ -196,9 +196,21 @@ def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypa
         assert "accessibility: Contrast tokens were not resolvable" in dict(comments)["review-findings"]
     if mode == "claim_wait":
         assert report["repair_pending"]
+        scheduled: list[tuple[float, tuple[int, ...]]] = []
+
+        class FakeTimer:
+            def __init__(self, delay: float, _target: object, args: tuple[int, ...]) -> None:
+                scheduled.append((delay, args))
+                self.daemon = False
+
+            def start(self) -> None:
+                pass
+
+        monkeypatch.setattr("dev_agents.pr_fixer.Timer", FakeTimer)
         service._finalize({"number": 42, "claimed": True, "review_only": True,
                            "workflow": "pr-review", "run_id": run_id, "report": report})
         assert service.state.get_run("pr-review", run_id).status == "waiting"
+        assert scheduled == [(service.config.review_claim_window_seconds + 1, (42,))]
         opened = service.state.get_run("pr-review", run_id).metadata["repair_opened_at"]
         meta.update(headRefName="feature", state="OPEN", baseRefName="staging",
                     mergeable="MERGEABLE", labels=[], reviews=[], checks=[])

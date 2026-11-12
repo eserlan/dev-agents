@@ -10,13 +10,13 @@ This file re-exports the ``pr_fixer``-specific namespace so every existing
 ``from dev_agents.pr_fixer import X`` keeps working unchanged, including the
 handful of names tests monkeypatch by their dotted path on this package
 (``_run``, ``_feedback``, ``_publish_pr_run_comment``, ``repository_slug``,
-``Thread``) -- see the docstring in ``github_ops.py`` for why those specific
+``Thread``, ``Timer``) -- see the docstring in ``github_ops.py`` for why those specific
 calls route back through this package object instead of a plain import.
 """
 
 from __future__ import annotations
 
-from threading import Thread
+from threading import Thread, Timer
 
 from dev_agents.runtime import repository_slug
 
@@ -72,6 +72,7 @@ __all__ = [
     "PrFixerRunState",
     "PrFixerService",
     "Thread",
+    "Timer",
     "_agent_report",
     "_auto_pause_body",
     "_cleanup_artifacts",
