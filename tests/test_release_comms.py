@@ -29,6 +29,16 @@ def test_extract_json_block_fenced_and_unfenced() -> None:
     assert extract_json_block("not json at all") is None
 
 
+def test_extract_json_block_skips_prompt_example_in_agent_log() -> None:
+    log = (
+        "user\nRespond with ONLY a fenced ```json block shaped like:\n"
+        '{"postworthy": true, "reason": "<one sentence>"}\nNo other prose.\n\n'
+        "codex\n```json\n"
+        '{"postworthy": true, "reason": "real"}\n```\ntokens used\n'
+    )
+    assert extract_json_block(log) == {"postworthy": True, "reason": "real"}
+
+
 def test_run_release_comms_dry_run_does_not_publish(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
