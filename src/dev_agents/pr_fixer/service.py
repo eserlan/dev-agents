@@ -355,6 +355,16 @@ class PrFixerService:
             if isinstance(item, dict)
         )
 
+    def _hold_label(self, meta: dict[str, Any] | None) -> str | None:
+        """The hold label on the PR or on an issue it closes, if any."""
+        held = {label.strip().lower() for label in self.config.hold_labels if label.strip()}
+        present = [
+            str(item.get("name", ""))
+            for item in (meta or {}).get("labels") or []
+            if isinstance(item, dict)
+        ] + [str(name) for name in (meta or {}).get("closingIssueLabels") or []]
+        return next((name for name in present if name.lower() in held), None)
+
     def _human_authored_head(self, meta: dict[str, Any]) -> bool:
         """Whether the PR head's latest commit was written only by people, not agents."""
         commits = meta.get("commits")
@@ -617,6 +627,10 @@ class PrFixerService:
             or "paused" in labels
         ):
             return {"meta": meta, "keys": keys, "skip": True}
+        hold = self._hold_label(meta)
+        if hold:
+            _log(f"held pr={number} label={hold}")
+            return {"meta": meta, "keys": keys, "skip": True, "skip_reason": "held"}
         head_sha = str(meta.get("headRefOid", "unknown"))
         external_author = _external_agent_commit(meta, self.config)
         resume_label = self.config.external_agent_resume_label.strip().lower()
@@ -1789,6 +1803,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
             and meta.get("baseRefName") == self.config.base_branch
             and not meta.get("isDraft")
             and "paused" not in labels
+            and self._hold_label(meta) is None
             # Someone is still working on the branch by hand.
             and not self._fix_paused(meta)
             and meta.get("mergeable") == "MERGEABLE"

@@ -48,7 +48,7 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
     )
     slug = _pkg.repository_slug(repo)
     owner, name = slug.split("/", 1)
-    threads_query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{databaseId}}}}}}}"
+    threads_query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:10){nodes{labels(first:50){nodes{name}}}} reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{databaseId}}}}}}}"
     threads = json.loads(
         _pkg._run(
             repo,
@@ -74,13 +74,16 @@ def _feedback(repo: Path, number: int) -> tuple[dict[str, Any], list[str]]:
                     repo, "gh", "run", "view", run_id.group(1), "--log-failed", check=False
                 )[-12000:]
     meta["checks"] = checks
-    nodes = (
-        threads.get("data", {})
-        .get("repository", {})
-        .get("pullRequest", {})
-        .get("reviewThreads", {})
-        .get("nodes", [])
+    pull_request = threads.get("data", {}).get("repository", {}).get("pullRequest", {}) or {}
+    meta["closingIssueLabels"] = sorted(
+        {
+            str(label.get("name", ""))
+            for issue in (pull_request.get("closingIssuesReferences") or {}).get("nodes") or []
+            for label in ((issue or {}).get("labels") or {}).get("nodes") or []
+            if label.get("name")
+        }
     )
+    nodes = (pull_request.get("reviewThreads") or {}).get("nodes", [])
     keys = [
         f"comment:{item['comments']['nodes'][0]['databaseId']}"
         for item in nodes

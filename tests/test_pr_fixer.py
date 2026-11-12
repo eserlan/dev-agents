@@ -1850,3 +1850,46 @@ def test_clean_review_lifts_fix_pause_and_auto_merges(
     assert (("gh", "pr", "edit", "42", "--remove-label", "pause:fix") in commands) is lifted
     assert (("gh", "pr", "merge", "42", "--auto", "--squash") in commands) is lifted
     assert (["fix-pause-lifted"] if lifted else []) == [call[3] for call in published]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        _green_pr(["Factory:Needs-Human"]),
+        {**_green_pr([]), "closingIssueLabels": ["ui", "factory:needs-human"]},
+    ],
+)
+def test_hold_label_on_pr_or_closed_issue_skips_and_blocks_auto_merge(
+    monkeypatch, tmp_path: Path, metadata: dict[str, Any]
+) -> None:
+    service = PrFixerService(
+        "demo", ProjectConfig(repo=tmp_path, github="owner/repo"), PrFixerConfig(state_path=tmp_path / "state.db")
+    )
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, []))
+
+    state = service._collect_feedback({"number": 42})
+
+    assert state["skip"] is True and state["skip_reason"] == "held"
+    assert service._auto_merge_eligible(metadata, []) is False
+
+
+def test_feedback_reads_labels_of_issues_the_pr_closes(monkeypatch, tmp_path: Path) -> None:
+    from dev_agents.pr_fixer.github_ops import _feedback
+
+    graphql = {"data": {"repository": {"pullRequest": {
+        "closingIssuesReferences": {"nodes": [{"labels": {"nodes": [{"name": "ui"}, {"name": "factory:needs-human"}]}}]},
+        "reviewThreads": {"nodes": []},
+    }}}}
+
+    def fake_run(_repo: Path, *args: str, **_kwargs: Any) -> str:
+        if args[:2] == ("gh", "api"):
+            return json.dumps(graphql)
+        return json.dumps({**_green_pr([]), "number": 42})
+
+    monkeypatch.setattr("dev_agents.pr_fixer._run", fake_run)
+    monkeypatch.setattr("dev_agents.pr_fixer.repository_slug", lambda _repo: "owner/repo")
+    monkeypatch.setattr("dev_agents.pr_fixer.github_ops._pull_request_checks", lambda _repo, _number: [])
+
+    meta, _keys = _feedback(tmp_path, 42)
+
+    assert meta["closingIssueLabels"] == ["factory:needs-human", "ui"]
