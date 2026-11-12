@@ -16,6 +16,7 @@ from dev_agents.workflows.release_comms import (
     resolve_promote_shas,
     run_release_comms,
 )
+from dev_agents.workflows.release_content import ReleaseDelta
 from dev_agents.workflows.release_publish import PublicationReceipt
 
 
@@ -643,3 +644,67 @@ def test_exact_channels_keeps_discord_out_of_injected_bluesky_drafts(
     )
 
     assert seen == [expected]
+
+
+def test_generated_art_for_a_draft_without_page_url_is_attached_to_that_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """App features often have no page to link; their generated art must still publish."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(
+        repo=repo,
+        github="owner/repo",
+        release_comms=ReleaseCommsConfig(state_path=tmp_path / "release.db", image_generation=True),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.resolve_promote_shas",
+        lambda r, run_id: ("newsha", "prevsha"),
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.comment_tracking_issue", lambda **kwargs: None
+    )
+
+    def fake_generate(**kwargs: Any) -> Path:
+        dest = Path(kwargs["dest"])
+        dest.write_bytes(b"png")
+        return dest
+
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.generate_announcement_image", fake_generate
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.upload_release_image",
+        lambda **kwargs: f"https://assets.test/{kwargs['key']}",
+    )
+    images: list[str] = []
+
+    def fake_publish(**kwargs: Any) -> PublicationReceipt:
+        images.append(kwargs["image_url"])
+        return PublicationReceipt("bluesky", "bluesky", "", "https://bsky.test/1")
+
+    monkeypatch.setattr("dev_agents.workflows.release_publish.publish_bluesky", fake_publish)
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_publish.publish_discord", lambda **kwargs: []
+    )
+
+    # Writer passes (not injected drafts) so the image check routes to generate_art.
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.run_shortform_writer_pass",
+        lambda **kwargs: [{"pageUrl": "", "text": "A new map tool"}],
+    )
+    monkeypatch.setattr(
+        "dev_agents.workflows.release_comms.collect_release_delta",
+        lambda *args: ReleaseDelta("newsha", "prevsha", [], [], ""),
+    )
+
+    result = run_release_comms(
+        project, "demo", "release-1", dry_run=False, publish_approved=True,
+        evaluator_result=EvaluatorResult(
+            postworthy=True, reason="Launch", recommended_channels=["bluesky"]
+        ),
+    )
+
+    assert images == ["https://assets.test/announcements/release-release-1-0.png"]
+    assert result.drafts is not None
+    assert result.drafts["bluesky"][0]["image"] == images[0]
