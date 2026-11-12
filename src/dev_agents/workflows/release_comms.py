@@ -666,24 +666,27 @@ def build_release_comms_workflow() -> Any:
             state, image_drafts, state.get("image_statuses") or []
         )
         overrides: dict[str, str] = {}
+        # App features often have no page URL; their art attaches to the draft itself.
+        draft_images: dict[int, str] = {}
         failures: list[str] = []
         stem = "".join(
             char if char.isalnum() or char in "-_" else "-" for char in state["promote_run_id"]
         )
-        for index, (_, page_url, path) in enumerate(generated):
+        for index, (dedup_key, page_url, path) in enumerate(generated):
             if state.get("dry_run", True):
                 continue
-            if not page_url:
-                failures.append(f"{path}: generated image has no page URL")
-                continue
             try:
-                overrides[page_url] = upload_release_image(
+                uploaded = upload_release_image(
                     repo=state["repo"],
                     path=path,
                     key=f"announcements/release-{stem}-{index}.png",
                     env=os.environ,
                     timeout=local_timeout(state),
                 )
+                if page_url:
+                    overrides[page_url] = uploaded
+                else:
+                    draft_images[int(dedup_key.removeprefix("draft:"))] = uploaded
             except Exception as error:  # noqa: BLE001 - report all generated-art failures
                 failures.append(f"{path}: {error}")
         _emit(
@@ -691,7 +694,7 @@ def build_release_comms_workflow() -> Any:
             "generated",
             {
                 "files": ",".join(str(path) for _, _, path in generated),
-                "uploaded": ",".join(overrides.values()),
+                "uploaded": ",".join([*overrides.values(), *draft_images.values()]),
                 "errors": ",".join(failures),
             },
         )
@@ -700,6 +703,11 @@ def build_release_comms_workflow() -> Any:
         updated_bluesky = [dict(item) for item in writer_res.bluesky]
         updated_discussions = [dict(item) for item in writer_res.github_discussions]
         updated_threads = [dict(item) for item in writer_res.threads]
+        for draft_index, uploaded in draft_images.items():
+            if draft_index < len(updated_bluesky):
+                updated_bluesky[draft_index]["image"] = uploaded
+            else:
+                updated_discussions[draft_index - len(updated_bluesky)]["image"] = uploaded
         for draft in updated_bluesky:
             image_url = overrides.get(draft.get("pageUrl", ""))
             if image_url:

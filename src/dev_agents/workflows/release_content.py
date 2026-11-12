@@ -83,18 +83,29 @@ def load_skill_prompt(skill_id: str) -> str:
     return text
 
 
-def extract_json_block(text: str) -> dict[str, Any] | None:
-    """Extract first json object from text (fenced or unfenced)."""
-    fenced = re.search(r"```json\s*([\s\S]*?)```", text, re.IGNORECASE)
-    candidate = fenced.group(1) if fenced else text
+def _json_object(candidate: str) -> dict[str, Any] | None:
     match = re.search(r"\{[\s\S]*\}", candidate)
     if not match:
         return None
     try:
         data = json.loads(match.group(0))
-        return data if isinstance(data, dict) else None
     except json.JSONDecodeError:
         return None
+    return data if isinstance(data, dict) else None
+
+
+def extract_json_block(text: str) -> dict[str, Any] | None:
+    """Extract the agent's json answer from a log (fenced or unfenced).
+
+    Agent logs echo the prompt, whose shape example sits before the real answer,
+    so the last parseable line-start ```json fence wins.
+    """
+    fences = re.findall(r"^```json[ \t]*\n([\s\S]*?)^```", text, re.IGNORECASE | re.MULTILINE)
+    for candidate in reversed(fences):
+        data = _json_object(candidate)
+        if data is not None:
+            return data
+    return None if fences else _json_object(text)
 
 
 def render_template(template: str, context: dict[str, str]) -> str:
