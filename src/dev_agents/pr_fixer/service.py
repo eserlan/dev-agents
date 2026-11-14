@@ -386,6 +386,14 @@ class PrFixerService:
             login and login not in agents and not login.endswith("[bot]") for login in logins
         )
 
+    def _repo_slug(self) -> str | None:
+        """owner/name for code links, or None so a lookup failure only drops the links."""
+        try:
+            return _pkg.repository_slug(self.project.repo)
+        except RuntimeError as error:
+            _log(f"repo-slug-failed error={error}")
+            return None
+
     def _agent_identity(self, report: dict[str, Any] | None = None) -> dict[str, Any]:
         """The model and effort that ran (or will run) the agent, for naming it in comments.
 
@@ -1622,6 +1630,7 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                 review_round=review_round, head_sha=original_head or None,
                                 claim_window_seconds=self.config.review_claim_window_seconds,
                                 fix_paused_label=self.config.fix_pause_label if fix_paused else None,
+                                repo_slug=self._repo_slug(),
                                 **self._agent_identity(report),
                             ),
                         )
