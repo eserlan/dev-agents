@@ -1893,3 +1893,28 @@ def test_feedback_reads_labels_of_issues_the_pr_closes(monkeypatch, tmp_path: Pa
     meta, _keys = _feedback(tmp_path, 42)
 
     assert meta["closingIssueLabels"] == ["factory:needs-human", "ui"]
+
+
+def test_review_findings_link_each_location_to_the_reviewed_commit() -> None:
+    sha = "a" * 40
+    body = _review_findings_body(42, "run-1", {"findings": [
+        {"severity": "high", "category": "data", "location": "apps/web/x.ts:273", "impact": "Base drifts"},
+        {"severity": "low", "category": "tests", "location": "src/y.ts:L3-L9 (helper)", "impact": "Gap"},
+        {"severity": "low", "category": "tests", "location": "whole module", "impact": "Vague"},
+    ]}, head_sha=sha, repo_slug="owner/repo")
+
+    single = f"https://github.com/owner/repo/blob/{sha}/apps/web/x.ts#L271-L275"
+    ranged = f"https://github.com/owner/repo/blob/{sha}/src/y.ts#L3-L9"
+    assert f"**Where:** [`apps/web/x.ts:273`]({single})" in body
+    assert f"\n\n   {single}\n" in body
+    assert f"\n\n   {ranged}\n" in body
+    assert "**Where:** `whole module`" in body
+
+
+def test_review_findings_without_a_slug_keep_plain_locations() -> None:
+    body = _review_findings_body(42, "run-1", {"findings": [
+        {"severity": "high", "category": "data", "location": "a.ts:1", "impact": "x"},
+    ]}, head_sha="a" * 40)
+
+    assert "**Where:** `a.ts:1`" in body
+    assert "https://github.com/" not in body

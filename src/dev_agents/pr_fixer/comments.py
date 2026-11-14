@@ -8,6 +8,7 @@ plain local import.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -286,7 +287,29 @@ def _severity_counts(findings: list[dict[str, Any]]) -> str:
     return " · ".join(counts) or str(len(findings))
 
 
-def _findings_markdown(report: dict[str, Any]) -> str:
+SNIPPET_CONTEXT_LINES = 2
+_LOCATION = re.compile(r"`?(?:\./)?(?P<path>[^\s:`/][^\s:`]*):L?(?P<start>\d+)(?:-L?(?P<end>\d+))?")
+
+
+def _code_permalink(location: object, repo_slug: str | None, head_sha: str | None) -> str | None:
+    """A permalink to a finding's lines in the reviewed commit, padded with a little context.
+
+    GitHub expands a same-repository permalink on its own line into a code snippet, so the
+    finding shows the code it is about. Locations without a path and line get no link.
+    """
+    match = _LOCATION.match(str(location or "").strip())
+    if not (repo_slug and head_sha and match):
+        return None
+    start = int(match["start"])
+    end = max(start, int(match["end"] or start))
+    if start == end:
+        start, end = max(1, start - SNIPPET_CONTEXT_LINES), end + SNIPPET_CONTEXT_LINES
+    return f"https://github.com/{repo_slug}/blob/{head_sha}/{match['path']}#L{start}-L{end}"
+
+
+def _findings_markdown(
+    report: dict[str, Any], repo_slug: str | None = None, head_sha: str | None = None
+) -> str:
     """Render each structured finding as its own reviewable list item, most severe first."""
     findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
     if not findings:
@@ -297,12 +320,16 @@ def _findings_markdown(report: dict[str, Any]) -> str:
     for index, item in enumerate(findings[:MAX_LISTED_FINDINGS], start=1):
         category = f" **{item['category']}**" if item.get("category") else ""
         lines.append(f"{index}. {_severity_label(item.get('severity'))}{category}")
-        lines.append(f"   - **Where:** `{item.get('location', '?')}`")
+        permalink = _code_permalink(item.get("location"), repo_slug, head_sha)
+        where = f"`{item.get('location', '?')}`"
+        lines.append(f"   - **Where:** [{where}]({permalink})" if permalink else f"   - **Where:** {where}")
         lines.append(f"   - **Impact:** {item.get('impact', '')}")
         if item.get("evidence"):
             lines.append(f"   - **Evidence:** {item['evidence']}")
         if item.get("remediation"):
             lines.append(f"   - **Suggested fix:** {item['remediation']}")
+        if permalink:
+            lines.extend(["", f"   {permalink}", ""])
     if len(findings) > MAX_LISTED_FINDINGS:
         lines.append(f"\n…and {len(findings) - MAX_LISTED_FINDINGS} more in the run report.")
     return "\n".join(lines) + "\n"
@@ -346,6 +373,7 @@ def _review_findings_body(
     model: str = CODEX_MODEL,
     effort: str | None = None,
     fix_paused_label: str | None = None,
+    repo_slug: str | None = None,
 ) -> str:
     scope = "independent audit" if review_round == 0 else "targeted post-fix verification"
     count = len([item for item in report.get("findings") or [] if isinstance(item, dict)])
@@ -374,7 +402,7 @@ def _review_findings_body(
 <details open>
 <summary><strong>Open ({count})</strong></summary>
 
-{_findings_markdown(report)}
+{_findings_markdown(report, repo_slug, head_sha)}
 </details>
 
 {_what_changed_section(report.get("summary"), report.get("files"))}
