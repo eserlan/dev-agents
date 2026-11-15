@@ -689,9 +689,11 @@ class PrFixerService:
         review_plan = self._review_plan(
             number, head_sha, human_head=self._human_authored_head(meta)
         )
+        # Only threads the fixer has not yet handled block the review. Addressed threads
+        # stay open until someone resolves them, and must not stall the review forever.
         review_only = (
             self.config.review_without_copilot
-            and not keys
+            and not unseen
             and _review_is_due(meta, self.config)
             and not _has_copilot_review(meta)
             and review_plan is not None
