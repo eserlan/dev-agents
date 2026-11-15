@@ -1918,3 +1918,34 @@ def test_review_findings_without_a_slug_keep_plain_locations() -> None:
 
     assert "**Where:** `a.ts:1`" in body
     assert "https://github.com/" not in body
+
+
+def test_internal_review_runs_when_open_threads_were_already_processed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = ProjectConfig(repo=repo, github="owner/repo")
+    config = PrFixerConfig(state_path=tmp_path / "state.db")
+    metadata: dict[str, Any] = {
+        "baseRefName": "staging",
+        "headRefName": "feature/fixed",
+        "headRefOid": "abc123",
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "labels": [],
+        "reviews": [],
+        "checks": [{"name": "tests", "state": "SUCCESS", "bucket": "pass"}],
+    }
+    service = PrFixerService("demo", project, config)
+    thread = ["comment:101"]
+    service.state.unprocessed_feedback("pr-fixer", "42", thread)
+    service.state.mark_feedback_processed("pr-fixer", "42", thread)
+    monkeypatch.setattr("dev_agents.pr_fixer._feedback", lambda _repo, _number: (metadata, thread))
+
+    state = service._collect_feedback({"number": 42})
+
+    assert state["review_only"] is True
+    assert state["workflow"] == "pr-review"
