@@ -37,6 +37,82 @@ def setup_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return origin, repo, head
 
 
+def test_review_effort_applies_to_auditor_but_not_fixer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The read-only auditor can run harder than the repair it gates."""
+    _origin, repo, head = setup_repository(tmp_path)
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
+        review_claim_window_seconds=0,
+        state_path=tmp_path / "state.db", worktree_dir=tmp_path / "worktrees", log_dir=tmp_path / "logs",
+        model="gpt-6-luna", reasoning_effort="high", review_reasoning_effort="max",
+        fallback_provider="claude", fallback_model="claude-sonnet-5-5",
+        fallback_reasoning_effort="medium", review_fallback_reasoning_effort="low",
+    ))
+    assert service._review_provider_options("codex") == ("gpt-6-luna", "max")
+    assert service._review_provider_options("claude") == ("claude-sonnet-5-5", "low")
+    assert service._provider_options("codex") == ("gpt-6-luna", "high")
+    assert service._provider_options("claude") == ("claude-sonnet-5-5", "medium")
+    run_id = f"pr-review-42-{head}"
+    service.state.claim_run("pr-review", run_id, metadata={"pull_request": 42, "head_sha": head})
+    monkeypatch.setattr(
+        "dev_agents.pr_fixer._publish_pr_run_comment",
+        lambda *_args, **_kwargs: True,
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def agent(_provider: str, _prompt: str, **kwargs) -> AgentResult:
+        output = kwargs["last_message_path"]
+        if kwargs.get("read_only"):
+            calls.append(("auditor", kwargs.get("reasoning_effort")))
+            output.write_text(json.dumps({
+                "summary": "Changes the feature branch.",
+                "files": [{"path": "feature.txt", "description": "Adds the new branch"}],
+                "verdict": "findings",
+                "findings": [{
+                    "severity": "high", "confidence": "high", "category": "security-privacy",
+                    "requirement": "base.txt:1 requires input validation",
+                    "trigger": "Invalid input enters the new branch",
+                    "introduced_by": "feature.txt:1 bypasses validation",
+                    "location": "feature.txt:1", "evidence": "The new branch bypasses validation",
+                    "impact": "Invalid input reaches the sensitive sink", "remediation": "Validate before use",
+                }],
+                "categories_checked": sorted(AUDIT_LENSES),
+                "checks": [{"category": c, "status": "finding" if c == "security-privacy" else "pass",
+                            "evidence": "Traced changed path"} for c in sorted(AUDIT_LENSES)],
+                "limitations": [],
+            }))
+        else:
+            calls.append(("fixer", kwargs.get("reasoning_effort")))
+            worktree = kwargs["cwd"]
+            (worktree / "feature.txt").write_text("fixed")
+            git(worktree, "add", ".")
+            git(worktree, "commit", "-m", "fix")
+            git(worktree, "push", "origin", "HEAD:feature")
+            repair = {"verdict": "clean", "findings": [], "categories_checked": [],
+                      "fixes": [{"location": "feature.txt:1", "summary": "Validated before use"}],
+                      "validation": ["focused check"]}
+            output.write_text("DEV_AGENTS_REVIEW_REPORT_BEGIN\nFINDINGS: repaired\nFIXES: repaired\nREPORT_JSON: "
+                              + json.dumps(repair) + "\nDEV_AGENTS_REVIEW_REPORT_END\n")
+        return AgentResult(0, False)
+
+    monkeypatch.setattr("dev_agents.pr_fixer.service.run_agent", agent)
+    succeeded, _report = service._fix(42, "feature", [], review_only=True, meta={"headRefOid": head}, run_id=run_id)
+
+    assert succeeded is True
+    assert calls == [("auditor", "max"), ("fixer", "high")]
+
+
+def test_review_effort_inherits_fix_effort_when_unset(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    service = PrFixerService("demo", ProjectConfig(repo=repo, github="owner/repo"), PrFixerConfig(
+        state_path=tmp_path / "state.db",
+        model="gpt-6-luna", reasoning_effort="high",
+        fallback_provider="claude", fallback_model="claude-sonnet-5-5", fallback_reasoning_effort="medium",
+    ))
+    assert service._review_provider_options("codex") == ("gpt-6-luna", "high")
+    assert service._review_provider_options("claude") == ("claude-sonnet-5-5", "medium")
+
+
 @pytest.mark.parametrize("mode", ["clean", "findings", "malformed", "mutation", "stale", "incomplete", "incomplete_findings", "fix_noop", "claude_attributed", "claim_wait", "disputed", "budget", "verification_only", "fix_paused"])
 def test_auditor_and_fixer_are_separate_and_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     origin, repo, head = setup_repository(tmp_path)

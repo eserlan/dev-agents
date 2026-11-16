@@ -25,6 +25,9 @@ projects:
       # Optional Codex model override; defaults to the runtime's pinned model.
       # model: gpt-6.1-sol
       reasoning_effort: high
+      # Optional harder effort for the read-only review auditor only; repairs keep
+      # reasoning_effort. Omit to run both at reasoning_effort.
+      # review_reasoning_effort: max
       # Green staging PRs without a submitted Copilot review receive the two-pass
       # general + Codex-Cryptica review before auto-merge eligibility is checked.
       review_without_copilot: true

@@ -75,6 +75,8 @@ class _ProviderPassState(TypedDict, total=False):
     skipped: bool
     model: str | None
     effort: str | None
+    # The auditor's effort when it differs from the fixer's (see _review_provider_options).
+    review_effort: str | None
     prompt: str
     deadline: float
     audit: Any
@@ -421,6 +423,13 @@ class PrFixerService:
         if provider == PR_FIX_PROVIDER:
             return self.config.model, self.config.reasoning_effort
         return self.config.fallback_model, self.config.fallback_reasoning_effort
+
+    def _review_provider_options(self, provider: str) -> tuple[str | None, str | None]:
+        """Model and reasoning effort for the read-only auditor of one of `_providers()`."""
+        model, effort = self._provider_options(provider)
+        if provider == PR_FIX_PROVIDER:
+            return model, self.config.review_reasoning_effort or effort
+        return model, self.config.review_fallback_reasoning_effort or effort
 
     def _quota_blocked_until(self) -> Any:
         """The earliest reset time while every provider is over its usage limit, else None."""
@@ -1503,10 +1512,11 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                                     "result": AgentResult(1, previous.timed_out if previous else False)}
                         _log(f"fallback-start pr={number} provider={provider}")
                     model, effort = self._provider_options(provider)
+                    review_effort = self._review_provider_options(provider)[1]
                     report.update(
                         agent_provider=provider,
                         agent_model=model or (CODEX_MODEL if provider == PR_FIX_PROVIDER else provider),
-                        agent_effort=effort,
+                        agent_effort=review_effort if review_only else effort,
                     )
                     prompt = (
                         _review_prompt(
@@ -1525,15 +1535,18 @@ The agent did not complete the fix for PR #{number}. Feedback remains actionable
                         else _prompt(worktree, number, keys, base, conflicts)
                     )
                     _log(f"agent-start pr={number} provider={provider} log={log}")
-                    record("start_provider", "provider_started", provider=provider, model=model, effort=effort)
+                    record("start_provider", "provider_started", provider=provider, model=model,
+                           effort=effort, review_effort=review_effort)
                     return {
                         "provider": provider, "skipped": False, "model": model, "effort": effort,
+                        "review_effort": review_effort,
                         "prompt": prompt, "deadline": time.monotonic() + self.config.timeout_minutes * 60,
                         "audit": None, "result": None,
                     }
 
                 def audit_step(state: _ProviderPassState) -> dict[str, Any]:
-                    provider, model, effort = state["provider"], state["model"], state["effort"]
+                    provider, model = state["provider"], state["model"]
+                    effort = state.get("review_effort") or state["effort"]
                     before_head = _pkg._run(worktree, "git", "rev-parse", "HEAD")
                     before_status = _pkg._run(worktree, "git", "status", "--porcelain")
                     audit_path = log.with_suffix(".audit.json")

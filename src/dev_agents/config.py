@@ -242,6 +242,11 @@ class PrFixerConfig(BaseModel):
     fallback_provider: Literal["claude"] | None = None
     fallback_model: str | None = None
     fallback_reasoning_effort: str | None = None
+    # The read-only auditor gates auto-merge, so it can run harder than the repair
+    # that follows it. None inherits ``reasoning_effort``.
+    review_reasoning_effort: str | None = None
+    # None inherits ``fallback_reasoning_effort``.
+    review_fallback_reasoning_effort: str | None = None
     timeout_minutes: int = 20
     reconcile_interval_seconds: int = 300
     review_without_copilot: bool = True
