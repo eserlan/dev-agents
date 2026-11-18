@@ -40,6 +40,10 @@ projects:
       # e.g. ["some-coding-agent[bot]"]; empty means nothing pauses.
       external_agent_logins: []
       external_agent_resume_label: dev-agents-resume
+      # Vercel Hobby projects only deploy the owner's commits. Set to "base" (base branch) or
+      # "all" (also PR branches) to push an empty commit as the daemon's GitHub user when
+      # Vercel blocks a commit by its Git author. Needs the webhook's "status" event.
+      vercel_blocked_author_redeploy: "off"
       auto_merge: false
       # Set both auto_merge and this flag to true to merge only PRs created by issue_fixer.
       auto_merge_issue_fixes_only: false

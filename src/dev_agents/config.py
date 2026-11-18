@@ -268,6 +268,11 @@ class PrFixerConfig(BaseModel):
     # Bot logins whose pushes pause automation on a PR until the resume label is applied.
     external_agent_logins: list[str] = []
     external_agent_resume_label: str = "dev-agents-resume"
+    # When Vercel blocks a deployment because the commit's Git author has no access to the
+    # project (a Hobby project only deploys its owner's commits), push an empty commit as the
+    # daemon's GitHub user so the same tree deploys. "base" covers the base branch, "all"
+    # also PR branches. Needs the repository webhook to send "status" events.
+    vercel_blocked_author_redeploy: Literal["off", "base", "all"] = "off"
     # Reviews still run and post findings on a PR with this label, but nothing is fixed or
     # pushed: someone is working on the branch by hand. ``paused`` stops reviews too.
     fix_pause_label: str = "pause:fix"

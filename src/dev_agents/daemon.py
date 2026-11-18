@@ -42,6 +42,7 @@ from dev_agents.pr_fixer import (
 )
 from dev_agents.runtime import StateRepository, state_database_path
 from dev_agents.runtime.github import gh
+from dev_agents.vercel_redeploy import BlockedDeployment, blocked_deployment, redeploy
 from dev_agents.workflows.bluesky_reminders import (
     latest_publication_time,
     select_bluesky_reminder,
@@ -335,6 +336,61 @@ def serve(project_name: str, project: ProjectConfig, config: PrFixerConfig) -> N
                     f"accepted delivery={delivery} event=push branch={config.base_branch}; reconciling"
                 )
                 Thread(target=reconcile, daemon=True).start()
+                self.send_response(202)
+                self.end_headers()
+                return
+            if event == "status":
+                blocked = (
+                    blocked_deployment(
+                        payload,
+                        repository=project.github,
+                        base_branch=config.base_branch,
+                        scope=config.vercel_blocked_author_redeploy,
+                    )
+                    if project.github
+                    else None
+                )
+                if blocked is None:
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+                # Keyed by commit, so the redeploy happens once however often Vercel reports it.
+                run_id = f"{blocked.branch}@{blocked.sha}"
+                claim = service.state.claim_run(
+                    "vercel-redeploy",
+                    run_id,
+                    delivery_id=delivery,
+                    metadata={"branch": blocked.branch, "sha": blocked.sha, "author": blocked.author},
+                )
+                if not claim.claimed:
+                    _log(f"ignored delivery={delivery} event=status reason=duplicate run_id={run_id}")
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+
+                def run_redeploy(blocked: BlockedDeployment = blocked, run_id: str = run_id) -> None:
+                    try:
+                        assert project.github is not None
+                        new_sha = redeploy(project.repo, project.github, blocked)
+                    except Exception as error:  # noqa: BLE001 - daemon must log worker failures
+                        service.state.complete_run(
+                            "vercel-redeploy", run_id, status="failed", error=str(error)
+                        )
+                        _log(f"failed delivery={delivery} event=status vercel-redeploy {run_id} error={error}")
+                        return
+                    service.state.complete_run(
+                        "vercel-redeploy", run_id, metadata={"redeploy_sha": new_sha}
+                    )
+                    _log(
+                        f"handled delivery={delivery} event=status vercel-redeploy {run_id} "
+                        f"author={blocked.author} new_sha={new_sha or 'skipped-same-user'}"
+                    )
+
+                Thread(target=run_redeploy, daemon=True).start()
+                _log(
+                    f"accepted delivery={delivery} event=status vercel-redeploy {run_id} "
+                    f"author={blocked.author}"
+                )
                 self.send_response(202)
                 self.end_headers()
                 return
