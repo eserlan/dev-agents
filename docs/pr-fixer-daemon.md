@@ -220,6 +220,25 @@ It does not start a fix, because the fixer could only report that there is nothi
 daemon logs `infrastructure-failure-ignored` once per check and head. The check still blocks
 auto-merge until it passes, for example after a rerun. Add patterns per project for other providers.
 
+## Vercel deployments blocked by commit author
+
+A Vercel Hobby project deploys only its owner's commits. When a collaborator authors the tip of
+a branch (their own PR commits, or the squash commit GitHub authors in their name when their PR
+merges), Vercel sets the commit status *"Git author <login> must have access to the project on
+Vercel to create deployments."*
+
+With `vercel_blocked_author_redeploy: base` the daemon answers that status on the base branch by
+creating an empty commit on top of the blocked one through the GitHub API and fast-forwarding
+the branch to it. GitHub authors that commit as the user the daemon's `gh` is logged in as, so
+Vercel deploys the same tree. `all` does the same for any branch tip, which covers PR previews.
+
+- The repository webhook must include the **Statuses** (`status`) event.
+- The ref update is never forced. If the branch moved since the blocked commit, nothing is
+  pushed and the run is recorded as failed under the `vercel-redeploy` workflow.
+- With `all`, the extra commit lands on the collaborator's PR branch, so their next push
+  from a stale local copy (or a coding agent's session) has to pull it first.
+- Nothing happens when the blocked author is the `gh` user itself.
+
 ## Issue fixer
 
 Projects may also opt in to the label-driven issue fixer:
