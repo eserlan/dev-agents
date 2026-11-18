@@ -50,9 +50,10 @@ installed:
 - the selected workspace `lint:types` commands from the workflow, when applicable
 
 If the selector reports full validation (for example because package.json, bun.lock, scripts/,
-`.github/`, or shared configuration changed), follow the workflow's widened affected-workspace
-commands instead. Do not run `bun run lint` or a repository-wide test command for an ordinary
-affected-only PR."""
+`.github/`, or shared configuration changed), the widened scope is CI's job on the pushed head,
+not yours. Do not run the widened full-workspace validation locally: run only the changed-file
+validators above plus the `lint:types` commands for workspaces containing your changes. Do not run
+`bun run lint` or a repository-wide test command for an ordinary affected-only PR."""
     return """Run focused tests first. For linting, run ESLint/format checks only against changed files;
 do not run repository-wide lint or test commands unless the target repository's instructions
 require them or no targeted command is available. Independent lint, test, and type-check commands

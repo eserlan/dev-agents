@@ -260,6 +260,8 @@ def test_target_validation_uses_codex_cryptica_affected_scripts(tmp_path: Path) 
     assert "scripts/test-changed.mjs --base \"$BASE_SHA\" --head HEAD" in instructions
     assert "in parallel" in instructions
     assert "repository-wide" in instructions
+    assert "Do not run the widened full-workspace validation locally" in instructions
+    assert "CI" in instructions
 
 
 def test_target_validation_falls_back_without_repository_scripts(tmp_path: Path) -> None:
